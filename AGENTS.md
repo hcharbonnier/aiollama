@@ -85,3 +85,8 @@ the full development workflow.
 - Report security vulnerabilities privately to hello@ollama.com (do not open public issues; see `SECURITY.md`)
 - Validate all inputs at API boundaries; use parameterized queries for SQLite access (`mattn/go-sqlite3`)
 - Users should secure hosted Ollama instances and monitor for unusual activity
+
+## Git
+
+- You are responsible to add new commits when needed
+- Create a new commit with a descriptive message
