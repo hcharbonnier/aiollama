@@ -9,6 +9,8 @@ include(ExternalProject)
 set(OLLAMA_LLAMA_BACKENDS "" CACHE STRING
     "Semicolon-separated llama-server GPU backends to build: cuda_v12;cuda_v13;rocm_v7_1;rocm_v7_2;vulkan;cuda_jetpack5;cuda_jetpack6")
 set(_ollama_mlx_backends_doc "Semicolon-separated MLX backends to build: cuda_v13;metal_v3;metal_v4")
+set(_ollama_sdcpp_backends_doc "Semicolon-separated stable-diffusion.cpp backends to build: cpu;cuda_v12;cuda_v13;metal;vulkan")
+set(OLLAMA_SDCPP_BACKENDS "" CACHE STRING "${_ollama_sdcpp_backends_doc}")
 set(OLLAMA_VERSION "0.0.0" CACHE STRING "Ollama version embedded in the local Go binary")
 set(OLLAMA_PAYLOAD_INSTALL_PREFIX "${CMAKE_BINARY_DIR}" CACHE PATH
     "Build-time staging prefix for nested Ollama native payloads")
@@ -192,6 +194,34 @@ if(OLLAMA_MLX_BACKENDS)
         list(APPEND _mlx_source_targets ollama-mlx-c-source)
     endif()
     add_custom_target(ollama-mlx-sources DEPENDS ${_mlx_source_targets})
+endif()
+
+set(_sdcpp_source_targets)
+if(OLLAMA_SDCPP_BACKENDS)
+    file(READ "${CMAKE_SOURCE_DIR}/SD_CPP_VERSION" OLLAMA_SD_CPP_GIT_TAG)
+    string(STRIP "${OLLAMA_SD_CPP_GIT_TAG}" OLLAMA_SD_CPP_GIT_TAG)
+
+    if(DEFINED FETCHCONTENT_SOURCE_DIR_STABLE_DIFFUSION_CPP AND NOT "${FETCHCONTENT_SOURCE_DIR_STABLE_DIFFUSION_CPP}" STREQUAL "")
+        get_filename_component(OLLAMA_SD_CPP_SOURCE_DIR
+            "${FETCHCONTENT_SOURCE_DIR_STABLE_DIFFUSION_CPP}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+        message(STATUS "Using stable-diffusion.cpp source override: ${OLLAMA_SD_CPP_SOURCE_DIR}")
+    elseif(DEFINED ENV{OLLAMA_SD_CPP_SOURCE})
+        get_filename_component(OLLAMA_SD_CPP_SOURCE_DIR
+            "$ENV{OLLAMA_SD_CPP_SOURCE}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+        message(STATUS "Using local stable-diffusion.cpp source: ${OLLAMA_SD_CPP_SOURCE_DIR}")
+    else()
+        set(OLLAMA_SD_CPP_SOURCE_DIR "${CMAKE_BINARY_DIR}/_deps/stable_diffusion_cpp-src")
+        ExternalProject_Add(ollama-sdcpp-source
+            GIT_REPOSITORY "https://github.com/leejet/stable-diffusion.cpp.git"
+            GIT_TAG ${OLLAMA_SD_CPP_GIT_TAG}
+            GIT_SHALLOW TRUE
+            SOURCE_DIR ${OLLAMA_SD_CPP_SOURCE_DIR}
+            CONFIGURE_COMMAND ""
+            BUILD_COMMAND ""
+            INSTALL_COMMAND ""
+            USES_TERMINAL_DOWNLOAD TRUE)
+        list(APPEND _sdcpp_source_targets ollama-sdcpp-source)
+    endif()
 endif()
 
 set(OLLAMA_BUILD_PARALLEL "" CACHE STRING
@@ -525,6 +555,90 @@ function(ollama_add_mlx_build name)
         USES_TERMINAL_INSTALL TRUE)
 endfunction()
 
+function(ollama_add_sdcpp_build name)
+    cmake_parse_arguments(ARG "" "PRESET;RUNNER_DIR" "TARGETS;CMAKE_ARGS" ${ARGN})
+    if(NOT ARG_RUNNER_DIR)
+        message(FATAL_ERROR "ollama_add_sdcpp_build(${name}) requires RUNNER_DIR")
+    endif()
+
+    if(WIN32 AND name STREQUAL "vulkan")
+        set(_build_dir ${CMAKE_BINARY_DIR}/sd-vk)
+    else()
+        set(_build_dir ${CMAKE_BINARY_DIR}/sdcpp-${name})
+    endif()
+    ollama_collect_cache_args_with_prefix("GGML_" _ggml_cache_args)
+    set(_cmake_args
+        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+        -DCMAKE_INSTALL_PREFIX=${OLLAMA_PAYLOAD_INSTALL_PREFIX}
+        -DOLLAMA_LIB_DIR:STRING=${OLLAMA_LIB_DIR}
+        -DOLLAMA_SDCPP_RUNNER_DIR=${ARG_RUNNER_DIR}
+        -DOLLAMA_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+        -DFETCHCONTENT_SOURCE_DIR_STABLE_DIFFUSION_CPP=${OLLAMA_SD_CPP_SOURCE_DIR}
+        ${ARG_CMAKE_ARGS}
+        ${_ggml_cache_args}
+    )
+
+    foreach(_arg IN ITEMS
+            CUDAToolkit_ROOT
+            CMAKE_CUDA_COMPILER
+            CMAKE_CUDA_HOST_COMPILER
+            CMAKE_INCLUDE_PATH
+            CMAKE_LIBRARY_PATH
+            CMAKE_PREFIX_PATH)
+        ollama_append_cache_arg_if_set(_cmake_args ${_arg})
+    endforeach()
+
+    if(APPLE)
+        if(CMAKE_OSX_ARCHITECTURES)
+            list(APPEND _cmake_args
+                -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES})
+        endif()
+        if(CMAKE_OSX_DEPLOYMENT_TARGET)
+            list(APPEND _cmake_args
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
+        endif()
+    endif()
+
+    set(_configure_command ${CMAKE_COMMAND}
+        -S ${CMAKE_SOURCE_DIR}/cmake/sdcpp
+        -B <BINARY_DIR>
+        ${_cmake_args})
+    if(ARG_PRESET)
+        set(_configure_command ${CMAKE_COMMAND}
+            -S ${CMAKE_SOURCE_DIR}/cmake/sdcpp
+            --preset ${ARG_PRESET}
+            -B <BINARY_DIR>
+            ${_cmake_args})
+    endif()
+
+    set(_targets ${ARG_TARGETS})
+    if(NOT _targets)
+        set(_targets stable-diffusion)
+    endif()
+    set(_build_target_args)
+    foreach(_t IN LISTS _targets)
+        list(APPEND _build_target_args ${OLLAMA_NATIVE_BUILD_TARGET_ARG} ${_t})
+    endforeach()
+
+    ExternalProject_Add(ollama-sdcpp-${name}
+        SOURCE_DIR ${CMAKE_SOURCE_DIR}/cmake/sdcpp
+        BINARY_DIR ${_build_dir}
+        CONFIGURE_COMMAND ${_configure_command}
+        BUILD_COMMAND ${OLLAMA_NATIVE_BUILD_TOOL_COMMAND}
+            ${OLLAMA_NATIVE_CONFIG_ARG}
+            ${_build_target_args}
+        INSTALL_COMMAND ${CMAKE_COMMAND} --install <BINARY_DIR>
+            ${OLLAMA_NATIVE_CONFIG_ARG}
+            --component sdcpp
+        DEPENDS ${_sdcpp_source_targets}
+        LIST_SEPARATOR |
+        BUILD_ALWAYS TRUE
+        ${OLLAMA_NATIVE_EXTERNAL_OPTIONS}
+        USES_TERMINAL_CONFIGURE TRUE
+        USES_TERMINAL_BUILD TRUE
+        USES_TERMINAL_INSTALL TRUE)
+endfunction()
+
 find_program(GO_EXECUTABLE go)
 
 if(OLLAMA_MLX_BACKENDS)
@@ -774,6 +888,61 @@ if(_mlx_targets)
     add_custom_target(ollama-mlx-backends ALL
         DEPENDS ${_mlx_targets}
         COMMENT "Building MLX backends")
+endif()
+
+set(_sdcpp_targets)
+foreach(_backend IN LISTS OLLAMA_SDCPP_BACKENDS)
+    if(_backend STREQUAL "cpu")
+        ollama_add_sdcpp_build(cpu
+            RUNNER_DIR cpu
+            CMAKE_ARGS
+                -DBUILD_SHARED_LIBS=ON
+                -DGGML_BACKEND_DL=ON
+                -DGGML_CPU_ALL_VARIANTS=ON)
+        list(APPEND _sdcpp_targets ollama-sdcpp-cpu)
+    elseif(_backend STREQUAL "cuda_v12" OR _backend STREQUAL "cuda_v13")
+        set(_cuda_args)
+        ollama_append_cache_arg_if_set(_cuda_args CMAKE_CUDA_ARCHITECTURES)
+        ollama_append_cache_arg_if_set(_cuda_args CMAKE_CUDA_FLAGS)
+        ollama_append_cuda_toolkit_args(_cuda_args ${_backend})
+        ollama_add_sdcpp_build(${_backend}
+            RUNNER_DIR ${_backend}
+            CMAKE_ARGS
+                -DBUILD_SHARED_LIBS=ON
+                -DGGML_BACKEND_DL=ON
+                -DGGML_CUDA=ON
+                ${_cuda_args})
+        list(APPEND _sdcpp_targets ollama-sdcpp-${_backend})
+    elseif(_backend STREQUAL "metal")
+        if(NOT APPLE)
+            message(FATAL_ERROR "OLLAMA_SDCPP_BACKENDS=metal is only supported on macOS")
+        endif()
+        ollama_check_metal_toolchain(_metal_version)
+        ollama_add_sdcpp_build(metal
+            RUNNER_DIR metal
+            CMAKE_ARGS
+                -DBUILD_SHARED_LIBS=ON
+                -DGGML_METAL=ON
+                -DGGML_METAL_EMBED_LIBRARY=ON)
+        list(APPEND _sdcpp_targets ollama-sdcpp-metal)
+    elseif(_backend STREQUAL "vulkan")
+        ollama_add_sdcpp_build(vulkan
+            RUNNER_DIR vulkan
+            CMAKE_ARGS
+                -DBUILD_SHARED_LIBS=ON
+                -DGGML_BACKEND_DL=ON
+                -DGGML_VULKAN=ON)
+        list(APPEND _sdcpp_targets ollama-sdcpp-vulkan)
+    else()
+        message(FATAL_ERROR
+            "Unknown OLLAMA_SDCPP_BACKENDS entry '${_backend}'")
+    endif()
+endforeach()
+
+if(_sdcpp_targets)
+    add_custom_target(ollama-sdcpp-backends ALL
+        DEPENDS ${_sdcpp_targets}
+        COMMENT "Building stable-diffusion.cpp backends")
 endif()
 
 install(DIRECTORY "${OLLAMA_PAYLOAD_INSTALL_PREFIX}/${OLLAMA_LIB_DIR}/"
