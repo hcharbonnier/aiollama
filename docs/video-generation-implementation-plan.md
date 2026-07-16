@@ -1439,18 +1439,18 @@ production quality.
 - **Go integration** validated: `go build -tags=sdcpp` links against the built
   `libstable-diffusion.so` and the `x/sdcpp` Go tests pass.
 
-#### 12.2 Runner handler tests with mock (Phase 8.4)
+#### 12.2 Runner handler tests with mock (Phase 8.4) — DONE
 
 - The HTTP handlers (`handleImageCompletion`, `handleVideoCompletion`) in
-  `x/diffgen/runner.go` have **no unit tests** for streaming, cancellation, or
-  error propagation. Current tests cover only the helper functions in
-  `memory.go` and the marshaling in `types.go`.
-- To test these without a GPU, the `sdcpp.Context` calls need to be abstracted
-  behind an interface so a mock can substitute `GenerateImage`/`GenerateVideo`.
-  Currently `runnerServer.ctx` is a concrete `*sdcpp.Context`.
-- Alternatively, use a tiny CPU-only model (e.g. SD1.5-turbo at 256×256) for
-  smoke tests — but that requires a built `libstable-diffusion` and a downloaded
-  model.
+  `x/diffgen/runner.go` now have unit tests for streaming, cancellation, error
+  propagation, OOM normalization, warning surfacing, mode override, and
+  parameter forwarding (`x/diffgen/runner_test.go`, 25 tests).
+- `sdcpp.Context` is abstracted behind the `sdContext` interface
+  (`x/diffgen/context.go`) so a `mockSDContext` substitutes without a GPU or
+  real model. `*sdcpp.Context` satisfies the interface via a compile-time
+  assertion (`x/diffgen/context_sdcpp.go`). The test binary still links
+  `libstable-diffusion` (cgo) but the mock never calls into C.
+- Run with: `CGO_LDFLAGS='-L<libdir> -lstable-diffusion' go test -tags=sdcpp -run TestHandler ./x/diffgen/`
 
 #### 12.3 Dockerfile (Section 5, modified files inventory)
 
@@ -1576,7 +1576,7 @@ OLLAMA_TEST_DIFF_MODEL=wan2.2-t2v-a14b go test -tags=integration -run TestDiffge
 |------|----------|--------|--------|--------|
 | Native build validation (`cmake --build`) | High | 1–2 days | E2E testing | **DONE** (CPU/Linux validated; CUDA/Metal/Vulkan pending toolchain) |
 | ggml symbol isolation check | High | 0.5 day | Native build | **DONE** (0 leaked symbols; coexist test passes) |
-| Runner handler tests (mock or CPU model) | Medium | 2–3 days | None | Pending |
+| Runner handler tests (mock or CPU model) | Medium | 2–3 days | None | **DONE** (25 tests via mock sdContext interface) |
 | Dockerfile SD.cpp deps | Medium | 0.5 day | Containerized CI | Pending |
 | CI multi-backend matrix | Medium | 1–2 days | Regression prevention | Pending |
 | Video container encoding (WebM) | Low | 3–5 days | Non-blocking (PNG stream works) | Pending |

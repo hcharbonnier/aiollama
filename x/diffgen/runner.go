@@ -105,7 +105,7 @@ func Execute(args []string) error {
 type runnerServer struct {
 	modelName string
 	port      int
-	ctx       *sdcpp.Context
+	ctx       sdContext
 	mode      ModelMode
 	warning   string // non-fatal warning surfaced per-request (e.g. WAN VAE CPU fallback)
 }
