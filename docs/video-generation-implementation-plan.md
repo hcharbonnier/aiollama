@@ -1574,17 +1574,43 @@ production quality.
   the ffmpeg-dependent tests (they require ffmpeg installed on the runner);
   tracked alongside 12.4.
 
-#### 12.6 End-to-end testing with real models
+#### 12.6 End-to-end testing with real models — PARTIAL (test harness done; real-model E2E pending)
 
-- No E2E test has been run against a real SD.cpp model. The integration test
-  scaffold (`TestDiffgenImageGeneration`, `TestDiffgenVideoGeneration`,
-  `TestDiffgenVideoAPI`) is written but requires:
+- The E2E test harness is implemented. The integration test scaffold
+  (`TestDiffgenImageGeneration`, `TestDiffgenVideoGeneration`,
+  `TestDiffgenVideoAPI`) now supports importing SD.cpp models from a **local
+  directory** of component files via `OLLAMA_TEST_DIFF_MODEL_DIR`, in addition
+  to the original registry-pull path. New tests were added:
+  - `TestDiffgenImageGenerationProgress` — verifies streaming step/total
+    progress events are emitted before the final image.
+  - `TestDiffgenImportFromDirectory` — exercises the SD.cpp import path
+    (`convertFromSDCpp`) end-to-end via `OLLAMA_TEST_DIFF_IMPORT_DIR` (uploads
+    component files as blobs, creates the model, verifies it appears in
+    `/api/tags` and `Show` returns a valid manifest). Does not require a GPU or
+    real model — only tests the import/manifest path.
+  - Helpers: `importDiffModelFromDir` (uploads blobs + `Create`), `ensureDiffModel`
+    (import-or-pull dispatch), `sha256Digest`.
+- The `ollama create` path for SD.cpp models (`convertFromSDCpp`) now has full
+  unit test coverage in `server/routes_create_test.go`:
+  - `TestConvertFromSDCpp` (7 subtests): image model with components map,
+    video model with dual diffusion models, filename-stem fallback naming,
+    missing `model_index.json` error, invalid JSON error, base-layer
+    append-order, model_index blob round-trip.
+  - `TestCreateModelFromSDCppFilesSetsConfig`: full `CreateHandler` path —
+    verifies `model_format: "sdcpp"`, `capabilities: ["video"]`, and that all
+    diffusion component layers are present in the manifest with correct names
+    and media types.
+  - `TestCreateModelFromSDCppFilesImageDefaultsToImageCapability`: verifies
+    the `["image"]` default when `model_index.json` omits capabilities.
+  - `TestDetectModelTypeFromFiles` extended: sdcpp detection from
+    `model_index.json` (path-agnostic via `filepath.Base`), and precedence over
+    `.safetensors`.
+- **Remaining (real-model E2E):** Running the integration tests against actual
+  SD.cpp model weights still requires:
   1. A built `ollama` binary with the `sdcpp` tag and a linked
      `libstable-diffusion`.
-  2. A pulled or imported SD.cpp model set via `OLLAMA_TEST_DIFF_MODEL`.
-- The `ollama create` path for SD.cpp models (`convertFromSDCpp`) has no test
-  coverage — it needs a test fixture with a `model_index.json` + dummy
-  component files.
+  2. A model set via `OLLAMA_TEST_DIFF_MODEL` (+ `OLLAMA_TEST_DIFF_MODEL_DIR`
+     for local import, or a registry pull).
 
 ##### Test models (CPU-only, 2-bit quantized where available)
 
@@ -1677,6 +1703,6 @@ OLLAMA_TEST_DIFF_MODEL=wan2.2-t2v-a14b go test -tags=integration -run TestDiffge
 | Dockerfile SD.cpp deps | Medium | 0.5 day | Containerized CI | **DONE** (sdcpp-* build/publish stages added, reusing existing toolchain stages; opt-in `build-sdcpp`/`publish-go-sdcpp` Go target; not wired into default image) |
 | CI multi-backend matrix | Low | 1–2 days | Regression prevention | **DEFERRED** (non-priority; revisit after 12.6 E2E harness and GPU CI runners) |
 | Video container encoding (WebM) | Low | 3–5 days | Non-blocking (PNG stream works) | **DONE** (ffmpeg-based `EncodeWebM`, opt-in via `output_format: "webm"` everywhere including the HTTP video API — no implicit default; size-capped output buffer; `VideoWriter` container-priority bug fixed; fallback surfaced via response `Warning`) |
-| E2E tests with real models (FLUX.2-Klein-4B + WAN 2.2, CPU, Q2_K) | Medium | 1 day | Requires native build | Pending (native build done; models/test harness pending) |
-| `convertFromSDCpp` test fixture | Low | 0.5 day | Import path coverage | Pending |
+| E2E tests with real models (FLUX.2-Klein-4B + WAN 2.2, CPU, Q2_K) | Medium | 1 day | Requires native build | **PARTIAL** (test harness done: local-dir import via `OLLAMA_TEST_DIFF_MODEL_DIR`, progress-streaming + import tests added; real-model run pending sdcpp-tagged binary + model weights) |
+| `convertFromSDCpp` test fixture | Low | 0.5 day | Import path coverage | **DONE** (`TestConvertFromSDCpp` 7 subtests + `TestCreateModelFromSDCppFilesSetsConfig` + `TestCreateModelFromSDCppFilesImageDefaultsToImageCapability` + `TestDetectModelTypeFromFiles` sdcpp cases) |
 | Memory estimation overhead factor | Low | 0.5 day | Pre-flight accuracy | Pending |

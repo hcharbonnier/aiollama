@@ -1776,6 +1776,34 @@ func TestDetectModelTypeFromFiles(t *testing.T) {
 		}
 	})
 
+	t.Run("model_index.json detected as sdcpp (path-agnostic)", func(t *testing.T) {
+		// model_index.json may appear under a subdirectory; detectModelTypeFromFiles
+		// uses filepath.Base, so any path ending in model_index.json routes to sdcpp.
+		// Use forward slashes which filepath.Base handles on all platforms.
+		for _, name := range []string{"model_index.json", "subdir/model_index.json", "deep/nested/model_index.json"} {
+			files := map[string]string{
+				name: "sha256:abc123",
+			}
+
+			modelType := detectModelTypeFromFiles(files)
+			if modelType != "sdcpp" {
+				t.Fatalf("expected model type 'sdcpp' for %q, got %q", name, modelType)
+			}
+		}
+	})
+
+	t.Run("model_index.json takes precedence over safetensors", func(t *testing.T) {
+		files := map[string]string{
+			"model_index.json":  "sha256:abc123",
+			"model.safetensors": "sha256:def456",
+		}
+
+		modelType := detectModelTypeFromFiles(files)
+		if modelType != "sdcpp" {
+			t.Fatalf("expected model type 'sdcpp' to take precedence, got %q", modelType)
+		}
+	})
+
 	t.Run("unsupported file type", func(t *testing.T) {
 		p := t.TempDir()
 		t.Setenv("OLLAMA_MODELS", p)
@@ -2103,5 +2131,347 @@ func TestCreateFromSafetensorsModel_PreservesLayerNames(t *testing.T) {
 	}
 	if !jsonNames["tokenizer.json"] {
 		t.Error("tokenizer.json layer name not preserved in derived model")
+	}
+}
+
+// createSDCppTestFiles sets up an OLLAMA_MODELS blob store and writes a
+// model_index.json plus dummy component files, returning a files map keyed by
+// filename → digest (matching the input shape of convertFromSDCpp). The
+// modelIndex JSON is returned for assertions.
+func createSDCppTestFiles(t *testing.T, modelIndex []byte, componentFiles map[string][]byte) map[string]string {
+	t.Helper()
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	files := make(map[string]string, len(componentFiles)+1)
+
+	// model_index.json
+	files["model_index.json"] = createTestBlob(t, modelIndex)
+
+	for name, data := range componentFiles {
+		files[name] = createTestBlob(t, data)
+	}
+	return files
+}
+
+func TestConvertFromSDCpp(t *testing.T) {
+	t.Run("image model with components map", func(t *testing.T) {
+		modelIndex := []byte(`{
+			"architecture": "FluxPipeline",
+			"capabilities": ["image"],
+			"model_format": "sdcpp",
+			"components": {
+				"diffusion_model": "flux-2-klein-4b.gguf",
+				"vae": "flux2_ae.safetensors",
+				"clip_l": "qwen-3-4b.gguf"
+			}
+		}`)
+		componentFiles := map[string][]byte{
+			"flux-2-klein-4b.gguf":   []byte("dummy-diffusion-weights"),
+			"flux2_ae.safetensors":   []byte("dummy-vae-weights"),
+			"qwen-3-4b.gguf":         []byte("dummy-clip-weights"),
+		}
+		files := createSDCppTestFiles(t, modelIndex, componentFiles)
+
+		var progress []string
+		fn := func(resp api.ProgressResponse) {
+			progress = append(progress, resp.Status)
+		}
+
+		layers, err := convertFromSDCpp(files, nil, fn)
+		if err != nil {
+			t.Fatalf("convertFromSDCpp failed: %v", err)
+		}
+
+		// Expect: 1 model_index layer + 3 component layers
+		if len(layers) != 4 {
+			t.Fatalf("expected 4 layers, got %d", len(layers))
+		}
+
+		// First layer is model_index
+		indexLayer := layers[0]
+		if indexLayer.Name != "model_index" {
+			t.Errorf("index layer name = %q, want %q", indexLayer.Name, "model_index")
+		}
+		if indexLayer.MediaType != mediaTypeModelIndex {
+			t.Errorf("index layer media type = %q, want %q", indexLayer.MediaType, mediaTypeModelIndex)
+		}
+
+		// Component layers should have the canonical component names from the
+		// components map, and the diffusion-component media type.
+		compByName := make(map[string]*layerGGML, 3)
+		for _, l := range layers[1:] {
+			compByName[l.Name] = l
+			if l.MediaType != mediaTypeDiffusionComponent {
+				t.Errorf("component %q media type = %q, want %q", l.Name, l.MediaType, mediaTypeDiffusionComponent)
+			}
+		}
+		for _, expected := range []string{"diffusion_model", "vae", "clip_l"} {
+			if _, ok := compByName[expected]; !ok {
+				t.Errorf("expected component %q not found in layers", expected)
+			}
+		}
+
+		// Progress callback should have fired for the index + each component.
+		if len(progress) < 4 {
+			t.Errorf("expected at least 4 progress updates, got %d (%v)", len(progress), progress)
+		}
+	})
+
+	t.Run("video model with dual diffusion models", func(t *testing.T) {
+		modelIndex := []byte(`{
+			"architecture": "WanVideoPipeline",
+			"capabilities": ["video"],
+			"model_format": "sdcpp",
+			"components": {
+				"diffusion_model": "Wan2.2-T2V-A14B-LowNoise-Q2_K.gguf",
+				"high_noise_diffusion_model": "Wan2.2-T2V-A14B-HighNoise-Q2_K.gguf",
+				"vae": "wan_2.1_vae.safetensors",
+				"t5xxl": "umt5-xxl-encoder-Q2_K.gguf"
+			}
+		}`)
+		componentFiles := map[string][]byte{
+			"Wan2.2-T2V-A14B-LowNoise-Q2_K.gguf":   []byte("low-noise-weights"),
+			"Wan2.2-T2V-A14B-HighNoise-Q2_K.gguf":  []byte("high-noise-weights"),
+			"wan_2.1_vae.safetensors":               []byte("vae-weights"),
+			"umt5-xxl-encoder-Q2_K.gguf":            []byte("t5xxl-weights"),
+		}
+		files := createSDCppTestFiles(t, modelIndex, componentFiles)
+
+		layers, err := convertFromSDCpp(files, nil, func(api.ProgressResponse) {})
+		if err != nil {
+			t.Fatalf("convertFromSDCpp failed: %v", err)
+		}
+
+		// 1 model_index + 4 components
+		if len(layers) != 5 {
+			t.Fatalf("expected 5 layers, got %d", len(layers))
+		}
+
+		compNames := make(map[string]bool, 4)
+		for _, l := range layers[1:] {
+			compNames[l.Name] = true
+		}
+		for _, expected := range []string{"diffusion_model", "high_noise_diffusion_model", "vae", "t5xxl"} {
+			if !compNames[expected] {
+				t.Errorf("expected component %q not found", expected)
+			}
+		}
+	})
+
+	t.Run("component name falls back to filename stem when not in components map", func(t *testing.T) {
+		// No "components" map — names should be derived from the file stem.
+		modelIndex := []byte(`{
+			"architecture": "FluxPipeline",
+			"capabilities": ["image"]
+		}`)
+		componentFiles := map[string][]byte{
+			"flux-2-klein.gguf":      []byte("diffusion"),
+			"flux2_ae.safetensors":   []byte("vae"),
+		}
+		files := createSDCppTestFiles(t, modelIndex, componentFiles)
+
+		layers, err := convertFromSDCpp(files, nil, func(api.ProgressResponse) {})
+		if err != nil {
+			t.Fatalf("convertFromSDCpp failed: %v", err)
+		}
+
+		compNames := make(map[string]bool, 2)
+		for _, l := range layers[1:] {
+			compNames[l.Name] = true
+		}
+		// File-extension-stripped stems:
+		if !compNames["flux-2-klein"] {
+			t.Errorf("expected component name %q (filename stem fallback), got %v", "flux-2-klein", compNames)
+		}
+		if !compNames["flux2_ae"] {
+			t.Errorf("expected component name %q (filename stem fallback), got %v", "flux2_ae", compNames)
+		}
+	})
+
+	t.Run("error when model_index.json is missing", func(t *testing.T) {
+		t.Setenv("OLLAMA_MODELS", t.TempDir())
+		// No model_index.json, just a component file.
+		files := map[string]string{
+			"model.gguf": createTestBlob(t, []byte("weights")),
+		}
+
+		_, err := convertFromSDCpp(files, nil, func(api.ProgressResponse) {})
+		if err == nil {
+			t.Fatal("expected error when model_index.json is missing, got nil")
+		}
+		if !strings.Contains(err.Error(), "model_index.json not found") {
+			t.Fatalf("expected 'model_index.json not found' error, got: %v", err)
+		}
+	})
+
+	t.Run("error when model_index.json is invalid JSON", func(t *testing.T) {
+		files := createSDCppTestFiles(t, []byte("{not valid json"), map[string][]byte{
+			"model.gguf": []byte("weights"),
+		})
+
+		_, err := convertFromSDCpp(files, nil, func(api.ProgressResponse) {})
+		if err == nil {
+			t.Fatal("expected error for invalid model_index.json, got nil")
+		}
+		if !strings.Contains(err.Error(), "parsing model_index.json") {
+			t.Fatalf("expected JSON parse error, got: %v", err)
+		}
+	})
+
+	t.Run("base layers are appended after component layers", func(t *testing.T) {
+		modelIndex := []byte(`{"architecture":"FluxPipeline","capabilities":["image"]}`)
+		files := createSDCppTestFiles(t, modelIndex, map[string][]byte{
+			"model.gguf": []byte("weights"),
+		})
+
+		// A base layer (e.g. a system prompt added separately).
+		systemLayer, err := manifest.NewLayer(bytes.NewReader([]byte("you are an image model")), "application/vnd.ollama.image.system")
+		if err != nil {
+			t.Fatal(err)
+		}
+		baseLayers := []*layerGGML{{Layer: systemLayer}}
+
+		layers, err := convertFromSDCpp(files, baseLayers, func(api.ProgressResponse) {})
+		if err != nil {
+			t.Fatalf("convertFromSDCpp failed: %v", err)
+		}
+
+		// 1 model_index + 1 component + 1 base layer
+		if len(layers) != 3 {
+			t.Fatalf("expected 3 layers, got %d", len(layers))
+		}
+		// The base layer should be last.
+		last := layers[len(layers)-1]
+		if last.MediaType != "application/vnd.ollama.image.system" {
+			t.Errorf("expected base layer last, got media type %q at position %d", last.MediaType, len(layers)-1)
+		}
+	})
+
+	t.Run("model_index layer content round-trips through blob store", func(t *testing.T) {
+		modelIndex := []byte(`{"architecture":"FluxPipeline","capabilities":["image"],"components":{"diffusion_model":"model.gguf"}}`)
+		files := createSDCppTestFiles(t, modelIndex, map[string][]byte{
+			"model.gguf": []byte("weights"),
+		})
+
+		layers, err := convertFromSDCpp(files, nil, func(api.ProgressResponse) {})
+		if err != nil {
+			t.Fatalf("convertFromSDCpp failed: %v", err)
+		}
+
+		indexLayer := layers[0]
+		blobPath, err := manifest.BlobsPath(indexLayer.Digest)
+		if err != nil {
+			t.Fatalf("BlobsPath: %v", err)
+		}
+		readBack, err := os.ReadFile(blobPath)
+		if err != nil {
+			t.Fatalf("read index blob: %v", err)
+		}
+		if string(readBack) != string(modelIndex) {
+			t.Errorf("model_index.json content mismatch: got %q, want %q", readBack, modelIndex)
+		}
+	})
+}
+
+func TestCreateModelFromSDCppFilesSetsConfig(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	var s Server
+
+	modelIndex := []byte(`{
+		"architecture": "WanVideoPipeline",
+		"capabilities": ["video"],
+		"model_format": "sdcpp",
+		"components": {
+			"diffusion_model": "Wan2.2-T2V-A14B-LowNoise.gguf",
+			"high_noise_diffusion_model": "Wan2.2-T2V-A14B-HighNoise.gguf",
+			"vae": "wan_2.1_vae.safetensors",
+			"t5xxl": "umt5-xxl-encoder.gguf"
+		}
+	}`)
+	componentFiles := map[string][]byte{
+		"Wan2.2-T2V-A14B-LowNoise.gguf":  []byte("low-noise-weights"),
+		"Wan2.2-T2V-A14B-HighNoise.gguf": []byte("high-noise-weights"),
+		"wan_2.1_vae.safetensors":         []byte("vae-weights"),
+		"umt5-xxl-encoder.gguf":           []byte("t5xxl-weights"),
+	}
+	files := createSDCppTestFiles(t, modelIndex, componentFiles)
+
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model:  "wan2.2-t2v-a14b",
+		Files:  files,
+		Stream: &stream,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	cfg := readCreatedModelConfig(t, "wan2.2-t2v-a14b")
+	if cfg.ModelFormat != "sdcpp" {
+		t.Errorf("ModelFormat = %q, want %q", cfg.ModelFormat, "sdcpp")
+	}
+	if !slices.Contains(cfg.Capabilities, "video") {
+		t.Errorf("Capabilities = %v, want to contain %q", cfg.Capabilities, "video")
+	}
+
+	// Verify the diffusion component layers are present in the manifest with
+	// the correct media type and names.
+	mf, err := manifest.ParseNamedManifest(model.ParseName("wan2.2-t2v-a14b"))
+	if err != nil {
+		t.Fatalf("parse manifest: %v", err)
+	}
+	componentNames := make(map[string]bool)
+	for _, l := range mf.Layers {
+		if l.MediaType == mediaTypeDiffusionComponent {
+			componentNames[l.Name] = true
+		}
+	}
+	for _, expected := range []string{"diffusion_model", "high_noise_diffusion_model", "vae", "t5xxl"} {
+		if !componentNames[expected] {
+			t.Errorf("expected diffusion component %q in manifest layers", expected)
+		}
+	}
+	// The model_index layer should also be present.
+	var hasModelIndex bool
+	for _, l := range mf.Layers {
+		if l.MediaType == mediaTypeModelIndex && l.Name == "model_index" {
+			hasModelIndex = true
+		}
+	}
+	if !hasModelIndex {
+		t.Error("expected model_index layer in manifest")
+	}
+}
+
+func TestCreateModelFromSDCppFilesImageDefaultsToImageCapability(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	var s Server
+
+	// model_index.json with no capabilities field — createModel should default
+	// to ["image"].
+	modelIndex := []byte(`{
+		"architecture": "FluxPipeline",
+		"components": {"diffusion_model": "flux.gguf"}
+	}`)
+	files := createSDCppTestFiles(t, modelIndex, map[string][]byte{
+		"flux.gguf": []byte("weights"),
+	})
+
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model:  "flux-default-cap",
+		Files:  files,
+		Stream: &stream,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	cfg := readCreatedModelConfig(t, "flux-default-cap")
+	if cfg.ModelFormat != "sdcpp" {
+		t.Errorf("ModelFormat = %q, want %q", cfg.ModelFormat, "sdcpp")
+	}
+	if !slices.Contains(cfg.Capabilities, "image") {
+		t.Errorf("Capabilities = %v, want to contain %q (default when missing)", cfg.Capabilities, "image")
 	}
 }
