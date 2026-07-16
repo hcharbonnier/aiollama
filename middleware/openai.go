@@ -679,6 +679,131 @@ func ImageEditsMiddleware() gin.HandlerFunc {
 	}
 }
 
+// VideoWriter collects streamed generate responses and outputs a video
+// generation response. The diffgen runner streams video frames as individual
+// images (Done=false) followed by a final Done=true message with no image.
+// VideoWriter accumulates the last frame and emits it when Done arrives.
+type VideoWriter struct {
+	BaseWriter
+	lastImage string
+}
+
+func (w *VideoWriter) writeResponse(data []byte) (int, error) {
+	var generateResponse api.GenerateResponse
+	if err := json.Unmarshal(data, &generateResponse); err != nil {
+		return 0, err
+	}
+
+	if generateResponse.Video != "" {
+		w.lastImage = generateResponse.Video
+	}
+	if generateResponse.Image != "" {
+		w.lastImage = generateResponse.Image
+	}
+
+	if generateResponse.Done && w.lastImage != "" {
+		generateResponse.Image = w.lastImage
+		w.ResponseWriter.Header().Set("Content-Type", "application/json")
+		return len(data), json.NewEncoder(w.ResponseWriter).Encode(openai.ToVideoGenerationResponse(generateResponse))
+	}
+
+	return len(data), nil
+}
+
+func (w *VideoWriter) Write(data []byte) (int, error) {
+	code := w.ResponseWriter.Status()
+	if code != http.StatusOK {
+		return w.writeError(data)
+	}
+
+	return w.writeResponse(data)
+}
+
+// VideoGenerationsMiddleware converts an OpenAI-style video generation request
+// into an Ollama GenerateRequest and wraps the response writer.
+func VideoGenerationsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req openai.VideoGenerationRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
+			return
+		}
+
+		if req.Prompt == "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt is required"))
+			return
+		}
+
+		if req.Model == "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "model is required"))
+			return
+		}
+
+		var b bytes.Buffer
+		if err := json.NewEncoder(&b).Encode(openai.FromVideoGenerationRequest(req)); err != nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, err.Error()))
+			return
+		}
+
+		c.Request.Body = io.NopCloser(&b)
+
+		w := &VideoWriter{
+			BaseWriter: BaseWriter{ResponseWriter: c.Writer},
+		}
+
+		c.Writer = w
+		c.Next()
+	}
+}
+
+// VideoEditsMiddleware converts an OpenAI-style video edit (image-to-video)
+// request into an Ollama GenerateRequest and wraps the response writer.
+func VideoEditsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req openai.VideoEditRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
+			return
+		}
+
+		if req.Prompt == "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt is required"))
+			return
+		}
+
+		if req.Model == "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "model is required"))
+			return
+		}
+
+		if req.Image == "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "image is required"))
+			return
+		}
+
+		genReq, err := openai.FromVideoEditRequest(req)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
+			return
+		}
+
+		var b bytes.Buffer
+		if err := json.NewEncoder(&b).Encode(genReq); err != nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, err.Error()))
+			return
+		}
+
+		c.Request.Body = io.NopCloser(&b)
+
+		w := &VideoWriter{
+			BaseWriter: BaseWriter{ResponseWriter: c.Writer},
+		}
+
+		c.Writer = w
+		c.Next()
+	}
+}
+
 // TranscriptionWriter collects streamed chat responses and outputs a transcription response.
 type TranscriptionWriter struct {
 	BaseWriter

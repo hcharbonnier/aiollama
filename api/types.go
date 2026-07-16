@@ -141,6 +141,33 @@ type GenerateRequest struct {
 	// Steps is the number of diffusion steps for image generation.
 	// Only used for image generation models.
 	Steps int32 `json:"steps,omitempty"`
+
+	// Experimental: Video generation fields (may change or be removed)
+
+	// NegativePrompt is the negative prompt for diffusion models.
+	NegativePrompt string `json:"negative_prompt,omitempty"`
+
+	// VideoFrames is the number of frames to generate for video models.
+	VideoFrames int32 `json:"video_frames,omitempty"`
+
+	// FPS is the output frame rate for video models.
+	FPS int32 `json:"fps,omitempty"`
+
+	// CFGScale is the classifier-free guidance scale for diffusion models.
+	CFGScale float32 `json:"cfg_scale,omitempty"`
+
+	// FlowShift is the flow shift parameter for WAN video models.
+	FlowShift float32 `json:"flow_shift,omitempty"`
+
+	// Sampler is the sampler name for diffusion models (e.g. "euler").
+	Sampler string `json:"sampler,omitempty"`
+
+	// OutputFormat is the desired output format for video ("webm","webp","gif")
+	// or image ("png") generation.
+	OutputFormat string `json:"output_format,omitempty"`
+
+	// EndImage is a base64-encoded end frame for FLF2V video generation.
+	EndImage []byte `json:"end_image,omitempty"`
 }
 
 // ChatRequest describes a request sent by [Client.Chat].
@@ -952,6 +979,12 @@ type GenerateResponse struct {
 	// Total is the total number of steps for image generation.
 	// Only present for image generation models during streaming.
 	Total int64 `json:"total,omitempty"`
+
+	// Experimental: Video generation fields (may change or be removed)
+
+	// Video contains a base64-encoded video container (e.g. webm).
+	// Only present for video generation models.
+	Video string `json:"video,omitempty"`
 }
 
 // ModelDetails provides details about a model.

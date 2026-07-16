@@ -927,3 +927,154 @@ func FromImageEditRequest(r ImageEditRequest) (api.GenerateRequest, error) {
 
 	return req, nil
 }
+
+// VideoGenerationRequest is an OpenAI-style video generation request.
+// OpenAI has no standardized video API as of 2026; this is an Ollama-native
+// surface mirroring the image API conventions.
+type VideoGenerationRequest struct {
+	Model          string  `json:"model"`
+	Prompt         string  `json:"prompt"`
+	NegativePrompt string  `json:"negative_prompt,omitempty"`
+	Size           string  `json:"size,omitempty"`
+	VideoFrames    int32   `json:"video_frames,omitempty"`
+	FPS            int32   `json:"fps,omitempty"`
+	Steps          int32   `json:"steps,omitempty"`
+	CFGScale       float32 `json:"cfg_scale,omitempty"`
+	FlowShift      float32 `json:"flow_shift,omitempty"`
+	Sampler        string  `json:"sampler,omitempty"`
+	OutputFormat   string  `json:"output_format,omitempty"`
+	Seed           *int64  `json:"seed,omitempty"`
+	Stream         *bool   `json:"stream,omitempty"`
+}
+
+// VideoGenerationResponse is an OpenAI-style video generation response.
+type VideoGenerationResponse struct {
+	Created int64            `json:"created"`
+	Data    []VideoURLOrData `json:"data"`
+}
+
+// VideoURLOrData contains either a URL or base64-encoded video data.
+type VideoURLOrData struct {
+	URL     string `json:"url,omitempty"`
+	B64JSON string `json:"b64_json,omitempty"`
+	Format  string `json:"format,omitempty"`
+}
+
+// FromVideoGenerationRequest converts a video generation request to an Ollama GenerateRequest.
+func FromVideoGenerationRequest(r VideoGenerationRequest) api.GenerateRequest {
+	req := api.GenerateRequest{
+		Model:          r.Model,
+		Prompt:         r.Prompt,
+		NegativePrompt: r.NegativePrompt,
+		VideoFrames:    r.VideoFrames,
+		FPS:            r.FPS,
+		Steps:          r.Steps,
+		CFGScale:       r.CFGScale,
+		FlowShift:      r.FlowShift,
+		Sampler:        r.Sampler,
+		OutputFormat:   r.OutputFormat,
+	}
+	if r.Size != "" {
+		var w, h int32
+		if _, err := fmt.Sscanf(r.Size, "%dx%d", &w, &h); err == nil {
+			req.Width = w
+			req.Height = h
+		}
+	}
+	if r.Seed != nil {
+		if req.Options == nil {
+			req.Options = map[string]any{}
+		}
+		req.Options["seed"] = *r.Seed
+	}
+	if r.Stream != nil {
+		req.Stream = r.Stream
+	}
+	return req
+}
+
+// ToVideoGenerationResponse converts an Ollama GenerateResponse to a VideoGenerationResponse.
+func ToVideoGenerationResponse(resp api.GenerateResponse) VideoGenerationResponse {
+	var data []VideoURLOrData
+	if resp.Image != "" {
+		data = []VideoURLOrData{{B64JSON: resp.Image}}
+	}
+	if resp.Video != "" {
+		data = []VideoURLOrData{{B64JSON: resp.Video}}
+	}
+	return VideoGenerationResponse{
+		Created: resp.CreatedAt.Unix(),
+		Data:    data,
+	}
+}
+
+// VideoEditRequest is an OpenAI-style video edit (image-to-video) request.
+type VideoEditRequest struct {
+	Model          string  `json:"model"`
+	Prompt         string  `json:"prompt"`
+	Image          string  `json:"image"`
+	EndImage       string  `json:"end_image,omitempty"`
+	NegativePrompt string  `json:"negative_prompt,omitempty"`
+	Size           string  `json:"size,omitempty"`
+	VideoFrames    int32   `json:"video_frames,omitempty"`
+	FPS            int32   `json:"fps,omitempty"`
+	Steps          int32   `json:"steps,omitempty"`
+	CFGScale       float32 `json:"cfg_scale,omitempty"`
+	FlowShift      float32 `json:"flow_shift,omitempty"`
+	Sampler        string  `json:"sampler,omitempty"`
+	OutputFormat   string  `json:"output_format,omitempty"`
+	Seed           *int64  `json:"seed,omitempty"`
+	Stream         *bool   `json:"stream,omitempty"`
+}
+
+// FromVideoEditRequest converts a video edit request to an Ollama GenerateRequest.
+func FromVideoEditRequest(r VideoEditRequest) (api.GenerateRequest, error) {
+	req := api.GenerateRequest{
+		Model:          r.Model,
+		Prompt:         r.Prompt,
+		NegativePrompt: r.NegativePrompt,
+		VideoFrames:    r.VideoFrames,
+		FPS:            r.FPS,
+		Steps:          r.Steps,
+		CFGScale:       r.CFGScale,
+		FlowShift:      r.FlowShift,
+		Sampler:        r.Sampler,
+		OutputFormat:   r.OutputFormat,
+	}
+
+	if r.Image != "" {
+		imgData, err := decodeImageURL(r.Image)
+		if err != nil {
+			return api.GenerateRequest{}, fmt.Errorf("invalid image: %w", err)
+		}
+		req.Images = append(req.Images, imgData)
+	}
+
+	if r.EndImage != "" {
+		endData, err := decodeImageURL(r.EndImage)
+		if err != nil {
+			return api.GenerateRequest{}, fmt.Errorf("invalid end_image: %w", err)
+		}
+		req.EndImage = endData
+	}
+
+	if r.Size != "" {
+		var w, h int32
+		if _, err := fmt.Sscanf(r.Size, "%dx%d", &w, &h); err == nil {
+			req.Width = w
+			req.Height = h
+		}
+	}
+
+	if r.Seed != nil {
+		if req.Options == nil {
+			req.Options = map[string]any{}
+		}
+		req.Options["seed"] = *r.Seed
+	}
+	if r.Stream != nil {
+		req.Stream = r.Stream
+	}
+
+	return req, nil
+}

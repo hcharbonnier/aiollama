@@ -299,6 +299,9 @@ type CompletionResponse struct {
 	// Image contains base64-encoded image data for image generation
 	Image string `json:"image,omitempty"`
 
+	// Video contains base64-encoded video data for video generation
+	Video string `json:"video,omitempty"`
+
 	// Step is the current step in image generation
 	Step int `json:"step,omitempty"`
 

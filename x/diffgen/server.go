@@ -308,6 +308,7 @@ func (s *Server) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 			Step:       step,
 			TotalSteps: total,
 			Image:      raw.Image,
+			Video:      raw.Video,
 		}
 		fn(cresp)
 		if cresp.Done {

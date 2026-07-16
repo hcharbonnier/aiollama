@@ -1915,6 +1915,9 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	// OpenAI-compatible image generation endpoints
 	r.POST("/v1/images/generations", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ImageGenerationsMiddleware(), s.GenerateHandler)
 	r.POST("/v1/images/edits", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ImageEditsMiddleware(), s.GenerateHandler)
+	// Ollama-native video generation endpoints (no OpenAI standard yet)
+	r.POST("/v1/video/generations", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.VideoGenerationsMiddleware(), s.GenerateHandler)
+	r.POST("/v1/video/edits", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.VideoEditsMiddleware(), s.GenerateHandler)
 	// OpenAI-compatible audio endpoint
 	r.POST("/v1/audio/transcriptions", middleware.TranscriptionMiddleware(), s.ChatHandler)
 
@@ -3227,6 +3230,10 @@ func (s *Server) handleImageGenerate(c *gin.Context, req api.GenerateRequest, mo
 
 		if cr.Image != "" {
 			res.Image = cr.Image
+		}
+
+		if cr.Video != "" {
+			res.Video = cr.Video
 		}
 
 		if cr.Done {
