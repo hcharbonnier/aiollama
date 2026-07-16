@@ -1,10 +1,11 @@
 # SOTA Implementation Plan: Image & Video Generation via stable-diffusion.cpp
 
 **Project:** aiollama (Ollama fork)
-**Goal:** Unify all generative media (image **and** video) on the
-[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) native backend,
-removing the existing MLX image-gen path entirely. Text generation stays on
-llama.cpp (unchanged). Supported on **all** platforms: Linux, macOS, Windows.
+**Goal:** Add video generation and broaden image-model coverage on the
+[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) native
+backend, **while retaining MLX** as the optimized macOS backend for the image and
+safetensors-LLM models it already supports. Text generation stays on llama.cpp
+(unchanged). Supported on **all** platforms: Linux, macOS, Windows.
 **Author:** Engineering analysis
 **Date:** 2026-07-16
 **Status:** Draft for review
@@ -13,34 +14,75 @@ llama.cpp (unchanged). Supported on **all** platforms: Linux, macOS, Windows.
 
 ## 1. Executive Summary
 
-This document is a State-of-the-Art (SOTA) implementation plan for consolidating
-all diffusion-based generation (image + video) onto a single native backend,
-stable-diffusion.cpp (SD.cpp), across all supported operating systems.
+This document is a State-of-the-Art (SOTA) implementation plan for adding
+diffusion-based video generation and broad image-model coverage on a single new
+native backend, stable-diffusion.cpp (SD.cpp), across all supported operating
+systems, **while keeping MLX as the optimized native backend for the models it
+already supports on macOS.**
 
-### Architectural decision: remove MLX, use SD.cpp for all media
+### Architectural decision: keep MLX, add SD.cpp as a complementary backend
 
 The fork currently carries **two** native inference stacks:
 
 | Stack | Purpose | Backends | Platforms |
 |-------|---------|----------|-----------|
 | llama.cpp | Text (LLM) generation | CUDA, Metal, Vulkan, ROCm, CPU | Win, Linux, Mac |
-| MLX | Image generation (and experimental safetensors LLM) | Metal, CUDA | Mac (primary), CUDA (secondary) |
+| MLX | Image generation (Z-Image, FLUX.2) + experimental safetensors LLM text | Metal, CUDA | Mac (primary), CUDA (secondary) |
 
-This plan **eliminates the MLX stack** and replaces it with SD.cpp for all
-diffusion workloads (image **and** video). The result is a clean, two-backend
-architecture:
+This plan **adds SD.cpp as a third, complementary native backend** rather than
+removing MLX. SD.cpp covers everything MLX does not: video, the broad image-model
+ecosystem (SDXL, SD3, Qwen-Image, Chroma, …), and cross-platform coverage on
+Linux/Windows. MLX is retained where it has unique value. The resulting
+architecture is a clean three-backend split:
 
 | Stack | Purpose | Backends | Platforms |
 |-------|---------|----------|-----------|
 | llama.cpp | Text (LLM) generation | CUDA, Metal, Vulkan, ROCm, CPU | Win, Linux, Mac |
-| stable-diffusion.cpp | Image **and** video generation | CUDA, Metal, Vulkan, OpenCL, SYCL, CPU | Win, Linux, Mac |
+| MLX | Image gen for natively-supported models (Z-Image, FLUX.2) + safetensors LLM text | Metal, CUDA | Mac (primary), CUDA (secondary) |
+| stable-diffusion.cpp | Video generation (all models) + image gen for models MLX does not support + image/video on Linux/Windows | CUDA, Metal, Vulkan, OpenCL, SYCL, CPU | Win, Linux, Mac |
 
-### Why SD.cpp is the right unified backend
+### Why keep MLX instead of removing it
+
+An earlier draft of this plan proposed removing MLX entirely and routing all
+image generation through SD.cpp. Detailed analysis (see Section 11, "MLX retention
+analysis") showed that a full removal is not justified in the near term because:
+
+1. **MLX runs 9 safetensors LLM text architectures** (Qwen3.5, Gemma4,
+   Cohere2-MoE, Laguna, GLM4-MoE-Lite, …) directly from checkpoints, with no
+   GGUF conversion. SD.cpp is diffusion-only and cannot replace this. Removing
+   MLX would drop a real, macOS-specific capability with no replacement.
+2. **MLX has deep Metal optimizations** that SD.cpp's ggml-Metal backend does
+   not: wired-memory pinning (Apple unified memory), graph compilation / closure
+   fusion (JIT Metal kernels), `mlx_fast_*` fused kernels (RMSNorm, RoPE, SDPA),
+   and zero-copy mmap of safetensors to GPU. No benchmark establishes that
+   SD.cpp+Metal matches MLX+Metal for FLUX.2 / Z-Image on Apple Silicon.
+3. **Video on macOS is CPU-bound regardless.** The WAN VAE supports only CUDA
+   and CPU (not Metal), so SD.cpp video on macOS Metal falls back to CPU VAE
+   either way. Removing MLX does not improve this and only removes the optimized
+   image path.
+
+MLX's sole downside is a larger maintenance surface (two diffusion stacks on
+macOS). The hybrid approach accepts that cost in exchange for preserving unique
+capabilities and proven Metal performance.
+
+### Recommended dispatch strategy (hybrid)
+
+| Request | Backend selected |
+|---------|-------------------|
+| Image gen, model natively supported by MLX (Z-Image, FLUX.2), on macOS | **MLX** (optimized Metal) |
+| Image gen, model NOT supported by MLX (SDXL, SD3, Qwen-Image, …) | **SD.cpp** |
+| Image gen on Linux/Windows | **SD.cpp** (MLX is macOS-relevant only) |
+| Video gen (any platform, any model) | **SD.cpp** (only option) |
+| Safetensors LLM text on macOS | **MLX** runner (preserved) |
+| GGUF LLM text (any platform) | **llama.cpp** (unchanged) |
+
+The existing scheduler dispatch in `server/sched.go` already supports this
+coexistence: `IsDiffGen()` (SD.cpp) vs `IsMLX()` (safetensors) vs the default
+llama.cpp (GGUF) path. No scheduler rearchitecture is required to keep MLX.
 
 SD.cpp is a pure C/C++ implementation built on ggml — the same lineage as
 llama.cpp — and shares its build system conventions (CMake, per-backend
-GPU compilation, GGUF support). It is a superset of what MLX currently provides
-for image generation, plus native video support:
+GPU compilation, GGUF support). It complements MLX by covering what MLX does not:
 
 - **Image models:** SD1.x/2.x, SDXL, SD3/3.5, FLUX.1/2, Qwen-Image, Z-Image,
   Chroma, LongCat, Krea2, HiDream, Ideogram4, and image-edit variants
@@ -54,10 +96,11 @@ for image generation, plus native video support:
   ESRGAN upscale, VAE tiling, flash attention, LCM, negative prompts,
   cross-platform reproducibility (`--rng cuda/cpu`), PNG metadata embedding.
 
-Because SD.cpp already supports Metal and CUDA, dropping MLX **loses nothing**
-in image-gen capability while gaining video, Vulkan, OpenCL, and SYCL coverage,
-and removing a large maintenance surface (the entire `x/imagegen/mlx/`,
-`x/mlxrunner/`, and MLX CMake subproject).
+SD.cpp adds video, the broad image-model ecosystem, and Vulkan/OpenCL/SYCL
+coverage that MLX never had. It coexists with MLX: where MLX has a native
+implementation (Z-Image, FLUX.2 image on macOS), MLX is preferred for its
+deep Metal optimizations; SD.cpp handles everything else (video, other image
+models, and all image/video work on Linux/Windows).
 
 ### Key findings from the codebase analysis
 
@@ -86,15 +129,14 @@ The aiollama fork already ships a working image-generation subsystem under
 | Scope | Effort | Notes |
 |-------|-------|-------|
 | SD.cpp build integration (CMake + FetchContent, all backends) | 2-3 weeks | Model on the llama.cpp backend build pattern |
-| CGO binding package (`x/sdcpp`) | 1-2 weeks | Replace the MLX bridge |
-| Unified runner (image + video, `x/diffgen/`) | 2-3 weeks | Replaces `x/imagegen/` |
-| API endpoints + middleware (image reuse + new video) | 1-2 weeks | Image path mostly preserved; video is new |
-| Scheduler + capabilities + memory estimation | 1 week | Add `"video"` capability path |
+| CGO binding package (`x/sdcpp`) | 1-2 weeks | New bridge, coexists with the MLX bridge |
+| Unified runner (image + video, `x/diffgen/`) | 2-3 weeks | New runner alongside the retained MLX imagegen runner |
+| API endpoints + middleware (image reuse + new video) | 1-2 weeks | Image path preserved; video is new |
+| Scheduler + capabilities + memory estimation | 1 week | Add `"video"` capability path; keep MLX dispatch |
 | Model import (safetensors/GGUF → manifest) | 1-2 weeks | Component-file manifest |
-| CLI + progress UX for image + video | 1 week | Extend/replace `x/imagegen/cli.go` |
-| MLX removal + migration cleanup | 1-2 weeks | Delete MLX packages, CMake, refs |
+| CLI + progress UX for image + video | 1 week | New diffgen CLI; MLX CLI retained |
 | Multi-backend testing (CUDA/Metal/Vulkan/CPU) | 2-3 weeks | Parallel with above |
-| **Total (focused, CUDA+CPU first)** | **~3-4 months** | Full multi-backend release |
+| **Total (focused, CUDA+CPU first)** | **~2.5-3.5 months** | Video + broad image coverage; MLX retained |
 
 ---
 
@@ -112,7 +154,7 @@ middleware/             # gin middleware: ImageGenerationsMiddleware, ImageEdits
 middleware/openai.go    # ImageWriter translates ndjson stream → OpenAI response
 types/model/config.go   # ConfigV2 (Capabilities, ModelFormat, Architecture)
 x/
-  imagegen/             # *** existing image-gen subsystem (MLX-based) — TO BE REPLACED ***
+  imagegen/             # *** existing image-gen subsystem (MLX-based) — RETAINED for MLX-supported image models ***
     imagegen.go         # ImageModel interface + loadImageModel
     server.go           # Server (llm.LlamaServer) wraps MLX subprocess
     runner.go           # Execute() entry for `ollama runner --imagegen-engine`
@@ -121,36 +163,40 @@ x/
     image.go            # MLX Array → PNG / base64
     memory.go           # CheckPlatformSupport, DetectModelType
     manifest/           # per-tensor blob manifest + weights loader
-    mlx/                # *** CGO bridge to MLX C library — TO BE DELETED ***
+    mlx/                # CGO bridge to MLX C library — RETAINED (MLX kept)
     models/
-      flux2/            # FLUX.2 Klein model impl (MLX tensors) — TO BE DELETED
-      zimage/           # Z-Image model impl (MLX tensors) — TO BE DELETED
+      flux2/            # FLUX.2 Klein model impl (MLX tensors) — RETAINED
+      zimage/           # Z-Image model impl (MLX tensors) — RETAINED
     safetensors/        # safetensors parsing + LoadModule reflection loader
-  mlxrunner/            # *** separate MLX-based LLM runner (text gen) — TO BE DELETED ***
+  mlxrunner/            # *** separate MLX-based LLM runner (text gen) — RETAINED (safetensors LLM on macOS) ***
   create/               # safetensors→manifest creation utilities
   safetensors/          # safetensors extraction
 cmake/
-  local.cmake           # superbuild: llama.cpp + MLX via ExternalProject/FetchContent
-  mlx/                  # MLX CMake subproject — TO BE DELETED
+  local.cmake           # superbuild: llama.cpp + MLX via ExternalProject/FetchContent (+ SD.cpp added)
+  mlx/                  # MLX CMake subproject — RETAINED (MLX kept)
 llama/                  # llama.cpp server subproject + compat (RETAINED for text)
 discover/               # GPU detection (per-OS files)
 CMakeLists.txt          # root orchestration
 LLAMA_CPP_VERSION       # pinned llama.cpp ref (RETAINED)
-MLX_VERSION, MLX_C_VERSION  # pinned MLX refs — TO BE DELETED
+MLX_VERSION, MLX_C_VERSION  # pinned MLX refs — RETAINED (MLX kept)
 ```
 
-### 2.2 Existing image-gen request flow (to be replaced)
+### 2.2 Existing image-gen request flow (MLX path, retained)
 
 ```
 CLI (cmd.go:886 imagegen.RunCLI)
   → api.Client.Generate(/api/generate)
   → server.GenerateHandler (routes.go:254)
-  → scheduler GetRunner (sched.go) — selects imagegen.NewServer if capability=="image"
+  → scheduler GetRunner (sched.go) — selects imagegen.NewServer if capability=="image" AND model is MLX-supported on macOS
   → x/imagegen.Server (server.go) spawns subprocess `ollama runner --imagegen-engine`
   → x/imagegen.Execute (runner.go) starts HTTP server in subprocess
   → Server.Completion (server.go:258) POSTs to child /completion
   → child handleImageCompletion (imagegen.go:64) streams ndjson {step,total} then {image}
 ```
+
+This MLX path is **retained** for the image models MLX supports natively
+(Z-Image, FLUX.2) on macOS. A new parallel SD.cpp path (Section 4, Phase 2)
+handles video and the broader image-model set.
 
 ### 2.3 Text-gen flow (retained, unchanged)
 
@@ -161,11 +207,12 @@ ollama run <llm-model>
   → token streaming via /completion
 ```
 
-Text generation is entirely on llama.cpp and is **not** affected by removing MLX.
-The MLX-based safetensors LLM runner (`x/mlxrunner/`) is a separate experimental
-text path that is also removed; safetensors LLM models are not part of the
-image/video scope and would fall back to conversion to GGUF or remain unsupported
-(out of scope for this plan).
+Text generation is entirely on llama.cpp and is **not** affected by this plan.
+The MLX-based safetensors LLM runner (`x/mlxrunner/`) is a separate text path
+that is **retained** — it runs 9 safetensors LLM architectures (Qwen3.5, Gemma4,
+Cohere2-MoE, Laguna, GLM4-MoE-Lite, …) directly from checkpoints on macOS
+without GGUF conversion. Keeping MLX preserves this capability; SD.cpp is
+diffusion-only and cannot serve it.
 
 ### 2.4 Key interfaces and contracts
 
@@ -175,17 +222,21 @@ image/video scope and would fall back to conversion to GGUF or remain unsupporte
   uses `"image"`, `"completion"`, `"vision"`, `"audio"`, `"tools"`, etc.
 - Scheduler dispatch (`sched.go:594`): `if slices.Contains(capabilities, "image")`.
 - `ImageModel` interface (`imagegen.go:19`): MLX-specific (`*mlx.Array` return) —
-  replaced by an SD.cpp-native interface.
+  **retained** for the MLX image path. The new SD.cpp runner uses its own
+  native interface (`DiffModel`); the two coexist.
 
 ### 2.5 Build system
 
 `cmake/local.cmake` is a superbuild using `ExternalProject_Add`:
 - llama.cpp (from `LLAMA_CPP_VERSION` pin) → `ollama_add_llama_server_build()`
-- MLX + MLX-C (from `MLX_VERSION`/`MLX_C_VERSION` pins) → `ollama_add_mlx_build()` — **removed**
+- MLX + MLX-C (from `MLX_VERSION`/`MLX_C_VERSION` pins) → `ollama_add_mlx_build()` — **retained**
+- SD.cpp (from `SD_CPP_VERSION` pin, added) → `ollama_add_sdcpp_build()` — **new**
 
 Backends selected via `OLLAMA_LLAMA_BACKENDS` (cuda_v12, rocm_v7_1, vulkan, ...)
-and `OLLAMA_MLX_BACKENDS` (cuda_v13, metal_v3/v4). The MLX variable is removed;
-a new `OLLAMA_SDCPP_BACKENDS` variable governs SD.cpp backends.
+and `OLLAMA_MLX_BACKENDS` (cuda_v13, metal_v3/v4) — both **retained**. A new
+`OLLAMA_SDCPP_BACKENDS` variable (cpu;cuda_v12;metal;vulkan) governs SD.cpp
+backends. The three backend sets are independent and can be configured
+separately per platform.
 
 ---
 
@@ -318,16 +369,25 @@ Boogu-Image-Edit.
 
 ### 4.1 Design principles
 
-1. **SD.cpp is the single diffusion backend** for image **and** video on all
-   platforms. No MLX dependency remains.
-2. **Text generation stays on llama.cpp** — fully unchanged.
-3. **Unified diffgen runner.** A single new `x/diffgen/` package handles both
-   image and video via SD.cpp, replacing `x/imagegen/` and `x/mlxrunner/`.
-   The runner exposes `/completion` (streaming ndjson) like the existing imagegen
-   runner, with mode detected from the loaded model.
+1. **SD.cpp is an added diffusion backend** for image **and** video, covering
+   what MLX cannot: video, the broad image-model ecosystem (SDXL, SD3,
+   Qwen-Image, …), and all platforms (Linux/Windows). **MLX is retained** as
+   the optimized macOS backend for the image and safetensors-LLM models it
+   already supports.
+2. **Text generation stays on llama.cpp** — fully unchanged. The MLX
+   safetensors LLM runner is also retained for the 9 text architectures it
+   serves on macOS.
+3. **New diffgen runner alongside the MLX runner.** A new `x/diffgen/`
+   package handles image and video via SD.cpp, **coexisting** with the
+   retained `x/imagegen/` (MLX) and `x/mlxrunner/` runners. The scheduler
+   picks the backend per model. The new runner exposes `/completion`
+   (streaming ndjson) like the existing imagegen runner, with mode detected
+   from the loaded model.
 4. **Capabilities: `"image"` and `"video"` are distinct.** A model is one or the
    other (or both, if the SD.cpp context supports both), determined at import
-   time by `model_index.json` architecture. The scheduler dispatches accordingly.
+   time by `model_index.json` architecture. The scheduler dispatches
+   accordingly — to MLX for MLX-supported image models on macOS, to SD.cpp
+   for video and other image models.
 5. **Mirror the proven runner pattern.** The new runner implements
    `llm.LlamaServer` and is spawned as a subprocess, exactly like the existing
    `x/imagegen/server.go`.
@@ -340,20 +400,21 @@ Boogu-Image-Edit.
 
 ### Phase 0: Foundation and build integration
 
-**Goal:** Build SD.cpp as a native library alongside llama.cpp, without any Go
-integration yet. Remove MLX build wiring.
+**Goal:** Build SD.cpp as a native library alongside llama.cpp **and MLX**,
+without any Go integration yet. MLX build wiring is **retained**; SD.cpp is added
+as a third native stack.
 
-#### 0.1 Remove MLX from the build
-- Delete `cmake/mlx/` and the `ollama_add_mlx_build()` function in
+#### 0.1 Keep MLX in the build (no removal)
+- **Retain** `cmake/mlx/` and the `ollama_add_mlx_build()` function in
   `cmake/local.cmake`.
-- Remove `MLX_VERSION` and `MLX_C_VERSION` files.
-- Remove `OLLAMA_MLX_BACKENDS` cache variable and all `mlx_*` preset logic.
-- Remove the `ollama-mlx-generate-wrappers` custom target and
-  `cmake/vendor-mlx-c-headers.cmake`.
-- Remove `x/imagegen/mlx/`, `x/mlxrunner/`, and MLX model implementations
-  (`x/imagegen/models/flux2/`, `x/imagegen/models/zimage/`) — these are
-  replaced by SD.cpp native implementations (no Go-side model code needed;
-  SD.cpp loads the model files directly).
+- **Retain** `MLX_VERSION` and `MLX_C_VERSION` files.
+- **Retain** `OLLAMA_MLX_BACKENDS` cache variable and `mlx_*` preset logic.
+- **Retain** `x/imagegen/mlx/`, `x/mlxrunner/`, and MLX model implementations
+  (`x/imagegen/models/flux2/`, `x/imagegen/models/zimage/`). These continue to
+  serve MLX-supported image models (Z-Image, FLUX.2) and the 9 safetensors LLM
+  text architectures on macOS.
+- The new SD.cpp native implementations load model files directly (no Go-side
+  model code needed), but they do **not** replace the MLX image path.
 
 #### 0.2 Pin SD.cpp version
 - Add `SD_CPP_VERSION` file at repo root (mirroring `LLAMA_CPP_VERSION`).
@@ -384,26 +445,28 @@ Add to `cmake/local.cmake`:
 - Wire into the `ollama-local` aggregate target.
 
 #### 0.4 ggml coexistence strategy
-SD.cpp vendors its own ggml; llama.cpp uses its own pinned ggml. To avoid symbol
-clashes when both are loaded into the same process (the Ollama binary links
-llama.cpp at build time and loads SD.cpp as a shared lib):
+SD.cpp vendors its own ggml; llama.cpp uses its own pinned ggml; MLX has its
+own runtime. To avoid symbol clashes when multiple are loaded into the same
+process (the Ollama binary links llama.cpp at build time and loads SD.cpp / MLX
+as shared libs):
 - **Build SD.cpp as a shared library** (`SD_BUILD_SHARED_LIBS=ON`) with hidden
   default visibility except the `SD_API` surface. SD.cpp already marks its API
   with `__attribute__((visibility("default")))` / `__declspec(dllexport)`.
 - This keeps each ggml's internal symbols private to its shared object, avoiding
   conflicts. Verify with `nm`/`dumpbin` that no `ggml_*` symbols leak.
-- **Phase 0 validation:** load both `libllama` and `libstable-diffusion` in a
-  test binary and confirm no duplicate-symbol linker errors.
+- **Phase 0 validation:** load `libllama`, `libstable-diffusion`, and the MLX
+  library in a test binary and confirm no duplicate-symbol linker errors.
 
 **Deliverable:** `cmake --build build` produces `libstable-diffusion.*` for the
-selected backends alongside the llama.cpp runners. MLX is gone from the build.
+selected backends alongside the llama.cpp runners **and the retained MLX
+libraries**. MLX is preserved in the build.
 
 ---
 
 ### Phase 1: CGO binding package
 
-**Goal:** A Go package `x/sdcpp/` that wraps the SD.cpp C API, replacing the
-MLX bridge.
+**Goal:** A Go package `x/sdcpp/` that wraps the SD.cpp C API, as a **new** bridge
+that coexists with the retained MLX bridge in `x/imagegen/mlx/`.
 
 #### 1.1 Package structure
 ```
@@ -416,7 +479,7 @@ x/sdcpp/
 ```
 
 #### 1.2 CGO directives
-Mirror the (now-deleted) `x/imagegen/mlx/mlx.go` cgo pattern:
+Mirror the existing `x/imagegen/mlx/mlx.go` cgo pattern (which is retained):
 
 ```go
 package sdcpp
@@ -463,10 +526,11 @@ Map C types:
 
 **Goal:** A working `ollama runner --diffgen-engine --model <name> --port <port>`
 subprocess that can generate images **and** videos from SD.cpp models, streaming
-progress.
+progress. This runner is **new and parallel** to the retained MLX imagegen runner;
+the scheduler selects which to spawn per model.
 
 #### 2.1 New runner package: `x/diffgen/`
-Replaces `x/imagegen/` entirely:
+Sits alongside the retained `x/imagegen/` (MLX); does not replace it:
 
 ```
 x/diffgen/
@@ -478,7 +542,7 @@ x/diffgen/
   video.go          # frames → container (PNG stream / WebM / GIF / animated WebP)
   memory.go         # platform support, DetectModelType, backend selection
   manifest/         # component-file manifest loader
-  cli.go            # CLI: ollama run <model> "prompt" (image or video)
+  cli.go            # CLI: ollama run <model> "prompt" (image or video) via SD.cpp
 ```
 
 #### 2.2 Request/response types (`types.go`)
@@ -539,7 +603,8 @@ Mirror `x/imagegen/runner.go:Execute`. The subprocess:
    (queried via `sdcpp.SupportsVideoGeneration(ctx)`).
 
 #### 2.4 `handleImageCompletion` (`diffgen.go`)
-Replaces `x/imagegen/imagegen.go:handleImageCompletion`, but calls SD.cpp:
+Mirrors `x/imagegen/imagegen.go:handleImageCompletion` (which is retained for
+MLX), but calls SD.cpp:
 
 ```go
 func (s *server) handleImageCompletion(w http.ResponseWriter, r *http.Request, req DiffRequest) {
@@ -648,39 +713,57 @@ runs; POSTing to `/completion` streams progress and returns images or frames.
 ### Phase 3: Scheduler and model dispatch
 
 **Goal:** `ollama run <model> "prompt"` works end-to-end through the normal
-server, with the scheduler managing the SD.cpp runner.
+server, with the scheduler managing the SD.cpp runner **alongside** the retained
+MLX imagegen runner and the llama.cpp text runner.
 
 #### 3.1 Capabilities: `"image"` and `"video"`
 The `Capabilities` field already accepts arbitrary strings. Image models get
 `["image"]`, video models get `["video"]`, and models supporting both (rare)
-get `["image","video"]`. Set at import time (Phase 5).
+get `["image","video"]`. Set at import time (Phase 5). MLX-supported image
+models (Z-Image, FLUX.2) keep `["image"]` and a `model_format: "mlx"` marker so
+the scheduler can route them to MLX on macOS.
 
 #### 3.2 Scheduler dispatch (`server/sched.go`)
-At `sched.go:592-599`, replace the MLX/imagegen branch with SD.cpp dispatch:
+At `sched.go:592-599`, **extend** the existing dispatch to add the SD.cpp
+(diffgen) branch **without removing** the MLX imagegen and mlxrunner branches:
 
 ```go
 switch {
 case slices.Contains(req.model.Config.Capabilities, "video"):
+    // SD.cpp is the only video backend (MLX has no video support)
     llama, err = diffgen.NewServer(modelName, "video")
 case slices.Contains(req.model.Config.Capabilities, "image"):
-    llama, err = diffgen.NewServer(modelName, "image")
+    if isMLXSupportedImageModel(req.model) && runtime.GOOS == "darwin" {
+        // Retained MLX path: Z-Image, FLUX.2 on macOS (optimized Metal)
+        llama, err = imagegen.NewServer(modelName)
+    } else {
+        // SD.cpp path: all other image models, and image gen on Linux/Windows
+        llama, err = diffgen.NewServer(modelName, "image")
+    }
+case isMLXSafetensorsLLM(req.model):
+    // Retained MLX safetensors LLM runner (9 text architectures on macOS)
+    llama, err = mlxrunner.NewClient(...)
 default:
-    // llama.cpp text path (existing newServerFn)
+    // llama.cpp text path (existing newServerFn) for GGUF models
     config := llamaServerConfigForModel(req.model)
     llama, err = s.newServerFn(systemInfo, loadGpus, ...)
 }
 ```
 
-This removes the `imagegen.NewServer` and `mlxrunner.NewClient` branches
-(sched.go:595, 597).
+`isMLXSupportedImageModel` checks the model's architecture/format against the
+MLX-supported set (Z-Image, FLUX.2) — this is a small, explicit allowlist. The
+existing `imagegen.NewServer` and `mlxrunner.NewClient` branches are **kept**;
+only the `"video"` capability and the SD.cpp `"image"` fallback are new.
 
-#### 3.3 Runner ref cleanup
-- Replace `runnerRef.isImagegen bool` (sched.go:1358) with `runnerKind string`
-  (`"llama"`/`"diffgen"`), or add `isDiffgen bool`.
-- Update `needsReload` (sched.go:1399) to check `wantImage || wantVideo` against
-  the loaded runner kind.
-- Remove `mlxrunner` import (sched.go:27) and all `IsMLX()` checks in
-  `server/routes.go` (lines 567, 1519, 2363, 2701) and `server/images.go:84`.
+#### 3.3 Runner ref additions
+- Keep `runnerRef.isImagegen bool` (sched.go:1358) for the MLX path; add a
+  parallel `isDiffgen bool` (or extend `runnerKind` to `"llama"`/`"mlx-image"`/
+  `"mlx-llm"`/`"diffgen"`).
+- Update `needsReload` (sched.go:1399) to check `wantImage || wantVideo`
+  against the loaded runner kind, including the new diffgen kind.
+- **Keep** the `mlxrunner` import (sched.go:27) and all `IsMLX()` checks in
+  `server/routes.go` (lines 567, 1519, 2363, 2701) and `server/images.go:84` —
+  they serve the retained MLX path. No removal.
 
 #### 3.4 Memory estimation
 SD.cpp context creation is where VRAM is consumed. `Server.Load()` must estimate
@@ -696,12 +779,14 @@ VRAM before spawning:
 
 #### 3.5 GPU/backend resolution
 `discover/` returns `[]ml.DeviceInfo`. Map to SD.cpp `backend` string (see 2.8).
-Reuse the `configureMLXSubprocessEnv` pattern (`server.go:185`) as
-`configureDiffgenSubprocessEnv` to set `LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH`
-to the sdcpp install dir for the selected backend.
+Add a `configureDiffgenSubprocessEnv` modeled on the **retained**
+`configureMLXSubprocessEnv` (`server.go:185`) to set
+`LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH` to the sdcpp install dir for the selected
+backend. The MLX env-configuration function stays for the MLX path.
 
 **Deliverable:** `ollama run <model> "prompt"` → scheduler spawns the SD.cpp
-runner → output streams back. Works for both image and video models.
+runner → output streams back. Works for both image and video models. MLX image
+and safetensors-LLM models continue to route to the retained MLX runners.
 
 ---
 
@@ -728,11 +813,12 @@ OutputFormat   string  `json:"output_format,omitempty"`
 Add `Video string` to `api.GenerateResponse` for the final container. The
 streaming `Step`/`Total` fields (already present) carry progress.
 
-#### 4.2 Image endpoints (preserved, rewired)
+#### 4.2 Image endpoints (preserved, backend-agnostic)
 `/v1/images/generations` and `/v1/images/edits` remain. The middleware
 (`middleware/openai.go:601`) is unchanged — it converts to
-`api.GenerateRequest` and the runner handles it. The only change is the runner
-behind it (SD.cpp instead of MLX). `ImageWriter` works as-is.
+`api.GenerateRequest` and the scheduler routes it to the appropriate runner
+(MLX for MLX-supported models on macOS, SD.cpp otherwise). The middleware does
+not need to know which backend is selected. `ImageWriter` works as-is.
 
 #### 4.3 Video endpoints (new)
 OpenAI has no standardized video generation API as of 2026. Define an
@@ -901,18 +987,23 @@ creates a runnable model for image or video.
 bar, and `ollama run <model> -i image.png "prompt"` does img2img / I2V.
 
 #### 6.1 CLI dispatch (`cmd/cmd.go`)
-At `cmd.go:886`, replace the `imagegen.RunCLI` call with a unified dispatch:
+At `cmd.go:886`, **extend** the existing `imagegen.RunCLI` dispatch to also
+handle SD.cpp diffgen models, without removing the MLX path:
 
 ```go
 if diffgen.IsDiffModel(name) {
     return diffgen.RunCLI(cmd, name, opts.Prompt, interactive, opts.KeepAlive)
 }
+if imagegen.IsImageModel(name) {
+    return imagegen.RunCLI(cmd, name, opts.Prompt, interactive, opts.KeepAlive) // retained MLX path
+}
 ```
 
-The runner auto-detects image vs video mode from the model's capabilities.
+The diffgen runner auto-detects image vs video mode from the model's
+capabilities. The `imagegen` check (MLX) remains for MLX-supported image models.
 
 #### 6.2 `x/diffgen/cli.go`
-Mirror `x/imagegen/cli.go` (which it replaces). Differences:
+Mirror `x/imagegen/cli.go` (which is **retained** for MLX models). Differences:
 - Flags: `--width`, `--height`, `--steps`, `--seed`, `--negative`,
   `--cfg-scale`, `--sampler`, `--output-format`, plus video-specific
   `--video-frames`, `--fps`, `--flow-shift`.
@@ -941,46 +1032,56 @@ video params:
 
 ---
 
-### Phase 7: MLX removal and migration cleanup
+### Phase 7: Coexistence hardening and documentation
 
-**Goal:** All MLX code, build wiring, and references are removed. The codebase
-is clean.
+**Goal:** Ensure SD.cpp and MLX coexist cleanly in the same binary and build,
+with no symbol clashes, correct scheduler routing, and up-to-date docs. MLX is
+**retained** — this phase replaces the originally-planned "MLX removal" step.
 
-#### 7.1 Delete MLX packages
-- `x/imagegen/` (entire directory — replaced by `x/diffgen/`)
-- `x/imagegen/mlx/` (CGO bridge)
-- `x/imagegen/models/flux2/`, `x/imagegen/models/zimage/` (MLX model impls)
-- `x/mlxrunner/` (entire directory — MLX-based LLM runner)
-- `x/models/` MLX-dependent model implementations (qwen3_5, qwen3_5_moe, etc.
-  that import `x/mlxrunner/`) — these are MLX text-gen models and are removed
-  with the MLX runner. Their GGUF equivalents run via llama.cpp.
-- `x/internal/mlxthread/` (MLX thread affinity)
-- `cmake/mlx/` and `cmake/vendor-mlx-c-headers.cmake`
+#### 7.1 Verify MLX + SD.cpp coexistence
+- Confirm `cmake --build build` produces both `libstable-diffusion.*` and the
+  MLX libraries with no linker errors or duplicate `ggml_*` symbols (see Phase
+  0.4 validation).
+- Confirm the scheduler dispatch (Phase 3.2) routes MLX-supported image models
+  to `imagegen.NewServer` and all other image/video models to
+  `diffgen.NewServer`.
+- Confirm the CLI dispatch (Phase 6.1) checks both `diffgen.IsDiffModel` and
+  `imagegen.IsImageModel`.
 
-#### 7.2 Remove MLX build wiring
-- `cmake/local.cmake`: remove `ollama_add_mlx_build()`, `OLLAMA_MLX_BACKENDS`,
-  MLX source fetching, `ollama-mlx-generate-wrappers`, `ollama-mlx-backends`.
-- Delete `MLX_VERSION` and `MLX_C_VERSION` files.
-- `Dockerfile`: remove MLX build dependencies.
+#### 7.2 Keep MLX packages and build wiring (no removal)
+- **Retain** `x/imagegen/` (MLX image-gen subsystem for Z-Image, FLUX.2 on macOS).
+- **Retain** `x/imagegen/mlx/` (CGO bridge), `x/imagegen/models/flux2/`,
+  `x/imagegen/models/zimage/` (MLX model implementations).
+- **Retain** `x/mlxrunner/` (safetensors LLM runner — 9 text architectures).
+- **Retain** `x/models/` MLX-dependent model implementations (qwen3_5,
+  qwen3_5_moe, etc. that import `x/mlxrunner/`).
+- **Retain** `x/internal/mlxthread/` (MLX thread affinity).
+- **Retain** `cmake/mlx/`, `cmake/vendor-mlx-c-headers.cmake`,
+  `ollama_add_mlx_build()`, `OLLAMA_MLX_BACKENDS`, `MLX_VERSION`,
+  `MLX_C_VERSION`.
 
-#### 7.3 Remove MLX references in Go code
-- `server/sched.go`: remove `mlxrunner` import (line 27), `IsMLX()` checks
-  (lines 531, 1443), `mlxrunner.NewClient` branch (line 597).
-- `server/routes.go`: remove `IsMLX()` checks (lines 567, 1519, 2363, 2701).
-- `server/images.go`: remove `IsMLX()` method (line 84) and its callers.
-- `x/quant/`, `x/safetensors/`, `x/create/`: update any MLX-dependent code to
-  be backend-agnostic or remove if solely MLX-serving.
-- `cmd/cmd.go`: remove `imagegen` import, `--imagegen` flag (line 2371),
-  `use_imagegen_runner` option handling (line 222).
+#### 7.3 Keep MLX references in Go code (no removal)
+- `server/sched.go`: **keep** `mlxrunner` import (line 27), `IsMLX()` checks
+  (lines 531, 1443), `mlxrunner.NewClient` branch (line 597). Add the diffgen
+  branch alongside.
+- `server/routes.go`: **keep** `IsMLX()` checks (lines 567, 1519, 2363, 2701).
+- `server/images.go`: **keep** `IsMLX()` method (line 84) and its callers.
+- `cmd/cmd.go`: **keep** `imagegen` import, `--imagegen` flag (line 2371),
+  `use_imagegen_runner` option handling (line 222). Add the diffgen dispatch
+  alongside.
 
 #### 7.4 Update documentation
-- `AGENTS.md`: update architecture section to reflect two-backend model
-  (llama.cpp for text, SD.cpp for image+video).
-- `x/imagegen/README.md` → `x/diffgen/README.md`: rewrite for SD.cpp backend.
-- `docs/development.md`: update build instructions (no MLX, add SD.cpp).
+- `AGENTS.md`: update architecture section to reflect the **three-backend**
+  model (llama.cpp for GGUF text, MLX for safetensors LLM text + MLX-supported
+  image on macOS, SD.cpp for video + broad image coverage on all platforms).
+- `x/diffgen/README.md`: document the SD.cpp runner and its coexistence with
+  the MLX `x/imagegen/` runner.
+- `docs/development.md`: add SD.cpp build instructions alongside the existing
+  MLX instructions (both are built; `OLLAMA_SDCPP_BACKENDS` is new).
 
-**Deliverable:** `go build ./...` and `cmake --build build` succeed with zero
-MLX references. `grep -ri mlx .` returns nothing in source.
+**Deliverable:** `go build ./...` and `cmake --build build` succeed with both
+SD.cpp and MLX present. The scheduler correctly routes models to the right
+backend. MLX image and safetensors-LLM capabilities are fully preserved.
 
 ---
 
@@ -1052,33 +1153,24 @@ and backend limitations.
 | `x/diffgen/manifest/manifest.go` | Component-file manifest loader |
 | `x/diffgen/README.md` | Documentation |
 
-### Deleted files (MLX removal)
-| Path | Reason |
-|------|--------|
-| `MLX_VERSION` | MLX pin removed |
-| `MLX_C_VERSION` | MLX-C pin removed |
-| `cmake/mlx/` (entire dir) | MLX CMake subproject |
-| `cmake/vendor-mlx-c-headers.cmake` | MLX header vendoring |
-| `x/imagegen/` (entire dir) | Replaced by `x/diffgen/` |
-| `x/mlxrunner/` (entire dir) | MLX-based LLM runner removed |
-| `x/internal/mlxthread/` (entire dir) | MLX thread affinity |
-| `x/models/` MLX-dependent impls | MLX text-gen model implementations |
+### Deleted files
+None. MLX is **retained** — no files are deleted. The new SD.cpp files are
+additive alongside the existing MLX packages.
 
 ### Modified files
 | Path | Change |
-|------|--------|
-| `CMakeLists.txt` | Include `cmake/sdcpp` if SD.cpp backends requested |
-| `cmake/local.cmake` | Remove MLX build; add `ollama_add_sdcpp_build()`, `OLLAMA_SDCPP_BACKENDS` |
-| `server/sched.go` | Remove mlxrunner/imagegen; dispatch `"image"`/`"video"` to `diffgen.NewServer` |
-| `server/routes.go` | Remove `IsMLX()` checks; register `/v1/video/generations`, `/v1/video/edits` |
-| `server/images.go` | Remove `IsMLX()` method |
-| `server/create.go` | SD.cpp model import path (detect + component blobs) |
-| `api/types.go` | Add video fields to `GenerateRequest`/`GenerateResponse` |
+|------|-------|
+| `CMakeLists.txt` | Include `cmake/sdcpp` if SD.cpp backends requested (additive; MLX include retained) |
+| `cmake/local.cmake` | Add `ollama_add_sdcpp_build()`, `OLLAMA_SDCPP_BACKENDS` (additive; MLX build retained) |
+| `server/sched.go` | Add diffgen dispatch for `"video"` and non-MLX `"image"`; keep mlxrunner/imagegen branches |
+| `server/routes.go` | Register `/v1/video/generations`, `/v1/video/edits`; keep `IsMLX()` checks |
+| `server/create.go` | Add SD.cpp model import path (detect + component blobs); keep MLX import path |
+| `api/types.go` | Add video fields to `GenerateRequest`/`GenerateResponse` (additive) |
 | `openai/openai.go` | Add `VideoGenerationRequest`/`VideoEditRequest` types + converters |
 | `middleware/openai.go` | Add `VideoGenerationsMiddleware`/`VideoEditsMiddleware` + `VideoWriter` |
-| `cmd/cmd.go` | Replace `imagegen.RunCLI` with `diffgen.RunCLI`; remove `--imagegen` flag |
-| `Dockerfile` | Remove MLX deps; add SD.cpp build deps |
-| `AGENTS.md` | Update architecture section (two-backend model) |
+| `cmd/cmd.go` | Add `diffgen.RunCLI` dispatch; keep `imagegen.RunCLI` and `--imagegen` flag |
+| `Dockerfile` | Add SD.cpp build deps (additive; MLX deps retained) |
+| `AGENTS.md` | Update architecture section (three-backend model: llama.cpp + MLX + SD.cpp) |
 
 ---
 
@@ -1086,13 +1178,13 @@ and backend limitations.
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| **ggml version skew** between SD.cpp's vendored ggml and llama.cpp's | High | Build conflicts / symbol clashes | Build SD.cpp as a shared lib with hidden visibility (only `SD_API` exported). Verify no `ggml_*` symbols leak with `nm`/`dumpbin`. Phase 0 validation gate. |
-| **WAN VAE CUDA/CPU only** (Metal/Vulkan unsupported) | High | macOS Metal / Vulkan users get slow video | Default to `--vae-on-cpu` on non-CUDA. Warn users. Track upstream for Metal VAE. Recommend CUDA for video. |
+| **ggml version skew** between SD.cpp's vendored ggml, llama.cpp's, and MLX's runtime | High | Build conflicts / symbol clashes | Build SD.cpp as a shared lib with hidden visibility (only `SD_API` exported). Verify no `ggml_*` symbols leak with `nm`/`dumpbin`. Phase 0 validation gate. MLX has its own runtime and does not share ggml symbols. |
+| **WAN VAE CUDA/CPU only** (Metal/Vulkan unsupported) | High | macOS Metal / Vulkan users get slow video | Default to `--vae-on-cpu` on non-CUDA. Warn users. Track upstream for Metal VAE. Recommend CUDA for video. Note: this is unchanged from the removal plan — video on macOS Metal is CPU-bound regardless of whether MLX is present. |
 | **14B model VRAM** exceeds typical consumer GPUs | High | OOM on load | Use SD.cpp `max_vram` + `stream_layers` offload. Default to 1.3B models in docs. Recommend Q8_0 GGUF quantization. |
 | **Video container encoding** adds heavy Go deps (ffmpeg) | Medium | Binary bloat / cross-compilation pain | Phase 2 streams PNG frames (no container dep). Phase 6 adds WebM via optional cgo ffmpeg or pure-Go muxer behind a build tag. |
 | **Synchronous generate calls block** the runner thread | Medium | Can't handle concurrent requests | Runner serializes per-model (existing `imageGenMu` pattern → `diffGenMu`). Scheduler serializes per runnerRef. Acceptable for phase 1. |
 | **SD.cpp API instability** (README: "API may change frequently") | Medium | Binding breakage on version bump | Pin a specific commit. Wrap all C calls in a thin Go interface so binding changes are localized to `x/sdcpp/`. |
-| **MLX removal breaks safetensors LLM models** | Medium | Users of experimental safetensors LLMs lose support | These were experimental. Document removal. GGUF conversion path remains via llama.cpp. Out of scope for this plan. |
+| **MLX + SD.cpp maintenance surface** (two diffusion stacks on macOS) | Medium | Higher maintenance cost | Accepted trade-off. MLX is retained for unique capabilities (safetensors LLM, deep Metal optimizations) that SD.cpp cannot replace. The scheduler already supports coexistence. Isolate SD.cpp in `x/diffgen/` and `x/sdcpp/` to minimize cross-contamination. |
 | **ggml shared-lib symbol hiding** not sufficient on Windows | Low | DLL load failures | On Windows, SD.cpp uses `__declspec(dllexport)` for `SD_API` only; ensure the build sets `SD_BUILD_DLL` correctly. Test on Windows early in phase 0. |
 | **WebM support not compiled** in SD.cpp build | Low | `output_format: "webm"` returns 400 | Detect at context creation. Fall back to PNG frame stream. |
 
@@ -1102,16 +1194,16 @@ and backend limitations.
 
 | Phase | Deliverable | Dependencies | Duration |
 |-------|------------|--------------|----------|
-| **0** | SD.cpp builds via CMake (all backends); MLX build wiring removed | None | 3 weeks |
+| **0** | SD.cpp builds via CMake (all backends) alongside retained MLX | None | 3 weeks |
 | **1** | CGO bridge package `x/sdcpp/` compiles | Phase 0 | 2 weeks |
 | **2** | Unified runner (`x/diffgen/`) generates image + video (manual model loading) | Phase 1 | 3 weeks |
-| **3** | Scheduler dispatch + `ollama run` end-to-end | Phase 2 | 1 week |
+| **3** | Scheduler dispatch + `ollama run` end-to-end (SD.cpp + MLX coexistence) | Phase 2 | 1 week |
 | **4** | HTTP API endpoints (image preserved + video new) + streaming | Phase 3 | 2 weeks |
 | **5** | Model import (`ollama create`) + manifest | Phase 3 | 2 weeks |
 | **6** | CLI UX (progress bars, img2img/I2V, output formats) | Phase 4, 5 | 1 week |
-| **7** | MLX removal + migration cleanup | Phase 2, 6 | 2 weeks |
+| **7** | Coexistence hardening + documentation (MLX retained, no removal) | Phase 2, 6 | 1 week |
 | **8** | Multi-backend (Metal/Vulkan), VRAM offload, tests | Phase 7 | 3 weeks |
-| | | **Total** | **~19 weeks (~4-5 months)** |
+| | | **Total** | **~18 weeks (~4-5 months)** |
 
 **Phase 0-2 = functional PoC** (CUDA + CPU, 1.3B video + SD-turbo image, frame-stream output).
 **Phase 3-6 = usable product** (API, CLI, model import, both image + video).
@@ -1133,9 +1225,12 @@ and backend limitations.
   save disk/binary size. Only if symbol conflicts materialize despite shared-lib
   isolation.
 - **OpenCL / SYCL backends.** SD.cpp supports them; add when demand exists.
-- **Safetensors LLM text generation.** The MLX runner supported experimental
-  safetensors LLM models. These are removed with MLX. If needed, convert to GGUF
-  and run via llama.cpp.
+- **Benchmarking MLX vs SD.cpp+Metal for image gen.** MLX is retained for its
+  deep Metal optimizations, but no benchmark currently compares the two for
+  FLUX.2/Z-Image on Apple Silicon. A future benchmark could determine whether
+  SD.cpp+Metal ever matches or exceeds MLX+Metal, which would inform whether
+  MLX image-gen could eventually be deprecated (safetensors LLM would still
+  require MLX).
 
 ---
 
@@ -1143,25 +1238,25 @@ and backend limitations.
 
 | Concept | Location |
 |---------|----------|
-| Runner subprocess (llm.LlamaServer) pattern | `x/imagegen/server.go:35-154` (to be replaced) |
-| Runner entry point | `x/imagegen/runner.go:22-115` (to be replaced) |
-| Image completion streaming | `x/imagegen/imagegen.go:64-132` (to be replaced) |
-| Scheduler dispatch (image/mlx) | `server/sched.go:592-599` (to be modified) |
-| Scheduler MLX branch | `server/sched.go:531, 597` (to be removed) |
-| Runner reload check | `server/sched.go:1393-1449` (to be modified) |
+| Runner subprocess (llm.LlamaServer) pattern | `x/imagegen/server.go:35-154` (pattern reference; retained) |
+| Runner entry point | `x/imagegen/runner.go:22-115` (pattern reference; retained) |
+| Image completion streaming | `x/imagegen/imagegen.go:64-132` (pattern reference; retained) |
+| Scheduler dispatch (image/mlx) | `server/sched.go:592-599` (to be extended with diffgen branch) |
+| Scheduler MLX branch | `server/sched.go:531, 597` (retained) |
+| Runner reload check | `server/sched.go:1393-1449` (to be modified to include diffgen kind) |
 | OpenAI image middleware | `middleware/openai.go:601-680` (image: preserved) |
 | OpenAI image types | `openai/openai.go:789-844` (image: preserved) |
 | API types (Width/Height/Steps/Image) | `api/types.go:131-143`, `api/types.go:946` |
 | Routes registration | `server/routes.go:1916-1917` |
 | Model capabilities | `types/model/config.go:4-28` |
-| Safetensors model import | `server/create.go:517-519` (to be extended) |
+| Safetensors model import | `server/create.go:517-519` (to be extended for SD.cpp) |
 | Manifest + blob storage | `x/imagegen/manifest/manifest.go` (pattern reference) |
-| Model type detection | `x/imagegen/memory.go:53-80` (to be replaced) |
-| CLI dispatch | `cmd/cmd.go:886` (to be modified) |
-| CLI image-gen flow | `x/imagegen/cli.go:82-194` (to be replaced) |
+| Model type detection | `x/imagegen/memory.go:53-80` (pattern reference; retained) |
+| CLI dispatch | `cmd/cmd.go:886` (to be extended with diffgen dispatch) |
+| CLI image-gen flow | `x/imagegen/cli.go:82-194` (pattern reference; retained) |
 | Progress bar UX | `x/imagegen/cli.go:146-163` (pattern reference) |
-| MLX CGO bridge (pattern, to be deleted) | `x/imagegen/mlx/mlx.go:1-46` |
-| MLX CMake (pattern, to be deleted) | `cmake/local.cmake:142-195`, `x/imagegen/mlx/CMakeLists.txt` |
+| MLX CGO bridge (pattern, retained) | `x/imagegen/mlx/mlx.go:1-46` |
+| MLX CMake (pattern, retained) | `cmake/local.cmake:142-195`, `x/imagegen/mlx/CMakeLists.txt` |
 | llama.cpp backend build (pattern) | `cmake/local.cmake:363-450` (`ollama_add_llama_server_build`) |
 | SD.cpp C API (image + video) | `include/stable-diffusion.h` (`generate_image`, `generate_video`, `sd_img_gen_params_t`, `sd_vid_gen_params_t`) |
 | SD.cpp WAN docs | `docs/wan.md` (leejet/stable-diffusion.cpp) |
@@ -1170,34 +1265,115 @@ and backend limitations.
 
 ## 10. Summary
 
-This plan consolidates all diffusion-based media generation (image **and** video)
-onto a single native backend, stable-diffusion.cpp, removing the existing MLX
-image-gen stack entirely. The resulting architecture is clean and uniform across
-all platforms:
+This plan adds video generation and broad image-model coverage via
+stable-diffusion.cpp as a **new complementary backend**, while **retaining MLX**
+as the optimized macOS backend for the image and safetensors-LLM models it
+already supports. The resulting architecture is a three-backend split:
 
-- **llama.cpp** → text generation (CUDA, Metal, Vulkan, ROCm, CPU).
-- **stable-diffusion.cpp** → image + video generation (CPU, CUDA, Metal, Vulkan,
-  OpenCL, SYCL).
+- **llama.cpp** → GGUF text generation (CUDA, Metal, Vulkan, ROCm, CPU).
+- **MLX** → safetensors LLM text (9 architectures on macOS) + image gen for
+  MLX-supported models (Z-Image, FLUX.2) on macOS (deep Metal optimizations).
+- **stable-diffusion.cpp** → video generation (all models, all platforms) +
+  image gen for models MLX does not support (SDXL, SD3, Qwen-Image, …) +
+  image/video on Linux/Windows (CPU, CUDA, Metal, Vulkan, OpenCL, SYCL).
 
-SD.cpp is a superset of MLX's image capabilities (supporting all major image
-model families: SD, SDXL, SD3, FLUX, Qwen-Image, Z-Image, etc.) **plus** native
-video (WAN 2.1/2.2, LTX-2.3, LingBot-Video). It runs on every platform Ollama
-targets, including macOS Metal (replacing MLX's macOS-only advantage) and adds
-Vulkan/OpenCL/SYCL coverage MLX never had.
+SD.cpp adds video (WAN 2.1/2.2, LTX-2.3, LingBot-Video) and the broad
+image-model ecosystem that MLX never covered, plus Vulkan/OpenCL/SYCL coverage.
+It does **not** replace MLX: MLX retains unique value in (1) running 9
+safetensors LLM text architectures with no GGUF conversion, and (2) deep Metal
+optimizations (wired memory, graph fusion, `mlx_fast_*` kernels) for image gen
+on Apple Silicon that SD.cpp's ggml-Metal does not replicate. The scheduler
+already supports this coexistence (`IsDiffGen()` vs `IsMLX()` vs llama.cpp).
 
-The hard work is concentrated in four areas:
+The hard work is concentrated in three areas:
 1. **Build integration + ggml coexistence** — getting SD.cpp to compile as an
-   isolated shared library alongside llama.cpp without symbol clashes, across
-   all backends.
+   isolated shared library alongside llama.cpp **and MLX** without symbol
+   clashes, across all backends.
 2. **CGO binding** — wrapping the SD.cpp C API (`generate_image`,
    `generate_video`, callbacks, cancellation) in idiomatic Go.
-3. **Unified diffgen runner** — a single subprocess runner handling both image
-   and video modes, replacing the MLX-based imagegen runner.
-4. **MLX removal** — deleting the MLX packages, CMake wiring, and all references,
-   while migrating image generation to SD.cpp.
+3. **New diffgen runner** — a new subprocess runner handling both image and
+   video modes via SD.cpp, alongside the retained MLX imagegen and mlxrunner.
 
-Everything else — scheduler dispatch, manifest storage, blob addressing, CLI
-framework, progress streaming, the existing OpenAI image API — is adaptation of
-existing, tested code paths. A focused effort reaches a functional PoC (CUDA +
-CPU, image + 1.3B video, frame-stream output) in ~8 weeks, and a
-production-quality multi-backend release with MLX fully removed in ~4-5 months.
+Everything else — scheduler dispatch (extended, not replaced), manifest storage,
+blob addressing, CLI framework, progress streaming, the existing OpenAI image
+API — is adaptation of existing, tested code paths. A focused effort reaches a
+functional PoC (CUDA + CPU, image + 1.3B video, frame-stream output) in ~8
+weeks, and a production-quality multi-backend release with MLX retained in
+~4-5 months.
+
+---
+
+## 11. MLX retention analysis
+
+This section documents the analysis behind the decision to **keep MLX** rather
+than remove it (as an earlier draft of this plan proposed).
+
+### What MLX provides (and would be lost by removal)
+
+| Capability | MLX | SD.cpp | Verdict |
+|-----------|-----|--------|---------|
+| Z-Image (image) | Full Go impl, optimized Metal | Supported natively | Replaceable, but Metal perf uncertain |
+| FLUX.2 Klein (image + edit) | Full Go impl with img2img | Supported natively | Replaceable, but Metal perf uncertain |
+| SDXL, SD3, Qwen-Image, Chroma, etc. | Not supported | Supported | SD.cpp superior |
+| Video (WAN 2.1/2.2, LTX) | Not supported | Supported, but VAE Metal = slow (CPU fallback) | SD.cpp only option |
+| 9 safetensors LLM text architectures | Experimental runner | Diffusion-only, cannot serve | **PERDU if MLX removed** |
+| Deep Metal optimizations | Wired memory, graph fusion, `mlx_fast_*` | ggml Metal (different) | Performance uncertain |
+
+### Three problems with full MLX removal
+
+1. **Loss of safetensors LLM text (irreplaceable).** MLX runs 9 text model
+   architectures directly from safetensors checkpoints without GGUF conversion.
+   SD.cpp is diffusion-only and cannot replace this. The removal plan said
+   "convert to GGUF" but that is a real loss of capability for macOS users of
+   these experimental models.
+
+2. **Uncertain Metal performance for image gen.** No benchmark compares
+   SD.cpp+Metal vs MLX+Metal for FLUX.2/Z-Image. MLX has deep optimizations
+   that SD.cpp lacks: wired-memory pinning (Apple unified memory), graph
+   compilation / closure fusion (JIT Metal kernels), `mlx_fast_*` fused kernels
+   (RMSNorm, RoPE, SDPA), and zero-copy mmap safetensors → GPU. SD.cpp uses
+   ggml Metal which is functional but lacks this native integration. On Apple
+   Silicon, MLX may be significantly faster for image generation.
+
+3. **Video on macOS is slow regardless.** The WAN VAE supports only CUDA and
+   CPU — not Metal. So even with SD.cpp, video on macOS Metal is degraded (VAE
+   on CPU). Removing MLX does not change this, but it means macOS becomes a
+   second-class platform for video either way.
+
+### Recommended strategy: hybrid (keep MLX)
+
+| Requested model | Capability | Backend |
+|----------------|-----------|---------|
+| Video (any) | video | SD.cpp (always) |
+| Image, MLX-supported, macOS | image | MLX (optimized Metal) |
+| Image, not MLX-supported | image | SD.cpp (broader model support) |
+| Image, Linux/Windows | image | SD.cpp (MLX is macOS-relevant only) |
+| Safetensors LLM text, macOS | completion | MLX runner (preserved) |
+| GGUF LLM text (any) | completion | llama.cpp (unchanged) |
+
+The existing scheduler dispatch (`server/sched.go`) already supports this
+coexistence: `IsDiffGen()` (SD.cpp) vs `IsMLX()` (safetensors) vs llama.cpp
+(GGUF). No scheduler rearchitecture is required to keep MLX.
+
+### Tradeoff: maintenance vs performance
+
+| Option | Maintenance | macOS performance | Text capability | Risk |
+|--------|------------|-------------------|----------------|------|
+| Full MLX removal (earlier draft) | Low (1 stack) | Uncertain | 9 archs lost | Metal perf regression |
+| **Hybrid (keep MLX) — this plan** | 2 stacks | Optimized | Preserved | MLX maintenance cost |
+| Hybrid simplified (keep MLX text only, image → SD.cpp) | Partial | Image uncertain | Preserved | Image perf compromise |
+
+### Conclusion
+
+The earlier Phase 7 (full MLX removal) is **not justified** in the near term.
+It would lose 9 safetensors LLM text architectures without replacement, risk an
+unmeasured image-performance regression on Apple Silicon, and its sole benefit
+is simplified maintenance. The hybrid approach — keep MLX as the macOS native
+backend for models it supports, use SD.cpp for video + unsupported image models
+— preserves all capabilities at the cost of a larger maintenance surface. The
+scheduler already supports coexistence.
+
+If the priority is video, Phases 0-6 suffice — SD.cpp coexists with MLX out of
+the box. The removal of MLX (Phase 7 as originally planned) adds nothing
+functionally and risks regressions, so it is replaced by a coexistence-
+hardening phase.
