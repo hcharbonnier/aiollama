@@ -227,6 +227,16 @@ type CompletionRequest struct {
 	Height int32 `json:"height,omitempty"`
 	Steps  int32 `json:"steps,omitempty"`
 	Seed   int64 `json:"seed,omitempty"`
+
+	// Video/diffusion generation fields
+	NegativePrompt string  `json:"negative_prompt,omitempty"`
+	VideoFrames    int32   `json:"video_frames,omitempty"`
+	FPS            int32   `json:"fps,omitempty"`
+	CFGScale       float32 `json:"cfg_scale,omitempty"`
+	FlowShift      float32 `json:"flow_shift,omitempty"`
+	Sampler        string  `json:"sampler,omitempty"`
+	OutputFormat   string  `json:"output_format,omitempty"`
+	EndImage       []byte  `json:"end_image,omitempty"`
 }
 
 type ChatRequest struct {

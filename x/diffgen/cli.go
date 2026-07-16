@@ -1,16 +1,19 @@
-//go:build sdcpp
-
 package diffgen
 
 import (
+	"bytes"
+	"cmp"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/gif"
+	_ "image/jpeg"
+	"image/png"
 	"io"
-	"net/http"
 	"os"
-	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +24,7 @@ import (
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/progress"
 	"github.com/ollama/ollama/readline"
+	"github.com/ollama/ollama/x/diffutil"
 )
 
 // Options holds generation options for image and video.
@@ -31,22 +35,26 @@ type Options struct {
 	Seed           int
 	NegativePrompt string
 
-	CFGScale float32
-	Sampler  string
-	Format   string
+	CFGScale     float32
+	Sampler      string
+	OutputFormat string
 
 	VideoFrames int
 	FPS         int
 	FlowShift   float32
+
+	InitImage string
+	EndImage  string
 }
 
+// DefaultOptions returns the default diffgen options.
 func DefaultOptions() Options {
 	return Options{
-		Width:  1024,
-		Height: 1024,
-		Steps:  0,
-		Seed:   0,
-		Format: "png",
+		Width:        defaultWidth,
+		Height:       defaultHeight,
+		Steps:        defaultSteps,
+		Seed:         defaultSeed,
+		OutputFormat: "png",
 	}
 }
 
@@ -80,6 +88,15 @@ func readFlags(cmd *cobra.Command, opts *Options) {
 	if v, err := cmd.Flags().GetString("negative"); err == nil && v != "" {
 		opts.NegativePrompt = v
 	}
+	if v, err := cmd.Flags().GetFloat32("cfg-scale"); err == nil && v > 0 {
+		opts.CFGScale = v
+	}
+	if v, err := cmd.Flags().GetString("sampler"); err == nil && v != "" {
+		opts.Sampler = v
+	}
+	if v, err := cmd.Flags().GetString("output-format"); err == nil && v != "" {
+		opts.OutputFormat = v
+	}
 	if v, err := cmd.Flags().GetInt("video-frames"); err == nil && v > 0 {
 		opts.VideoFrames = v
 	}
@@ -89,6 +106,99 @@ func readFlags(cmd *cobra.Command, opts *Options) {
 	if v, err := cmd.Flags().GetFloat32("flow-shift"); err == nil && v > 0 {
 		opts.FlowShift = v
 	}
+	if v, err := cmd.Flags().GetString("init-image"); err == nil && v != "" {
+		opts.InitImage = v
+	}
+	if v, err := cmd.Flags().GetString("end-image"); err == nil && v != "" {
+		opts.EndImage = v
+	}
+}
+
+// buildRequest constructs an api.GenerateRequest from the prompt and options.
+// It also collects init/end images from the --init-image/--end-image flags
+// and any image file paths embedded in the prompt text.
+func buildRequest(modelName, prompt string, opts Options, keepAlive *api.Duration) (*api.GenerateRequest, error) {
+	prompt, images, err := diffutil.ExtractFileData(prompt)
+	if err != nil {
+		return nil, err
+	}
+
+	// Prepend the init-image flag so it is the first image (img2img / I2V).
+	if opts.InitImage != "" {
+		data, err := diffutil.GetImageData(opts.InitImage)
+		if err != nil {
+			return nil, fmt.Errorf("init-image: %w", err)
+		}
+		images = append([]api.ImageData{data}, images...)
+	}
+
+	// End frame for FLF2V: encoded as a separate field on the request.
+	var endImage []byte
+	if opts.EndImage != "" {
+		data, err := diffutil.GetImageData(opts.EndImage)
+		if err != nil {
+			return nil, fmt.Errorf("end-image: %w", err)
+		}
+		endImage = data
+	}
+
+	req := &api.GenerateRequest{
+		Model:          modelName,
+		Prompt:         prompt,
+		Images:         images,
+		Width:          int32(opts.Width),
+		Height:         int32(opts.Height),
+		Steps:          int32(opts.Steps),
+		NegativePrompt: opts.NegativePrompt,
+		CFGScale:       opts.CFGScale,
+		Sampler:        opts.Sampler,
+		OutputFormat:   opts.OutputFormat,
+		VideoFrames:    int32(opts.VideoFrames),
+		FPS:            int32(opts.FPS),
+		FlowShift:      opts.FlowShift,
+		EndImage:       endImage,
+	}
+	if opts.Seed != 0 {
+		req.Options = map[string]any{"seed": opts.Seed}
+	}
+	if keepAlive != nil {
+		req.KeepAlive = keepAlive
+	}
+	return req, nil
+}
+
+// resultCollector accumulates streamed progress and frames/images from a
+// generation call.
+type resultCollector struct {
+	stepBar           *progress.StepBar
+	lastImage         string
+	frames            [][]byte
+	isVideo           bool
+	hasVideoContainer bool
+}
+
+func (rc *resultCollector) handle(resp api.GenerateResponse, p *progress.Progress, spinner *progress.Spinner, label string) error {
+	if resp.Total > 0 {
+		if rc.stepBar == nil {
+			spinner.Stop()
+			rc.stepBar = progress.NewStepBar(label, int(resp.Total))
+			p.Add("", rc.stepBar)
+		}
+		rc.stepBar.Set(int(resp.Completed))
+	}
+	if resp.Image != "" {
+		rc.lastImage = resp.Image
+		if rc.isVideo {
+			if data, err := base64.StdEncoding.DecodeString(resp.Image); err == nil {
+				rc.frames = append(rc.frames, data)
+			}
+		}
+	}
+	if resp.Video != "" {
+		rc.lastImage = resp.Video
+		rc.hasVideoContainer = true
+	}
+	return nil
 }
 
 func generate(cmd *cobra.Command, modelName, prompt string, keepAlive *api.Duration, opts Options) error {
@@ -97,51 +207,22 @@ func generate(cmd *cobra.Command, modelName, prompt string, keepAlive *api.Durat
 		return err
 	}
 
-	prompt, images, err := extractFileData(prompt)
+	req, err := buildRequest(modelName, prompt, opts, keepAlive)
 	if err != nil {
 		return err
-	}
-
-	req := &api.GenerateRequest{
-		Model:  modelName,
-		Prompt: prompt,
-		Images: images,
-		Width:  int32(opts.Width),
-		Height: int32(opts.Height),
-		Steps:  int32(opts.Steps),
-	}
-	if opts.Seed != 0 {
-		req.Options = map[string]any{"seed": opts.Seed}
-	}
-	if keepAlive != nil {
-		req.KeepAlive = keepAlive
 	}
 
 	p := progress.NewProgress(os.Stderr)
 	spinner := progress.NewSpinner("")
 	p.Add("", spinner)
 
-	var stepBar *progress.StepBar
-	var lastImage string
-	var frameCount int
+	label := "Generating"
+	if opts.VideoFrames > 0 {
+		label = "Generating video"
+	}
+	rc := &resultCollector{isVideo: opts.VideoFrames > 0}
 	err = client.Generate(cmd.Context(), req, func(resp api.GenerateResponse) error {
-		if resp.Total > 0 {
-			if stepBar == nil {
-				spinner.Stop()
-				label := "Generating"
-				if opts.VideoFrames > 0 {
-					label = "Generating video"
-				}
-				stepBar = progress.NewStepBar(label, int(resp.Total))
-				p.Add("", stepBar)
-			}
-			stepBar.Set(int(resp.Completed))
-		}
-		if resp.Image != "" {
-			lastImage = resp.Image
-			frameCount++
-		}
-		return nil
+		return rc.handle(resp, p, spinner, label)
 	})
 
 	p.StopAndClear()
@@ -149,28 +230,7 @@ func generate(cmd *cobra.Command, modelName, prompt string, keepAlive *api.Durat
 		return err
 	}
 
-	if lastImage != "" {
-		safeName := sanitizeFilename(prompt)
-		if len(safeName) > 50 {
-			safeName = safeName[:50]
-		}
-		timestamp := time.Now().Format("20060102-150405")
-		ext := ".png"
-		if frameCount > 1 {
-			ext = "-video.png"
-		}
-		filename := fmt.Sprintf("%s-%s%s", safeName, timestamp, ext)
-		imageData, err := base64.StdEncoding.DecodeString(lastImage)
-		if err != nil {
-			return fmt.Errorf("failed to decode image: %w", err)
-		}
-		if err := os.WriteFile(filename, imageData, 0o644); err != nil {
-			return fmt.Errorf("failed to save image: %w", err)
-		}
-		displayImageInTerminal(filename)
-		fmt.Printf("Image saved to: %s\n", filename)
-	}
-	return nil
+	return saveResult(rc, opts, prompt)
 }
 
 func runInteractive(cmd *cobra.Command, modelName string, keepAlive *api.Duration, opts Options) error {
@@ -234,10 +294,9 @@ func runInteractive(cmd *cobra.Command, modelName string, keepAlive *api.Duratio
 			printCurrentSettings(opts)
 			continue
 		case strings.HasPrefix(line, "/"):
-			// Check if it's a file path, not a command
 			args := strings.Fields(line)
 			isFile := false
-			for _, f := range extractFileNames(line) {
+			for _, f := range diffutil.ExtractFileNames(line) {
 				if strings.HasPrefix(f, args[0]) {
 					isFile = true
 					break
@@ -249,104 +308,190 @@ func runInteractive(cmd *cobra.Command, modelName string, keepAlive *api.Duratio
 			}
 		}
 
-		prompt, images, err := extractFileData(line)
+		req, err := buildRequest(modelName, line, opts, keepAlive)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			continue
-		}
-		req := &api.GenerateRequest{
-			Model:  modelName,
-			Prompt: prompt,
-			Images: images,
-			Width:  int32(opts.Width),
-			Height: int32(opts.Height),
-			Steps:  int32(opts.Steps),
-		}
-		if opts.Seed != 0 {
-			req.Options = map[string]any{"seed": opts.Seed}
-		}
-		if keepAlive != nil {
-			req.KeepAlive = keepAlive
 		}
 
 		p := progress.NewProgress(os.Stderr)
 		spinner := progress.NewSpinner("")
 		p.Add("", spinner)
-		var stepBar *progress.StepBar
-		var lastImage string
-		var frameCount int
+		label := "Generating"
+		if opts.VideoFrames > 0 {
+			label = "Generating video"
+		}
+		rc := &resultCollector{isVideo: opts.VideoFrames > 0}
 		err = client.Generate(cmd.Context(), req, func(resp api.GenerateResponse) error {
-			if resp.Total > 0 {
-				if stepBar == nil {
-					spinner.Stop()
-					label := "Generating"
-					if opts.VideoFrames > 0 {
-						label = "Generating video"
-					}
-					stepBar = progress.NewStepBar(label, int(resp.Total))
-					p.Add("", stepBar)
-				}
-				stepBar.Set(int(resp.Completed))
-			}
-			if resp.Image != "" {
-				lastImage = resp.Image
-				frameCount++
-			}
-			return nil
+			return rc.handle(resp, p, spinner, label)
 		})
 		p.StopAndClear()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			continue
 		}
-		if lastImage != "" {
-			imageData, err := base64.StdEncoding.DecodeString(lastImage)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error decoding image: %v\n", err)
-				continue
-			}
-			safeName := sanitizeFilename(line)
-			if len(safeName) > 50 {
-				safeName = safeName[:50]
-			}
-			timestamp := time.Now().Format("20060102-150405")
-			ext := ".png"
-			if frameCount > 1 {
-				ext = "-video.png"
-			}
-			filename := fmt.Sprintf("%s-%s%s", safeName, timestamp, ext)
-			if err := os.WriteFile(filename, imageData, 0o644); err != nil {
-				fmt.Fprintf(os.Stderr, "Error saving image: %v\n", err)
-				continue
-			}
-			displayImageInTerminal(filename)
-			fmt.Printf("Image saved to: %s\n", filename)
+		if err := saveResult(rc, opts, line); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			continue
 		}
 		fmt.Println()
 	}
 }
 
-func sanitizeFilename(s string) string {
-	s = strings.ToLower(s)
-	s = strings.ReplaceAll(s, " ", "-")
-	var b strings.Builder
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			b.WriteRune(r)
+// saveResult writes the final image or video to disk. For video, frames
+// streamed as base64 PNGs are assembled into a single container (GIF by
+// default; falls back to a PNG of the first frame if encoding fails).
+func saveResult(rc *resultCollector, opts Options, prompt string) error {
+	if rc.lastImage == "" {
+		return nil
+	}
+
+	safeName := diffutil.SanitizeFilename(prompt)
+	if len(safeName) > 50 {
+		safeName = safeName[:50]
+	}
+	timestamp := time.Now().Format("20060102-150405")
+
+	// Video container response (resp.Video was set): write the container
+	// bytes directly with the appropriate extension.
+	if rc.hasVideoContainer {
+		ext := "." + cmp.Or(opts.OutputFormat, "webm")
+		filename := fmt.Sprintf("%s-%s%s", safeName, timestamp, ext)
+		data, err := base64.StdEncoding.DecodeString(rc.lastImage)
+		if err != nil {
+			return fmt.Errorf("failed to decode video: %w", err)
+		}
+		if err := os.WriteFile(filename, data, 0o644); err != nil {
+			return fmt.Errorf("failed to save video: %w", err)
+		}
+		fmt.Printf("Video saved to: %s\n", filename)
+		return nil
+	}
+
+	// Video frame-stream mode: assemble frames into a GIF container.
+	if rc.isVideo && len(rc.frames) > 1 {
+		return saveVideo(rc.frames, opts, safeName, timestamp)
+	}
+
+	// Single image (or single-frame video treated as an image). resp.Image
+	// is always a base64-encoded PNG, so the extension is always .png.
+	ext := ".png"
+	if rc.isVideo {
+		ext = "-video.png"
+	}
+	filename := fmt.Sprintf("%s-%s%s", safeName, timestamp, ext)
+	imageData, err := base64.StdEncoding.DecodeString(rc.lastImage)
+	if err != nil {
+		return fmt.Errorf("failed to decode image: %w", err)
+	}
+	if err := os.WriteFile(filename, imageData, 0o644); err != nil {
+		return fmt.Errorf("failed to save image: %w", err)
+	}
+	diffutil.DisplayImageInTerminal(filename)
+	fmt.Printf("Image saved to: %s\n", filename)
+	return nil
+}
+
+// saveVideo encodes collected frames into a container file. GIF is the default
+// because it is pure-Go and dependency-free. WebM support is deferred to a
+// later phase. Frames are stored as compressed PNG bytes and decoded lazily
+// during encoding to minimize peak memory usage.
+func saveVideo(frameData [][]byte, opts Options, safeName, timestamp string) error {
+	fps := opts.FPS
+	if fps <= 0 {
+		fps = 16
+	}
+	delay := 100 / fps
+	if delay < 2 {
+		delay = 2
+	}
+
+	palette := defaultPalette()
+	ext := ".gif"
+	var buf bytes.Buffer
+	if err := encodeGIF(&buf, frameData, delay, palette); err != nil {
+		// Fallback: write the first frame as a PNG.
+		ext = ".png"
+		buf.Reset()
+		img, err := decodeImage(frameData[0])
+		if err != nil {
+			return fmt.Errorf("failed to decode fallback frame: %w", err)
+		}
+		if err := png.Encode(&buf, img); err != nil {
+			return fmt.Errorf("failed to encode fallback PNG: %w", err)
 		}
 	}
-	return b.String()
+
+	filename := fmt.Sprintf("%s-%s%s", safeName, timestamp, ext)
+	if err := os.WriteFile(filename, buf.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("failed to save video: %w", err)
+	}
+	fmt.Printf("Video saved to: %s (%d frames, %d fps)\n", filename, len(frameData), fps)
+	return nil
+}
+
+// encodeGIF builds a GIF from compressed PNG frame bytes, decoding each frame
+// lazily and quantizing it onto a shared palette using draw.Draw for efficient
+// direct blitting.
+func encodeGIF(w io.Writer, frameData [][]byte, delay int, palette color.Palette) error {
+	out := &gif.GIF{}
+	for _, data := range frameData {
+		img, err := decodeImage(data)
+		if err != nil {
+			return err
+		}
+		bounds := img.Bounds()
+		paletted := image.NewPaletted(bounds, palette)
+		draw.Draw(paletted, bounds, img, bounds.Min, draw.Src)
+		out.Image = append(out.Image, paletted)
+		out.Delay = append(out.Delay, delay)
+	}
+	return gif.EncodeAll(w, out)
+}
+
+// decodeImage decodes compressed image bytes (PNG or JPEG) into an image.Image.
+func decodeImage(data []byte) (image.Image, error) {
+	img, _, err := image.Decode(bytes.NewReader(data))
+	return img, err
+}
+
+// defaultPalette returns a 256-color palette suitable for GIF encoding. Uses
+// a uniform RGB cube to cover color space reasonably for photographic content.
+func defaultPalette() color.Palette {
+	p := make(color.Palette, 256)
+	idx := 0
+	for r := 0; r < 6; r++ {
+		for g := 0; g < 7; g++ {
+			for b := 0; b < 6; b++ {
+				p[idx] = color.RGBA{
+					R: uint8(r * 255 / 5),
+					G: uint8(g * 255 / 6),
+					B: uint8(b * 255 / 5),
+					A: 255,
+				}
+				idx++
+			}
+		}
+	}
+	for i := idx; i < 256; i++ {
+		v := uint8(float64(i) * 255 / 255)
+		p[i] = color.RGBA{R: v, G: v, B: v, A: 255}
+	}
+	return p
 }
 
 func printInteractiveHelp() {
 	fmt.Fprintln(os.Stderr, "Commands:")
-	fmt.Fprintln(os.Stderr, "  /set width <n>       Set image width")
-	fmt.Fprintln(os.Stderr, "  /set height <n>      Set image height")
+	fmt.Fprintln(os.Stderr, "  /set width <n>       Set image/video width")
+	fmt.Fprintln(os.Stderr, "  /set height <n>      Set image/video height")
 	fmt.Fprintln(os.Stderr, "  /set steps <n>       Set denoising steps")
 	fmt.Fprintln(os.Stderr, "  /set seed <n>        Set random seed")
 	fmt.Fprintln(os.Stderr, "  /set negative <s>    Set negative prompt")
+	fmt.Fprintln(os.Stderr, "  /set cfg_scale <f>   Set CFG scale")
 	fmt.Fprintln(os.Stderr, "  /set frames <n>      Set video frame count")
-	fmt.Fprintln(os.Stderr, "  /set fps <n>          Set video FPS")
+	fmt.Fprintln(os.Stderr, "  /set fps <n>         Set video FPS")
+	fmt.Fprintln(os.Stderr, "  /set flow_shift <f>  Set WAN flow shift")
+	fmt.Fprintln(os.Stderr, "  /set format <s>      Set output format")
 	fmt.Fprintln(os.Stderr, "  /show                Show current settings")
 	fmt.Fprintln(os.Stderr, "  /bye                 Exit")
 	fmt.Fprintln(os.Stderr)
@@ -360,9 +505,16 @@ func printCurrentSettings(opts Options) {
 	fmt.Fprintf(os.Stderr, "  height:   %d\n", opts.Height)
 	fmt.Fprintf(os.Stderr, "  steps:    %d\n", opts.Steps)
 	fmt.Fprintf(os.Stderr, "  seed:     %d (0=random)\n", opts.Seed)
+	fmt.Fprintf(os.Stderr, "  format:   %s\n", opts.OutputFormat)
+	if opts.CFGScale > 0 {
+		fmt.Fprintf(os.Stderr, "  cfg:      %.2f\n", opts.CFGScale)
+	}
 	if opts.VideoFrames > 0 {
 		fmt.Fprintf(os.Stderr, "  frames:   %d\n", opts.VideoFrames)
 		fmt.Fprintf(os.Stderr, "  fps:      %d\n", opts.FPS)
+	}
+	if opts.FlowShift > 0 {
+		fmt.Fprintf(os.Stderr, "  flow:     %.2f\n", opts.FlowShift)
 	}
 	if opts.NegativePrompt != "" {
 		fmt.Fprintf(os.Stderr, "  negative: %s\n", opts.NegativePrompt)
@@ -420,6 +572,23 @@ func handleSetCommand(args string, opts *Options) error {
 		}
 		opts.FPS = v
 		fmt.Fprintf(os.Stderr, "Set fps to %d\n", v)
+	case "flow_shift", "flow":
+		v, err := strconv.ParseFloat(value, 32)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("flow_shift must be a positive number")
+		}
+		opts.FlowShift = float32(v)
+		fmt.Fprintf(os.Stderr, "Set flow_shift to %.2f\n", v)
+	case "cfg_scale", "cfg":
+		v, err := strconv.ParseFloat(value, 32)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("cfg_scale must be a positive number")
+		}
+		opts.CFGScale = float32(v)
+		fmt.Fprintf(os.Stderr, "Set cfg_scale to %.2f\n", v)
+	case "format", "output_format":
+		opts.OutputFormat = value
+		fmt.Fprintf(os.Stderr, "Set output format to %s\n", value)
 	case "negative", "neg", "n":
 		opts.NegativePrompt = value
 		if value == "" {
@@ -431,89 +600,4 @@ func handleSetCommand(args string, opts *Options) error {
 		return fmt.Errorf("unknown option: %s (try /help)", key)
 	}
 	return nil
-}
-
-func displayImageInTerminal(imagePath string) bool {
-	termProgram := os.Getenv("TERM_PROGRAM")
-	kittyWindowID := os.Getenv("KITTY_WINDOW_ID")
-	weztermPane := os.Getenv("WEZTERM_PANE")
-	ghostty := os.Getenv("GHOSTTY_RESOURCES_DIR")
-
-	data, err := os.ReadFile(imagePath)
-	if err != nil {
-		return false
-	}
-	encoded := base64.StdEncoding.EncodeToString(data)
-
-	switch {
-	case termProgram == "iTerm.app" || termProgram == "WezTerm" || weztermPane != "":
-		fmt.Printf("\033]1337;File=inline=1;preserveAspectRatio=1:%s\a\n", encoded)
-		return true
-	case kittyWindowID != "" || ghostty != "" || termProgram == "ghostty":
-		const chunkSize = 4096
-		for i := 0; i < len(encoded); i += chunkSize {
-			end := min(i+chunkSize, len(encoded))
-			chunk := encoded[i:end]
-			if i == 0 {
-				more := 1
-				if end >= len(encoded) {
-					more = 0
-				}
-				fmt.Printf("\033_Ga=T,f=100,m=%d;%s\033\\", more, chunk)
-			} else if end >= len(encoded) {
-				fmt.Printf("\033_Gm=0;%s\033\\", chunk)
-			} else {
-				fmt.Printf("\033_Gm=1;%s\033\\", chunk)
-			}
-		}
-		fmt.Println()
-		return true
-	default:
-		return false
-	}
-}
-
-func extractFileNames(input string) []string {
-	regexPattern := `(?:[a-zA-Z]:)?(?:\./|/|\\)[\S\\ ]+?\.(?i:jpg|jpeg|png|webp)\b`
-	re := regexp.MustCompile(regexPattern)
-	return re.FindAllString(input, -1)
-}
-
-func extractFileData(input string) (string, []api.ImageData, error) {
-	filePaths := extractFileNames(input)
-	var imgs []api.ImageData
-	for _, fp := range filePaths {
-		nfp := strings.ReplaceAll(fp, "\\ ", " ")
-		nfp = strings.ReplaceAll(nfp, "\\(", "(")
-		nfp = strings.ReplaceAll(nfp, "\\)", ")")
-		nfp = strings.ReplaceAll(nfp, "%20", " ")
-		data, err := getImageData(nfp)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		} else if err != nil {
-			return "", nil, err
-		}
-		fmt.Fprintf(os.Stderr, "Added image '%s'\n", nfp)
-		input = strings.ReplaceAll(input, fp, "")
-		imgs = append(imgs, data)
-	}
-	return strings.TrimSpace(input), imgs, nil
-}
-
-func getImageData(filePath string) ([]byte, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	buf := make([]byte, 512)
-	if _, err = file.Read(buf); err != nil {
-		return nil, err
-	}
-	contentType := http.DetectContentType(buf)
-	allowedTypes := []string{"image/jpeg", "image/jpg", "image/png", "image/webp"}
-	if !slices.Contains(allowedTypes, contentType) {
-		return nil, fmt.Errorf("invalid image type: %s", contentType)
-	}
-	return os.ReadFile(filePath)
 }

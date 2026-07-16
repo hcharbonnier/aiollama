@@ -413,6 +413,13 @@ func convertDraftModelFromFiles(files map[string]string, baseLayers []*layerGGML
 
 func convertModelFromFilesWithMediaType(files map[string]string, baseLayers []*layerGGML, isAdapter bool, mediaType string, detectTemplate bool, fn func(resp api.ProgressResponse)) ([]*layerGGML, error) {
 	switch detectModelTypeFromFiles(files) {
+	case "sdcpp":
+		layers, err := convertFromSDCpp(files, baseLayers, fn)
+		if err != nil {
+			slog.Error("error converting from sdcpp", "error", err)
+			return nil, err
+		}
+		return layers, nil
 	case "safetensors":
 		layers, err := convertFromSafetensors(files, baseLayers, isAdapter, mediaType, detectTemplate, fn)
 		if err != nil {
@@ -478,6 +485,11 @@ func maxCreateInfoInt() int {
 
 func detectModelTypeFromFiles(files map[string]string) string {
 	for fn := range files {
+		if isModelIndexJSON(fn) {
+			return "sdcpp"
+		}
+	}
+	for fn := range files {
 		if strings.HasSuffix(fn, ".safetensors") {
 			return "safetensors"
 		} else if strings.HasSuffix(fn, ".gguf") {
@@ -512,6 +524,111 @@ func detectModelTypeFromFiles(files map[string]string) string {
 	}
 
 	return ""
+}
+
+// isModelIndexJSON reports whether the given filename is a model_index.json
+// file, handling both forward-slash and backslash path separators.
+func isModelIndexJSON(name string) bool {
+	return filepath.Base(name) == "model_index.json"
+}
+
+// mediaTypeDiffusionComponent is the media type for SD.cpp component blobs
+// (diffusion model, VAE, text encoders, etc.). GetModel's layer switch does
+// not recognize this type, so these layers are silently skipped by the
+// standard runtime path — the diffgen runner loads them via its own manifest
+// loader by component Name.
+const mediaTypeDiffusionComponent = "application/vnd.ollama.diffusion.component"
+
+// mediaTypeModelIndex is the media type for the model_index.json config blob
+// stored as a layer. The diffgen runner reads it to detect image vs video mode.
+const mediaTypeModelIndex = "application/vnd.ollama.image.json"
+
+// convertFromSDCpp imports a directory of SD.cpp model component files
+// (safetensors/gguf/ckpt) plus a model_index.json into the blob store as
+// named component layers. Component names are derived from the "components"
+// map in model_index.json when available, falling back to the filename stem.
+func convertFromSDCpp(files map[string]string, baseLayers []*layerGGML, fn func(resp api.ProgressResponse)) ([]*layerGGML, error) {
+	var indexData []byte
+	for fileName, digest := range files {
+		if isModelIndexJSON(fileName) {
+			blobPath, err := manifest.BlobsPath(digest)
+			if err != nil {
+				return nil, fmt.Errorf("error getting blobs path for %s: %w", fileName, err)
+			}
+			indexData, err = os.ReadFile(blobPath)
+			if err != nil {
+				return nil, fmt.Errorf("error reading model_index.json: %w", err)
+			}
+			break
+		}
+	}
+	if indexData == nil {
+		return nil, errors.New("model_index.json not found in files")
+	}
+
+	// Parse the components map to map filenames to canonical component names.
+	// model_index.json typically has: {"components": {"diffusion_model": "diffusion_model.safetensors", ...}}
+	var index struct {
+		Components map[string]string `json:"components"`
+	}
+	if err := json.Unmarshal(indexData, &index); err != nil {
+		return nil, fmt.Errorf("error parsing model_index.json: %w", err)
+	}
+
+	// Build a reverse map: filename (basename) → component name
+	fileToComponent := make(map[string]string, len(index.Components))
+	for compName, filePath := range index.Components {
+		fileToComponent[filepath.Base(filePath)] = compName
+	}
+
+	layers := make([]*layerGGML, 0, len(files)+1)
+	fn(api.ProgressResponse{Status: "writing model_index.json"})
+	indexLayer, err := manifest.NewLayer(bytes.NewReader(indexData), mediaTypeModelIndex)
+	if err != nil {
+		return nil, fmt.Errorf("error writing model_index.json layer: %w", err)
+	}
+	indexLayer.Name = "model_index"
+	layers = append(layers, &layerGGML{Layer: indexLayer})
+
+	for fileName, digest := range files {
+		if isModelIndexJSON(fileName) {
+			continue
+		}
+
+		blobPath, err := manifest.BlobsPath(digest)
+		if err != nil {
+			slog.Error("error getting blobs path", "file", fileName, "error", err)
+			continue
+		}
+
+		f, err := os.Open(blobPath)
+		if err != nil {
+			return nil, fmt.Errorf("error opening %s: %w", fileName, err)
+		}
+
+		// Derive component name: prefer the components map, fall back to filename stem
+		baseName := filepath.Base(fileName)
+		componentName, ok := fileToComponent[baseName]
+		if !ok {
+			componentName = baseName
+			for _, suffix := range []string{".safetensors", ".gguf", ".ckpt", ".pt", ".pth"} {
+				componentName = strings.TrimSuffix(componentName, suffix)
+			}
+		}
+
+		fn(api.ProgressResponse{Status: fmt.Sprintf("writing component %s", componentName)})
+
+		layer, err := manifest.NewLayer(f, mediaTypeDiffusionComponent)
+		f.Close()
+		if err != nil {
+			return nil, fmt.Errorf("error writing component %s: %w", componentName, err)
+		}
+		layer.Name = componentName
+		layers = append(layers, &layerGGML{Layer: layer})
+	}
+
+	layers = append(layers, baseLayers...)
+	return layers, nil
 }
 
 func convertFromSafetensors(files map[string]string, baseLayers []*layerGGML, isAdapter bool, mediaType string, detectTemplate bool, fn func(resp api.ProgressResponse)) ([]*layerGGML, error) {
@@ -726,6 +843,44 @@ func kvFromLayers(baseLayers []*layerGGML) (ofs.Config, error) {
 
 func createModel(r api.CreateRequest, name model.Name, baseLayers []*layerGGML, config *model.ConfigV2, fn func(resp api.ProgressResponse)) (err error) {
 	var layers []manifest.Layer
+
+	// Detect sdcpp component layers and set config accordingly
+	for _, layer := range baseLayers {
+		if layer.MediaType == mediaTypeDiffusionComponent {
+			config.ModelFormat = "sdcpp"
+			break
+		}
+	}
+	if config.ModelFormat == "sdcpp" {
+		for _, layer := range baseLayers {
+			if layer.MediaType == mediaTypeModelIndex {
+				blobPath, err := manifest.BlobsPath(layer.Digest)
+				if err != nil {
+					slog.Warn("failed to resolve model_index.json blob path", "error", err)
+					break
+				}
+				indexData, err := os.ReadFile(blobPath)
+				if err != nil {
+					slog.Warn("failed to read model_index.json blob", "error", err)
+					break
+				}
+				var index struct {
+					Capabilities []string `json:"capabilities"`
+				}
+				if err := json.Unmarshal(indexData, &index); err != nil {
+					return fmt.Errorf("error parsing model_index.json capabilities: %w", err)
+				}
+				if len(index.Capabilities) > 0 {
+					config.Capabilities = index.Capabilities
+				} else {
+					slog.Warn("model_index.json has no capabilities; defaulting to image")
+					config.Capabilities = []string{"image"}
+				}
+				break
+			}
+		}
+	}
+
 	for _, layer := range baseLayers {
 		if layer.GGML != nil {
 			if layer.rewriteForCreate && layer.GGML.Name() == "gguf" && len(layer.splitParts) > 0 && layerHasEmbeddedCompatibilityTensors(layer) {

@@ -24,3 +24,9 @@ func NewServer(modelName, mode string) (llm.LlamaServer, error) {
 	return nil, errSDCppNotCompiled
 }
 
+// Execute is a stub for the runner subprocess entry point. Without the sdcpp
+// build tag the binary cannot run the diffgen engine.
+func Execute(args []string) error {
+	return errSDCppNotCompiled
+}
+

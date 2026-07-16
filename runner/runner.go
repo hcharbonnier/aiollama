@@ -3,6 +3,7 @@ package runner
 import (
 	"fmt"
 
+	"github.com/ollama/ollama/x/diffgen"
 	"github.com/ollama/ollama/x/imagegen"
 	"github.com/ollama/ollama/x/mlxrunner"
 )
@@ -14,11 +15,13 @@ func Execute(args []string) error {
 
 	if len(args) > 0 {
 		switch args[0] {
+		case "--diffgen-engine":
+			return diffgen.Execute(args[1:])
 		case "--imagegen-engine":
 			return imagegen.Execute(args[1:])
 		case "--mlx-engine":
 			return mlxrunner.Execute(args[1:])
 		}
 	}
-	return fmt.Errorf("unknown runner engine, expected --imagegen-engine or --mlx-engine")
+	return fmt.Errorf("unknown runner engine, expected --diffgen-engine, --imagegen-engine or --mlx-engine")
 }

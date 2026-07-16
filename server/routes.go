@@ -3209,12 +3209,20 @@ func (s *Server) handleImageGenerate(c *gin.Context, req api.GenerateRequest, mo
 	var finalResponse api.GenerateResponse
 
 	if err := runner.Completion(c.Request.Context(), llm.CompletionRequest{
-		Prompt: req.Prompt,
-		Width:  req.Width,
-		Height: req.Height,
-		Steps:  req.Steps,
-		Seed:   seed,
-		Media:  media,
+		Prompt:         req.Prompt,
+		Width:          req.Width,
+		Height:         req.Height,
+		Steps:          req.Steps,
+		Seed:           seed,
+		Media:          media,
+		NegativePrompt: req.NegativePrompt,
+		VideoFrames:    req.VideoFrames,
+		FPS:            req.FPS,
+		CFGScale:       req.CFGScale,
+		FlowShift:      req.FlowShift,
+		Sampler:        req.Sampler,
+		OutputFormat:   req.OutputFormat,
+		EndImage:       req.EndImage,
 	}, func(cr llm.CompletionResponse) {
 		streamStarted = true
 		res := api.GenerateResponse{

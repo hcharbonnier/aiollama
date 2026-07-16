@@ -57,6 +57,7 @@ import (
 	"github.com/ollama/ollama/version"
 	xcreate "github.com/ollama/ollama/x/create"
 	xcreateclient "github.com/ollama/ollama/x/create/client"
+	"github.com/ollama/ollama/x/diffgen"
 	"github.com/ollama/ollama/x/imagegen"
 )
 
@@ -878,10 +879,22 @@ func RunHandler(cmd *cobra.Command, args []string) error {
 		return generateEmbedding(cmd, name, opts.Prompt, opts.KeepAlive, truncate, dimensions)
 	}
 
+	// Check if this is a video generation model (SD.cpp diffgen backend)
+	if slices.Contains(info.Capabilities, model.CapabilityVideo) {
+		if opts.Prompt == "" && !interactive {
+			return errors.New("video generation models require a prompt. Usage: ollama run " + name + " \"your prompt here\"")
+		}
+		return diffgen.RunCLI(cmd, name, opts.Prompt, interactive, opts.KeepAlive)
+	}
+
 	// Check if this is an image generation model
 	if slices.Contains(info.Capabilities, model.CapabilityImage) {
 		if opts.Prompt == "" && !interactive {
 			return errors.New("image generation models require a prompt. Usage: ollama run " + name + " \"your prompt here\"")
+		}
+		// SD.cpp (sdcpp) models use the unified diffgen runner.
+		if info.Details.Format == "sdcpp" {
+			return diffgen.RunCLI(cmd, name, opts.Prompt, interactive, opts.KeepAlive)
 		}
 		return imagegen.RunCLI(cmd, name, opts.Prompt, interactive, opts.KeepAlive)
 	}
@@ -2365,8 +2378,8 @@ func NewCLI() *cobra.Command {
 	runCmd.Flags().Bool("truncate", false, "For embedding models: truncate inputs exceeding context length (default: true). Set --truncate=false to error instead")
 	runCmd.Flags().Int("dimensions", 0, "Truncate output embeddings to specified dimension (embedding models only)")
 
-	// Image generation flags (width, height, steps, seed, etc.)
-	imagegen.RegisterFlags(runCmd)
+	// Diffusion generation flags (image + video: width, height, steps, seed, etc.)
+	diffgen.RegisterFlags(runCmd)
 
 	runCmd.Flags().Bool("imagegen", false, "Use the imagegen runner for LLM inference")
 	runCmd.Flags().MarkHidden("imagegen")
@@ -2522,7 +2535,7 @@ func NewCLI() *cobra.Command {
 	} {
 		switch cmd {
 		case runCmd:
-			imagegen.AppendFlagsDocs(cmd)
+			diffgen.AppendFlagsDocs(cmd)
 			appendEnvDocs(cmd, []envconfig.EnvVar{envVars["OLLAMA_EDITOR"], envVars["OLLAMA_HOST"], envVars["OLLAMA_NOHISTORY"]})
 		case serveCmd:
 			appendEnvDocs(cmd, []envconfig.EnvVar{

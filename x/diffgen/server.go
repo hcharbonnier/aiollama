@@ -242,13 +242,21 @@ func (s *Server) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 		images = append(images, media.Data)
 	}
 	creq := DiffRequest{
-		Prompt: req.Prompt,
-		Mode:   s.mode,
-		Width:  req.Width,
-		Height: req.Height,
-		Steps:  int(req.Steps),
-		Seed:   seed,
-		Images: images,
+		Prompt:         req.Prompt,
+		Mode:           s.mode,
+		Width:          req.Width,
+		Height:         req.Height,
+		Steps:          int(req.Steps),
+		Seed:           seed,
+		Images:         images,
+		NegativePrompt: req.NegativePrompt,
+		CFGScale:       req.CFGScale,
+		Sampler:        req.Sampler,
+		OutputFormat:   req.OutputFormat,
+		VideoFrames:    int(req.VideoFrames),
+		FPS:            int(req.FPS),
+		FlowShift:      req.FlowShift,
+		EndImage:       req.EndImage,
 	}
 	if req.Options != nil {
 		creq.Options = &RequestOptions{

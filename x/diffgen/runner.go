@@ -93,9 +93,9 @@ func newRunnerServer(modelName string, port int) (*runnerServer, error) {
 		return nil, fmt.Errorf("failed to load manifest: %w", err)
 	}
 
-	configData, err := m.ReadConfig()
+	configData, err := m.ReadModelIndex()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read model config: %w", err)
+		return nil, fmt.Errorf("failed to read model_index.json: %w", err)
 	}
 
 	modelType := DetectModelType(configData)

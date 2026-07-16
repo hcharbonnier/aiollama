@@ -97,9 +97,16 @@ func (m *ModelManifest) ComponentPath(name string) (string, error) {
 	return "", fmt.Errorf("component %q not found in manifest", name)
 }
 
-// ReadConfig reads and returns the config blob content (model_index.json).
-func (m *ModelManifest) ReadConfig() ([]byte, error) {
-	return os.ReadFile(m.BlobPath(m.Manifest.Config.Digest))
+// ReadModelIndex reads the model_index.json layer content. This is stored as
+// a named layer ("model_index") during import, separate from the ConfigV2
+// config blob. Used by the runner to detect image vs video mode.
+func (m *ModelManifest) ReadModelIndex() ([]byte, error) {
+	for _, layer := range m.Manifest.Layers {
+		if layer.Name == "model_index" {
+			return os.ReadFile(m.BlobPath(layer.Digest))
+		}
+	}
+	return nil, fmt.Errorf("model_index component not found in manifest")
 }
 
 // TotalComponentSize returns the sum of all component layer sizes.
