@@ -2,7 +2,6 @@ package diffgen
 
 import (
 	"bytes"
-	"cmp"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -353,9 +352,17 @@ func saveResult(rc *resultCollector, opts Options, prompt string) error {
 	timestamp := time.Now().Format("20060102-150405")
 
 	// Video container response (resp.Video was set): write the container
-	// bytes directly with the appropriate extension.
+	// bytes directly with the appropriate extension. "webm-lossless" still
+	// produces a .webm file (VP9 codec inside a WebM container), so map
+	// both webm variants to the .webm extension.
 	if rc.hasVideoContainer {
-		ext := "." + cmp.Or(opts.OutputFormat, "webm")
+		ext := ".webm"
+		switch strings.ToLower(opts.OutputFormat) {
+		case "gif":
+			ext = ".gif"
+		case "webp":
+			ext = ".webp"
+		}
 		filename := fmt.Sprintf("%s-%s%s", safeName, timestamp, ext)
 		data, err := base64.StdEncoding.DecodeString(rc.lastImage)
 		if err != nil {

@@ -162,10 +162,14 @@ type GenerateRequest struct {
 	// Sampler is the sampler name for diffusion models (e.g. "euler").
 	Sampler string `json:"sampler,omitempty"`
 
-	// OutputFormat is the desired output format for video ("webm","webp","gif")
-	// or image ("png") generation. "webm" requires an `ffmpeg` binary on the
-	// server's PATH; if unavailable, the response falls back to individual
-	// streamed frame images instead of a single video container.
+	// OutputFormat is the desired output format for video ("webm","webm-lossless","webp","gif")
+	// or image ("png") generation. "webm" produces a lossy VP8 container;
+	// "webm-lossless" produces a lossless VP9 container (pixel-perfect, but
+	// larger and slower to encode). Both require an `ffmpeg` binary on the
+	// server's PATH; "webm-lossless" additionally requires libvpx-vp9. If
+	// unavailable, "webm-lossless" falls back to lossy VP8 WebM, then both
+	// fall back to individual streamed frame images — downgrades are
+	// surfaced via the response Warning field.
 	OutputFormat string `json:"output_format,omitempty"`
 
 	// EndImage is a base64-encoded end frame for FLF2V video generation.

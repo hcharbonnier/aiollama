@@ -798,6 +798,106 @@ func TestHandlerVideoWebMFallsBackWithoutOutputFormat(t *testing.T) {
 	}
 }
 
+// TestHandlerVideoWebMLosslessContainer exercises the full
+// handleVideoCompletion path with output_format="webm-lossless" and a real
+// ffmpeg that has libvpx-vp9. It skips cleanly when ffmpeg or VP9 is
+// unavailable.
+func TestHandlerVideoWebMLosslessContainer(t *testing.T) {
+	requireVP9(t)
+
+	frames := []sdcpp.Image{testImage(), testImage(), testImage()}
+	mock := &mockSDContext{
+		supportsVideo: true,
+		videoResult:   frames,
+	}
+	s := newTestServer(ModeVideo, mock)
+
+	_, resps := doCompletion(t, s, DiffRequest{
+		Prompt: "a dog running", OutputFormat: "webm-lossless",
+		Width: 8, Height: 8, Steps: 1, Seed: 1,
+		VideoFrames: 3, FPS: 8,
+	})
+
+	if len(resps) != 1 {
+		t.Fatalf("expected a single container response, got %d responses", len(resps))
+	}
+	resp := resps[0]
+	if !resp.Done {
+		t.Fatal("expected Done=true")
+	}
+	if resp.Video == "" {
+		t.Fatal("expected a base64-encoded webm container in Video")
+	}
+	if resp.Image != "" {
+		t.Errorf("expected no per-frame Image when a container is produced, got %q", resp.Image)
+	}
+	// No downgrade warning expected when VP9 is available.
+	if resp.Warning != "" {
+		t.Errorf("expected no warning when lossless VP9 is available, got %q", resp.Warning)
+	}
+
+	data, err := base64.StdEncoding.DecodeString(resp.Video)
+	if err != nil {
+		t.Fatalf("failed to decode video base64: %v", err)
+	}
+	ebmlMagic := []byte{0x1A, 0x45, 0xDF, 0xA3}
+	if len(data) < 4 || string(data[:4]) != string(ebmlMagic) {
+		t.Errorf("decoded video does not start with EBML magic header, got % x", data[:min(4, len(data))])
+	}
+}
+
+// TestHandlerVideoWebMLosslessFallsBackToLossyVP9Missing confirms that when
+// lossless VP9 is requested but ffmpeg lacks libvpx-vp9, the runner
+// transparently degrades to lossy VP8 WebM (still a single container) and
+// surfaces the downgrade via the Warning field rather than falling all the
+// way back to the PNG frame stream.
+func TestHandlerVideoWebMLosslessFallsBackToLossyVP9Missing(t *testing.T) {
+	requireFFmpeg(t)
+
+	// Force the cached VP9 probe to report unsupported, simulating an
+	// ffmpeg built without libvpx-vp9. The probe is restored afterward.
+	origProbe := vp9ProbeFunc
+	vp9ProbeFunc = func() bool { return false }
+	vp9Supported = false
+	vp9SupportOnce = &sync.Once{}
+	defer func() {
+		vp9ProbeFunc = origProbe
+		vp9Supported = false
+		vp9SupportOnce = &sync.Once{}
+		probeVP9()
+	}()
+
+	frames := []sdcpp.Image{testImage(), testImage()}
+	mock := &mockSDContext{
+		supportsVideo: true,
+		videoResult:   frames,
+	}
+	s := newTestServer(ModeVideo, mock)
+
+	_, resps := doCompletion(t, s, DiffRequest{
+		Prompt: "a dog running", OutputFormat: "webm-lossless",
+		Width: 8, Height: 8, Steps: 1, Seed: 1,
+		VideoFrames: 2, FPS: 8,
+	})
+
+	if len(resps) != 1 {
+		t.Fatalf("expected a single container response (lossy VP8 fallback), got %d responses", len(resps))
+	}
+	resp := resps[0]
+	if !resp.Done {
+		t.Fatal("expected Done=true")
+	}
+	if resp.Video == "" {
+		t.Fatal("expected a lossy VP8 webm container as fallback, got empty Video")
+	}
+	if resp.Warning == "" {
+		t.Error("expected a Warning explaining the lossless->lossy VP8 downgrade")
+	}
+	if !strings.Contains(resp.Warning, "lossless VP9") {
+		t.Errorf("expected the warning to mention lossless VP9, got %q", resp.Warning)
+	}
+}
+
 func TestHandlerVideoParamsForwarded(t *testing.T) {
 	mock := &mockSDContext{
 		supportsVideo: true,

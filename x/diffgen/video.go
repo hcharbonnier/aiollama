@@ -2,8 +2,8 @@
 
 package diffgen
 
-// Video container encoding. WebM (VP8) is produced by piping raw RGB frames
-// through an external `ffmpeg` process (rawvideo -> libvpx -> webm). This
+// Video container encoding. WebM is produced by piping raw RGB frames through
+// an external `ffmpeg` process (rawvideo -> libvpx/libvpx-vp9 -> webm). This
 // avoids vendoring a VP8/VP9 encoder or linking cgo ffmpeg bindings: ffmpeg is
 // an optional *runtime* dependency looked up on PATH, not a build-time Go
 // module dependency, so binaries that ship without ffmpeg still build and run
@@ -12,6 +12,15 @@ package diffgen
 // cross-compilation pain" risk called out in the implementation plan (§6)
 // for container encoding while still delivering a real single-file video
 // container per §12.5.
+//
+// Two codecs are supported, selected via output_format:
+//   - "webm": VP8 (libvpx). Broad availability, compact lossy output. The
+//     default single-file container format.
+//   - "webm-lossless": VP9 lossless (libvpx-vp9 -lossless 1). Pixel-perfect
+//     preservation of SD.cpp's VAE decoder output at the cost of much larger
+//     files and slower encoding. Requires an ffmpeg built with libvpx-vp9
+//     (any --enable-libvpx build has both VP8 and VP9); falls back to lossy
+//     VP8 WebM, then to the PNG frame-stream protocol, when unavailable.
 
 import (
 	"bytes"
@@ -41,7 +50,16 @@ var (
 	ffmpegPathOnce sync.Once
 	ffmpegPath     string
 	ffmpegPathErr  error
+
+	vp9ProbeFunc   func() bool
+	vp9SupportOnce *sync.Once
+	vp9Supported   bool
 )
+
+func init() {
+	vp9ProbeFunc = probeVP9Impl
+	vp9SupportOnce = &sync.Once{}
+}
 
 // lookupFFmpeg resolves and caches the ffmpeg binary path from PATH.
 func lookupFFmpeg() (string, error) {
@@ -49,6 +67,35 @@ func lookupFFmpeg() (string, error) {
 		ffmpegPath, ffmpegPathErr = exec.LookPath("ffmpeg")
 	})
 	return ffmpegPath, ffmpegPathErr
+}
+
+// probeVP9Impl is the real VP9 codec probe. It is wrapped by probeVP9 so
+// tests can substitute a stub via vp9ProbeFunc.
+func probeVP9Impl() bool {
+	ffmpeg, err := lookupFFmpeg()
+	if err != nil {
+		return false
+	}
+	out, err := exec.Command(ffmpeg, "-hide_banner", "-encoders").CombinedOutput()
+	if err != nil {
+		return false
+	}
+	// ffmpeg -encoders lists lines like " V....D libvpx-vp9 ...".
+	// A libvpx build that lacks VP9 (unusual but possible via a
+	// custom build) would not list libvpx-vp9.
+	return strings.Contains(string(out), "libvpx-vp9")
+}
+
+// probeVP9 reports whether the resolved ffmpeg was built with the libvpx-vp9
+// encoder (required for lossless VP9 output). Any ffmpeg built with
+// --enable-libvpx exposes both VP8 (libvpx) and VP9 (libvpx-vp9); builds
+// without libvpx or with a stripped encoder list report VP9 as unavailable,
+// and lossless requests fall back to lossy VP8.
+func probeVP9() bool {
+	vp9SupportOnce.Do(func() {
+		vp9Supported = vp9ProbeFunc()
+	})
+	return vp9Supported
 }
 
 // SupportsContainerEncoding reports whether an ffmpeg binary is available on
@@ -59,19 +106,45 @@ func SupportsContainerEncoding() bool {
 	return err == nil
 }
 
-// EncodeWebM muxes a sequence of same-sized raw RGB frames into a VP8/WebM
+// SupportsLosslessVP9 reports whether the resolved ffmpeg can encode lossless
+// VP9 (libvpx-vp9). Implies SupportsContainerEncoding. Callers requesting
+// lossless VP9 should fall back to lossy VP8 WebM, then to the PNG
+// frame-stream protocol, when this returns false.
+func SupportsLosslessVP9() bool {
+	return probeVP9()
+}
+
+// webmCodec selects the ffmpeg encoder and flags for a given output format.
+// Returns the codec name, the extra ffmpeg argument fragments (appended after
+// the shared rawvideo input flags), and the container "format" label reported
+// to callers. The lossless boolean selects VP9 lossless (libvpx-vp9) over VP8
+// (libvpx).
+func webmArgs(lossless bool) (codec string, extra []string, format string) {
+	if lossless {
+		return "libvpx-vp9", []string{"-lossless", "1", "-b:v", "0", "-deadline", "good"}, "webm"
+	}
+	return "libvpx", []string{"-b:v", "2M", "-deadline", "good"}, "webm"
+}
+
+// EncodeWebM muxes a sequence of same-sized raw RGB frames into a WebM
 // container at the given frame rate by streaming them through an external
-// ffmpeg process (rawvideo in, webm out). It returns an error, with no
-// partial output, if ffmpeg is unavailable, the frames are invalid, or
-// encoding fails for any other reason; callers should fall back to the PNG
-// frame-stream protocol in that case.
-func EncodeWebM(ctx context.Context, frames []sdcpp.Image, fps int) ([]byte, error) {
+// ffmpeg process (rawvideo in, webm out). When lossless is true, the VP9
+// lossless encoder (libvpx-vp9 -lossless 1) is used for pixel-perfect output;
+// otherwise the VP8 encoder (libvpx) is used. It returns an error, with no
+// partial output, if ffmpeg is unavailable, the requested VP9 codec is not
+// compiled in (for lossless), the frames are invalid, or encoding fails for
+// any other reason; callers should fall back to the PNG frame-stream protocol
+// (or, for lossless failures specifically, to lossy VP8) in that case.
+func EncodeWebM(ctx context.Context, frames []sdcpp.Image, fps int, lossless bool) ([]byte, error) {
 	if len(frames) == 0 {
 		return nil, errors.New("no frames to encode")
 	}
 	ffmpeg, err := lookupFFmpeg()
 	if err != nil {
 		return nil, fmt.Errorf("ffmpeg not found on PATH: %w", err)
+	}
+	if lossless && !probeVP9() {
+		return nil, fmt.Errorf("ffmpeg does not provide the libvpx-vp9 encoder required for lossless VP9")
 	}
 	if fps <= 0 {
 		fps = 16
@@ -94,6 +167,14 @@ func EncodeWebM(ctx context.Context, frames []sdcpp.Image, fps int) ([]byte, err
 		}
 	}
 
+	codec, extraArgs, _ := webmArgs(lossless)
+	pixFmt := "yuv420p"
+	if lossless {
+		// VP9 lossless requires yuv444p to avoid chroma subsampling;
+		// yuv420p would still lose color information even with
+		// -lossless 1.
+		pixFmt = "yuv444p"
+	}
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-y",
 		"-f", "rawvideo",
@@ -102,13 +183,11 @@ func EncodeWebM(ctx context.Context, frames []sdcpp.Image, fps int) ([]byte, err
 		"-r", strconv.Itoa(fps),
 		"-i", "-",
 		"-an",
-		"-c:v", "libvpx",
-		"-pix_fmt", "yuv420p",
-		"-b:v", "2M",
-		"-deadline", "good",
-		"-f", "webm",
-		"-",
+		"-c:v", codec,
+		"-pix_fmt", pixFmt,
 	}
+	args = append(args, extraArgs...)
+	args = append(args, "-f", "webm", "-")
 	cmd := exec.CommandContext(ctx, ffmpeg, args...)
 
 	stdin, err := cmd.StdinPipe()

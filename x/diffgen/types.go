@@ -24,7 +24,7 @@ type DiffRequest struct {
 	CFGScale     float32  `json:"cfg_scale,omitempty"`
 	Sampler      string   `json:"sampler,omitempty"`
 	Scheduler    string   `json:"scheduler,omitempty"`
-	OutputFormat string   `json:"output_format,omitempty"` // image: "png"; video: "webm","webp","gif"
+	OutputFormat string   `json:"output_format,omitempty"` // image: "png"; video: "webm","webm-lossless","webp","gif"
 	Images       [][]byte `json:"images,omitempty"`        // init/control images (img2img, I2V)
 
 	BatchCount      int     `json:"batch_count,omitempty"`

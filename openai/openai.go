@@ -1001,6 +1001,12 @@ func FromVideoGenerationRequest(r VideoGenerationRequest) api.GenerateRequest {
 }
 
 // ToVideoGenerationResponse converts an Ollama GenerateResponse to a VideoGenerationResponse.
+//
+// A populated Video field is reported as Format "webm" regardless of the
+// underlying codec: both VP8 ("webm") and VP9 lossless ("webm-lossless")
+// produce WebM containers (see x/diffgen/video.go). A codec downgrade from
+// lossless VP9 to lossy VP8 is surfaced via the runner's Warning, not the
+// response Format.
 func ToVideoGenerationResponse(resp api.GenerateResponse) VideoGenerationResponse {
 	var data []VideoURLOrData
 	if resp.Image != "" {

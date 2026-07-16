@@ -362,8 +362,25 @@ func (s *runnerServer) handleVideoCompletion(w http.ResponseWriter, r *http.Requ
 	// below on any encoding failure (e.g. ffmpeg missing or erroring), in
 	// which case the fallback is surfaced via the Warning field below rather
 	// than only logged server-side.
-	if strings.EqualFold(req.OutputFormat, "webm") && SupportsContainerEncoding() {
-		data, encErr := EncodeWebM(r.Context(), frames, req.FPS)
+	//
+	// "webm-lossless" requests VP9 lossless (libvpx-vp9 -lossless 1); if the
+	// resolved ffmpeg lacks libvpx-vp9, it transparently degrades to lossy
+	// VP8 WebM (still a single container) and surfaces the downgrade via
+	// Warning, before any PNG frame-stream fallback is considered.
+	wantLossless := strings.EqualFold(req.OutputFormat, "webm-lossless")
+	if (strings.EqualFold(req.OutputFormat, "webm") || wantLossless) && SupportsContainerEncoding() {
+		lossless := wantLossless
+		if lossless && !SupportsLosslessVP9() {
+			slog.Warn("lossless VP9 requested but ffmpeg lacks libvpx-vp9; falling back to lossy VP8 webm", "model", s.modelName)
+			fallbackNotice := "lossless VP9 (libvpx-vp9) unavailable in ffmpeg; returned lossy VP8 webm instead"
+			if warning != "" {
+				warning += "; " + fallbackNotice
+			} else {
+				warning = fallbackNotice
+			}
+			lossless = false
+		}
+		data, encErr := EncodeWebM(r.Context(), frames, req.FPS, lossless)
 		if encErr == nil {
 			resp := DiffResponse{
 				Video: base64.StdEncoding.EncodeToString(data),
@@ -386,7 +403,7 @@ func (s *runnerServer) handleVideoCompletion(w http.ResponseWriter, r *http.Requ
 		if r.Context().Err() != nil {
 			return
 		}
-		slog.Warn("webm container encoding failed; falling back to frame stream", "model", s.modelName, "error", encErr)
+		slog.Warn("webm container encoding failed; falling back to frame stream", "model", s.modelName, "lossless", lossless, "error", encErr)
 		fallbackNotice := "webm container encoding failed (" + encErr.Error() + "); returned individual frames instead"
 		if warning != "" {
 			warning += "; " + fallbackNotice
