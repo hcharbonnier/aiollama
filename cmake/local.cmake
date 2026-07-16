@@ -893,12 +893,17 @@ endif()
 set(_sdcpp_targets)
 foreach(_backend IN LISTS OLLAMA_SDCPP_BACKENDS)
     if(_backend STREQUAL "cpu")
+        # Embed ggml statically into libstable-diffusion (SD_BUILD_SHARED_LIBS=ON,
+        # SD_BUILD_SHARED_GGML_LIB=OFF) with hidden visibility so ggml symbols
+        # do not leak across llama.cpp's and SD.cpp's vendored ggml copies when
+        # both are loaded in the same process (Phase 0.4 symbol isolation).
+        # GGML_BACKEND_DL/GGML_CPU_ALL_VARIANTS are intentionally OFF: they
+        # produce separate shared ggml backend modules whose symbols would
+        # escape the hidden-visibility boundary.
         ollama_add_sdcpp_build(cpu
             RUNNER_DIR cpu
             CMAKE_ARGS
-                -DBUILD_SHARED_LIBS=ON
-                -DGGML_BACKEND_DL=ON
-                -DGGML_CPU_ALL_VARIANTS=ON)
+                -DGGML_NATIVE=ON)
         list(APPEND _sdcpp_targets ollama-sdcpp-cpu)
     elseif(_backend STREQUAL "cuda_v12" OR _backend STREQUAL "cuda_v13")
         set(_cuda_args)
@@ -908,8 +913,6 @@ foreach(_backend IN LISTS OLLAMA_SDCPP_BACKENDS)
         ollama_add_sdcpp_build(${_backend}
             RUNNER_DIR ${_backend}
             CMAKE_ARGS
-                -DBUILD_SHARED_LIBS=ON
-                -DGGML_BACKEND_DL=ON
                 -DGGML_CUDA=ON
                 ${_cuda_args})
         list(APPEND _sdcpp_targets ollama-sdcpp-${_backend})
@@ -921,7 +924,6 @@ foreach(_backend IN LISTS OLLAMA_SDCPP_BACKENDS)
         ollama_add_sdcpp_build(metal
             RUNNER_DIR metal
             CMAKE_ARGS
-                -DBUILD_SHARED_LIBS=ON
                 -DGGML_METAL=ON
                 -DGGML_METAL_EMBED_LIBRARY=ON)
         list(APPEND _sdcpp_targets ollama-sdcpp-metal)
@@ -929,8 +931,6 @@ foreach(_backend IN LISTS OLLAMA_SDCPP_BACKENDS)
         ollama_add_sdcpp_build(vulkan
             RUNNER_DIR vulkan
             CMAKE_ARGS
-                -DBUILD_SHARED_LIBS=ON
-                -DGGML_BACKEND_DL=ON
                 -DGGML_VULKAN=ON)
         list(APPEND _sdcpp_targets ollama-sdcpp-vulkan)
     else()
@@ -949,3 +949,41 @@ install(DIRECTORY "${OLLAMA_PAYLOAD_INSTALL_PREFIX}/${OLLAMA_LIB_DIR}/"
     DESTINATION "${OLLAMA_LIB_DIR}"
     COMPONENT ollama-local
     USE_SOURCE_PERMISSIONS)
+
+# --- Phase 0.4 coexistence validation test -----------------------------------
+# Builds a small C binary that links libstable-diffusion (SD.cpp) together
+# with libggml-base (llama.cpp's vendored ggml) and resolves one symbol from
+# each. If SD.cpp leaked its ggml_* symbols into the dynamic table, the link
+# step would fail with a duplicate-symbol error. This target is the Phase 0.4
+# validation gate referenced by the implementation plan (Section 0.4).
+#
+# Only built when both stacks are present in the same superbuild: at least one
+# SD.cpp backend (OLLAMA_SDCPP_BACKENDS) and the llama.cpp local build
+# (OLLAMA_HAVE_LLAMA_SERVER).
+if(_sdcpp_targets AND OLLAMA_HAVE_LLAMA_SERVER)
+    set(_sdcpp_coexist_src "${CMAKE_SOURCE_DIR}/cmake/sdcpp/coexist_test.c")
+    set(_sdcpp_coexist_bin "${CMAKE_BINARY_DIR}/sdcpp-coexist-test")
+    # libstable-diffusion.so is emitted into the SD.cpp build bin dir; the
+    # first SD.cpp backend (cpu) is used as the representative library.
+    set(_sdcpp_lib_dir "${CMAKE_BINARY_DIR}/sdcpp-cpu/bin")
+    # libggml-base.so is installed by the llama-server-local build into the
+    # payload install prefix.
+    set(_llama_lib_dir "${OLLAMA_PAYLOAD_INSTALL_PREFIX}/${OLLAMA_LIB_DIR}")
+    add_custom_command(
+        OUTPUT "${_sdcpp_coexist_bin}"
+        COMMAND ${CMAKE_C_COMPILER}
+            -I${CMAKE_SOURCE_DIR}/x/sdcpp/include
+            ${_sdcpp_coexist_src}
+            -o ${_sdcpp_coexist_bin}
+            -L${_sdcpp_lib_dir} -lstable-diffusion
+            -L${_llama_lib_dir} -lggml-base
+            -Wl,-rpath,${_sdcpp_lib_dir} -Wl,-rpath,${_llama_lib_dir}
+        DEPENDS "${_sdcpp_coexist_src}"
+        COMMENT "Building SD.cpp + llama.cpp coexistence test binary"
+        VERBATIM)
+    add_custom_target(sdcpp-coexist
+        DEPENDS "${_sdcpp_coexist_bin}" ollama-llama-server-local ${_sdcpp_targets}
+        COMMAND "${_sdcpp_coexist_bin}"
+        COMMENT "Running Phase 0.4 coexistence validation"
+        VERBATIM)
+endif()

@@ -39,21 +39,28 @@ if(DEFINED ENV{OLLAMA_SD_CPP_SOURCE})
 endif()
 
 # Configure SD.cpp build options BEFORE FetchContent_MakeAvailable.
-# Build as a shared library with hidden default visibility except the SD_API
-# surface, so internal ggml symbols do not clash with llama.cpp's ggml.
+# Build stable-diffusion as a shared library with ggml+backends embedded
+# statically inside it (SD_BUILD_SHARED_GGML_LIB=OFF). Combined with hidden
+# default visibility, this keeps each ggml's internal symbols private to the
+# libstable-diffusion shared object, avoiding conflicts with llama.cpp's
+# vendored ggml when both are loaded in the same process (Phase 0.4).
+#
+# Backends are linked statically into the shared lib (no GGML_BACKEND_DL, which
+# would emit separate ggml backend modules whose symbols escape the hidden-
+# visibility boundary). The superbuild caller selects the backend via
+# GGML_<BACKEND>=ON; GGML_CPU is ON by default in ggml.
 set(SD_BUILD_SHARED_LIBS ON CACHE BOOL "Build stable-diffusion as shared lib" FORCE)
+set(SD_BUILD_SHARED_GGML_LIB OFF CACHE BOOL "Embed ggml statically into libstable-diffusion" FORCE)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden CACHE STRING "" FORCE)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON CACHE BOOL "" FORCE)
+# GGML_BACKEND_DL and GGML_CPU_ALL_VARIANTS must be OFF so ggml backends are
+# linked statically into the shared lib instead of emitted as separate modules.
+set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
+set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
 
 # Container output support (WebM/animated-WebP) for video encoding.
 set(USE_WEBP ON CACHE BOOL "Enable WebP support" FORCE)
 set(USE_WEBM ON CACHE BOOL "Enable WebM video container support" FORCE)
-
-# Forward GGML backend selection from the superbuild caller. The caller sets
-# GGML_<BACKEND>=ON via the OLLAMA_SDCPP_BACKENDS mapping before configuring.
-if(NOT DEFINED GGML_CPU_ALL_VARIANTS)
-    set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
-endif()
 
 FetchContent_Declare(
     stable_diffusion_cpp
@@ -62,6 +69,65 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(stable_diffusion_cpp)
+
+# --- Phase 0.4: ggml symbol isolation ---------------------------------------
+# SD.cpp vendors its own ggml and links it statically into the shared
+# libstable-diffusion. The static ggml objects are compiled with default
+# (visible) visibility, so without intervention their symbols leak into the
+# shared library's dynamic symbol table and clash with llama.cpp's vendored
+# ggml when both are loaded in the same process.
+#
+# Two layers enforce isolation on ELF (Linux) and Mach-O (macOS) hosts:
+#   1. Compile everything with -fvisibility=hidden so non-SD_API symbols are
+#      hidden by default. SD_API functions are explicitly marked with
+#      __attribute__((visibility("default"))) in the header, so they remain
+#      exported. This is applied to ggml-base, ggml-cpu, and the SD lib.
+#   2. (ELF only) A linker version script exports ONLY the SD_API surface,
+#      guaranteeing no ggml_* or internal C++ symbols are visible regardless
+#      of how upstream compiles its objects. This is the authoritative gate.
+if(TARGET stable-diffusion)
+    set(_sd_target stable-diffusion)
+elseif(TARGET sd)
+    set(_sd_target sd)
+else()
+    set(_sd_target)
+endif()
+
+if(_sd_target)
+    # Layer 1: hidden compile visibility for the SD lib and its ggml deps.
+    foreach(_vis_target "${_sd_target}" ggml-base ggml-cpu ggml)
+        if(TARGET ${_vis_target})
+            set_target_properties(${_vis_target} PROPERTIES
+                CXX_VISIBILITY_PRESET hidden
+                C_VISIBILITY_PRESET hidden
+                VISIBILITY_INLINES_HIDDEN ON)
+        endif()
+    endforeach()
+
+    # Layer 2: linker version script (ELF only) exporting only SD_API symbols.
+    # The public C API symbols all start with sd_, new_sd_, free_sd_,
+    # generate_image, generate_video, or convert.
+    if(NOT WIN32 AND NOT APPLE)
+        set(_sdcpp_version_script "${CMAKE_CURRENT_BINARY_DIR}/sdcpp.exports")
+        file(WRITE "${_sdcpp_version_script}"
+"SD_API_1.0 {\n"
+"    global:\n"
+"        sd_*;\n"
+"        new_sd_ctx;\n"
+"        free_sd_ctx;\n"
+"        free_sd_images;\n"
+"        free_sd_audio;\n"
+"        generate_image;\n"
+"        generate_video;\n"
+"        convert;\n"
+"        go*Trampoline;\n"
+"    local:\n"
+"        *;\n"
+"};\n")
+        set_target_properties(${_sd_target} PROPERTIES
+            LINK_FLAGS "-Wl,--version-script,${_sdcpp_version_script}")
+    endif()
+endif()
 
 set(OLLAMA_LIB_DIR "lib/ollama" CACHE STRING "Install destination for Ollama runtime payloads")
 set(_base_dest "${OLLAMA_LIB_DIR}")

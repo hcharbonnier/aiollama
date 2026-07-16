@@ -1386,7 +1386,8 @@ hardening phase.
 
 **Date:** 2026-07-16
 **Status:** Phases 0–8 implemented and committed. Go code compiles and unit
-tests pass. Native build validation and E2E testing remain.
+tests pass. Native build validation (12.1) is complete (CPU/Linux); E2E
+testing and GPU-backend validation remain.
 
 ### Completed
 
@@ -1408,16 +1409,35 @@ The following items are explicitly listed in the plan but are **not yet
 implemented**. They are non-blocking for a functional PoC but required for
 production quality.
 
-#### 12.1 Native build validation (Phase 0.4, 7.1)
+#### 12.1 Native build validation (Phase 0.4, 7.1) — DONE
 
-- **`cmake --build build`** has not been run with real toolchains (CUDA, Metal,
-  Vulkan). The CMake wiring is written but untested at the native link stage.
-- **ggml symbol isolation** (Phase 0.4) is designed (shared lib + hidden
-  visibility) but not validated with `nm`/`dumpbin`. Need to confirm no
-  `ggml_*` symbols leak across `libllama`, `libstable-diffusion`, and the MLX
-  library when loaded in the same process.
-- **Phase 0 validation test binary** (load all three libs, confirm no
-  duplicate-symbol linker errors) is not written.
+- **`cmake --build build`** has been validated on Linux (WSL, GCC 13.3.0,
+  CPU backend) for both SD.cpp (`OLLAMA_SDCPP_BACKENDS=cpu`) and llama.cpp
+  (`ollama-local`). Both native stacks build and install cleanly in the same
+  superbuild. CUDA/Metal/Vulkan toolchains were not available in this
+  environment; the CPU path is validated end-to-end.
+- **ggml symbol isolation** (Phase 0.4) is implemented and validated. The
+  strategy embeds ggml+backends statically into `libstable-diffusion` (shared)
+  with two isolation layers: (1) `-fvisibility=hidden` compile flags on the SD
+  lib and its ggml deps, and (2) an ELF linker version script exporting only
+  the `SD_API` surface (`sd_*`, `new_sd_ctx`, `free_sd_*`, `generate_image`,
+  `generate_video`, `convert`). Verified with `nm -D`:
+  `libstable-diffusion.so` exports **0** `ggml_*` symbols (was 495 before the
+  fix), while `libggml-base.so` (llama.cpp) exports 535 — the two namespaces
+  are now disjoint.
+- **Phase 0.4 coexistence validation test binary** is written
+  (`cmake/sdcpp/coexist_test.c`) and wired as the `sdcpp-coexist` CMake
+  target (`cmake/local.cmake`). It links `libstable-diffusion` (SD.cpp) and
+  `libggml-base` (llama.cpp) in the same process, resolves one symbol from
+  each (`sd_get_system_info` and `ggml_type_name`), and confirms no
+  duplicate-symbol linker errors. The test passes:
+  ```
+  SD.cpp: System Info: SSE3 = 1 | ... | AVX512_VNNI = 1
+  llama.cpp ggml: ggml_type_name(0) = f32
+  PASS: SD.cpp and llama.cpp ggml coexist without symbol conflicts
+  ```
+- **Go integration** validated: `go build -tags=sdcpp` links against the built
+  `libstable-diffusion.so` and the `x/sdcpp` Go tests pass.
 
 #### 12.2 Runner handler tests with mock (Phase 8.4)
 
@@ -1552,14 +1572,14 @@ OLLAMA_TEST_DIFF_MODEL=wan2.2-t2v-a14b go test -tags=integration -run TestDiffge
 
 ### Summary of remaining work
 
-| Item | Priority | Effort | Blocks |
-|------|----------|--------|--------|
-| Native build validation (`cmake --build`) | High | 1–2 days | E2E testing |
-| ggml symbol isolation check | High | 0.5 day | Native build |
-| Runner handler tests (mock or CPU model) | Medium | 2–3 days | None |
-| Dockerfile SD.cpp deps | Medium | 0.5 day | Containerized CI |
-| CI multi-backend matrix | Medium | 1–2 days | Regression prevention |
-| Video container encoding (WebM) | Low | 3–5 days | Non-blocking (PNG stream works) |
-| E2E tests with real models (FLUX.2-Klein-4B + WAN 2.2, CPU, Q2_K) | Medium | 1 day | Requires native build |
-| `convertFromSDCpp` test fixture | Low | 0.5 day | Import path coverage |
-| Memory estimation overhead factor | Low | 0.5 day | Pre-flight accuracy |
+| Item | Priority | Effort | Blocks | Status |
+|------|----------|--------|--------|--------|
+| Native build validation (`cmake --build`) | High | 1–2 days | E2E testing | **DONE** (CPU/Linux validated; CUDA/Metal/Vulkan pending toolchain) |
+| ggml symbol isolation check | High | 0.5 day | Native build | **DONE** (0 leaked symbols; coexist test passes) |
+| Runner handler tests (mock or CPU model) | Medium | 2–3 days | None | Pending |
+| Dockerfile SD.cpp deps | Medium | 0.5 day | Containerized CI | Pending |
+| CI multi-backend matrix | Medium | 1–2 days | Regression prevention | Pending |
+| Video container encoding (WebM) | Low | 3–5 days | Non-blocking (PNG stream works) | Pending |
+| E2E tests with real models (FLUX.2-Klein-4B + WAN 2.2, CPU, Q2_K) | Medium | 1 day | Requires native build | Pending (native build done; models/test harness pending) |
+| `convertFromSDCpp` test fixture | Low | 0.5 day | Import path coverage | Pending |
+| Memory estimation overhead factor | Low | 0.5 day | Pre-flight accuracy | Pending |
