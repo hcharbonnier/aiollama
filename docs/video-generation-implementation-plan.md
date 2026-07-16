@@ -1452,30 +1452,127 @@ production quality.
   `libstable-diffusion` (cgo) but the mock never calls into C.
 - Run with: `CGO_LDFLAGS='-L<libdir> -lstable-diffusion' go test -tags=sdcpp -run TestHandler ./x/diffgen/`
 
-#### 12.3 Dockerfile (Section 5, modified files inventory)
+#### 12.3 Dockerfile (Section 5, modified files inventory) — DONE
 
-- The plan's file inventory lists `Dockerfile` as a modified file ("Add SD.cpp
-  build deps"), but the Dockerfile was **not modified**. SD.cpp build
-  dependencies (CMake, a C++ compiler, optional CUDA/Vulkan SDK) need to be
-  added for containerized builds.
+- Added `sdcpp-cpu`, `sdcpp-cuda_v12`, `sdcpp-cuda_v13`, `sdcpp-vulkan` build
+  stages (plus matching `publish-sdcpp-*` scratch stages) that build
+  `libstable-diffusion` via `cmake/sdcpp` through the root superbuild
+  (`-DOLLAMA_SDCPP_BACKENDS=<backend>`), mirroring the existing `mlx` stage
+  pattern. These reuse the same toolchain stages already used for the
+  llama-server GPU backends (`cpu-deps`, `cuda-12-deps`, `cuda-13-deps`,
+  `vulkan-deps`) — CMake, Ninja, a C++ compiler, and the CUDA/Vulkan SDKs were
+  already present in those stages, so no new system packages were required.
+- Fixed a pre-existing gap in `cmake/local.cmake`'s superbuild guard: it
+  required `OLLAMA_MLX_BACKENDS` to be set whenever `llama/server` was absent
+  from the build context, with no equivalent allowance for
+  `OLLAMA_SDCPP_BACKENDS`. This blocked an SD.cpp-only CMake invocation (the
+  new Docker stages don't copy `llama/server`, matching how the `mlx` stage
+  doesn't either). The guard now also accepts `OLLAMA_SDCPP_BACKENDS`.
+- Added an explicit, additive `build-sdcpp` / `publish-go-sdcpp` target that
+  builds the Go binary with `-tags=sdcpp` and links it against the `cpu`
+  backend's `libstable-diffusion`, for maintainers/CI who want a
+  diffgen-capable binary. This is **not** wired into the default
+  `build`/`publish-go` target or any assembled image (`amd64`, `arm64`,
+  `rocm`, `archive`, `image-archive`, or the final `ubuntu:24.04` stage),
+  because `x/sdcpp` links `libstable-diffusion` directly (unlike the
+  dlopen-based MLX bridge) — a default-enabled build would make every shipped
+  `ollama` binary hard-depend on `libstable-diffusion.so` being resolvable at
+  process startup on every platform/flavor (including e.g. the `rocm` image,
+  which has no SD.cpp backend), which is a correctness risk beyond the scope
+  of this item. Wiring SD.cpp into the default image/CI matrix is tracked
+  separately (12.4).
+- Not validated end-to-end in this environment (no Docker daemon / GPU
+  toolchains available here, consistent with the 12.1 note that CUDA/Metal/
+  Vulkan toolchains were unavailable for validation). The CMake invocations
+  mirror the already-validated (12.1) local `cmake --build` flow for
+  `OLLAMA_SDCPP_BACKENDS=cpu`.
 
-#### 12.4 CI multi-backend matrix (Phase 8.4)
+#### 12.4 CI multi-backend matrix (Phase 8.4) — DEFERRED (low priority)
 
 - No `.github/workflows/` configuration exists for a CUDA/Metal/Vulkan/CPU test
   matrix. The plan calls for this under Phase 8.4 ("Multi-backend CI matrix").
 - The integration test scaffold (`integration/diffgen_test.go`) compiles and
   skips cleanly when `OLLAMA_TEST_DIFF_MODEL` is unset, but no CI job sets it.
+- **Not a priority** for the current phase. The CPU backend is already
+  validated locally (12.1) and the Dockerfile build stages are in place (12.3).
+  A full multi-backend CI matrix (CUDA/Metal/Vulkan) is a regression-prevention
+  measure, not a functional blocker — it will be implemented later once the
+  E2E test harness (12.6) is wired up with real models, since a CI matrix
+  without a runnable test adds little value over the existing local
+  validation. Deferred until 12.6 lands and GPU-backed CI runners are available.
 
-#### 12.5 Video container encoding (Phase 2.6)
+#### 12.5 Video container encoding (Phase 2.6) — DONE
 
-- **Explicitly deferred** in the plan: video output is currently PNG frame
-  stream only (one `{frame, image}` ndjson line per frame). No WebM/MP4/GIF
-  container encoding is implemented.
-- The CLI assembles frames into a GIF via pure-Go `image/gif` as a basic
-  fallback, but the API response (`DiffResponse.Video`) is not populated — the
-  client receives individual frame images, not a single video blob.
-- WebM encoding (via cgo ffmpeg or a pure-Go muxer) is planned "in a later
-  phase behind a build tag" per Phase 2.6.
+- **WebM container encoding is implemented** (`x/diffgen/video.go`,
+  `EncodeWebM`). Rather than vendoring a VP8/VP9 encoder or linking cgo
+  ffmpeg bindings, raw RGB frames are piped through an external `ffmpeg`
+  process (`rawvideo` in, `libvpx`/`webm` out), resolved once via
+  `exec.LookPath("ffmpeg")` and cached. This keeps ffmpeg an **optional
+  runtime dependency** (looked up on `PATH`), not a build-time Go module or
+  cgo dependency — binaries built without ffmpeg present still build and run
+  unchanged; they transparently fall back to the PNG frame-stream protocol.
+  This directly addresses the "binary bloat / cross-compilation pain" risk
+  in §6 without the correctness risk of a from-scratch VP8 encoder.
+- `handleVideoCompletion` (`runner.go`) now checks
+  `strings.EqualFold(req.OutputFormat, "webm") && SupportsContainerEncoding()`
+  after generation completes. On success, it emits a single
+  `DiffResponse{Video: base64(webm), Done: true, Frame: n, Frames: n}`
+  message instead of streaming per-frame images (`Frame` is set equal to
+  `Frames` so `Completed == Total` for progress-bar consumers, since no
+  incremental frame progress is streamed on this path). On any failure
+  (ffmpeg missing, encode error, or a cancelled request), it logs a warning,
+  merges a "returned individual frames instead of a webm container" notice
+  into the response `Warning` field (in addition to any existing
+  WAN-VAE-fallback warning) so the degraded encoding is visible to callers
+  and not just server logs, and falls back to the original per-frame PNG
+  stream — fully backward compatible, and opt-in via `output_format`.
+- ffmpeg's stdout is read into a **size-capped** buffer (512 MiB via
+  `io.CopyN`, fully drained before `cmd.Wait()` per the `StdoutPipe`
+  contract) rather than assigning an unbounded `bytes.Buffer` directly to
+  `cmd.Stdout`, so a pathological frame count/size combination cannot grow
+  the container-encoding response without limit; encoding fails cleanly with
+  an error (and the usual frame-stream fallback) if the cap is exceeded.
+- **`output_format` has no implicit default anywhere** — including on the
+  OpenAI-compatible `/v1/video/generations` and `/v1/video/edits` endpoints.
+  An earlier version of this change defaulted those two endpoints to
+  `output_format="webm"` when unspecified, but that was reverted: since
+  container encoding depends on an optional runtime dependency (ffmpeg on
+  `PATH`), defaulting to it would have made the response shape
+  (single video blob vs. last-frame PNG) depend on the server's incidental
+  environment rather than an explicit, deployment-controlled choice. Callers
+  that want a single WebM file must request `output_format: "webm"`
+  explicitly; the native `/api/generate` path and CLI behave identically.
+- **Bug fix in `middleware.VideoWriter`:** the writer previously collapsed
+  `GenerateResponse.Video` and `.Image` into a single `lastImage` field and
+  always re-emitted it as `.Image`, so `openai.ToVideoGenerationResponse`
+  could never actually see a populated `.Video` field — a real webm
+  container would have been silently downgraded to "last frame as PNG" over
+  the OpenAI-compatible API. `VideoWriter` now tracks `lastVideo` and
+  `lastImage` separately and restores the correct field before encoding the
+  response, with `ToVideoGenerationResponse` setting `Format: "webm"` when a
+  container is returned and `Format: "png"` for the frame fallback. This fix
+  is independent of the output_format default question above and applies
+  whenever a container is produced (i.e. `output_format="webm"` is
+  requested explicitly).
+- **Tests:** `x/diffgen/video_test.go` (`TestEncodeWebM*`, real ffmpeg
+  subprocess, validates the EBML/Matroska magic header, dimension/channel
+  validation, context cancellation, default FPS, the output size cap);
+  `x/diffgen/runner_test.go` (`TestHandlerVideoWebMContainer`,
+  `TestHandlerVideoWebMFallsBackWithoutOutputFormat`, full HTTP handler path
+  with a mock `sdContext`, including the `Frame == Frames` progress
+  invariant); `middleware/openai_test.go` (`TestVideoGenerationsMiddleware`,
+  `TestVideoWriterResponse`, `TestVideoEditsMiddleware`, covering the
+  no-implicit-default behavior and the container-vs-fallback-frame priority
+  fix). All ffmpeg-dependent tests skip cleanly (`t.Skip`) when ffmpeg is not
+  on `PATH`. Verified locally against the previously-built
+  `build/lib/ollama/sdcpp/cpu/libstable-diffusion.so` (see §12.1) with
+  ffmpeg 6.1.1 (libvpx-enabled) on WSL/Linux.
+- **Not done:** animated WebP and GIF are still not produced server-side
+  (GIF remains a client-side CLI fallback only); MP4/H.264 container output
+  is not implemented (WebM/VP8 was prioritized as it's royalty-free and
+  matches the plan's stated priority order). No CI job currently exercises
+  the ffmpeg-dependent tests (they require ffmpeg installed on the runner);
+  tracked alongside 12.4.
 
 #### 12.6 End-to-end testing with real models
 
@@ -1577,9 +1674,9 @@ OLLAMA_TEST_DIFF_MODEL=wan2.2-t2v-a14b go test -tags=integration -run TestDiffge
 | Native build validation (`cmake --build`) | High | 1–2 days | E2E testing | **DONE** (CPU/Linux validated; CUDA/Metal/Vulkan pending toolchain) |
 | ggml symbol isolation check | High | 0.5 day | Native build | **DONE** (0 leaked symbols; coexist test passes) |
 | Runner handler tests (mock or CPU model) | Medium | 2–3 days | None | **DONE** (25 tests via mock sdContext interface) |
-| Dockerfile SD.cpp deps | Medium | 0.5 day | Containerized CI | Pending |
-| CI multi-backend matrix | Medium | 1–2 days | Regression prevention | Pending |
-| Video container encoding (WebM) | Low | 3–5 days | Non-blocking (PNG stream works) | Pending |
+| Dockerfile SD.cpp deps | Medium | 0.5 day | Containerized CI | **DONE** (sdcpp-* build/publish stages added, reusing existing toolchain stages; opt-in `build-sdcpp`/`publish-go-sdcpp` Go target; not wired into default image) |
+| CI multi-backend matrix | Low | 1–2 days | Regression prevention | **DEFERRED** (non-priority; revisit after 12.6 E2E harness and GPU CI runners) |
+| Video container encoding (WebM) | Low | 3–5 days | Non-blocking (PNG stream works) | **DONE** (ffmpeg-based `EncodeWebM`, opt-in via `output_format: "webm"` everywhere including the HTTP video API — no implicit default; size-capped output buffer; `VideoWriter` container-priority bug fixed; fallback surfaced via response `Warning`) |
 | E2E tests with real models (FLUX.2-Klein-4B + WAN 2.2, CPU, Q2_K) | Medium | 1 day | Requires native build | Pending (native build done; models/test harness pending) |
 | `convertFromSDCpp` test fixture | Low | 0.5 day | Import path coverage | Pending |
 | Memory estimation overhead factor | Low | 0.5 day | Pre-flight accuracy | Pending |

@@ -961,6 +961,13 @@ type VideoURLOrData struct {
 }
 
 // FromVideoGenerationRequest converts a video generation request to an Ollama GenerateRequest.
+//
+// OutputFormat is passed through as given, with no implicit default. Video
+// container encoding (e.g. "webm") depends on an optional runtime dependency
+// (ffmpeg on PATH; see x/diffgen/video.go), so defaulting to it here would
+// make the response shape depend on the server's incidental environment
+// rather than on an explicit, deployment-controlled choice. Callers that want
+// a single video file must request output_format="webm" explicitly.
 func FromVideoGenerationRequest(r VideoGenerationRequest) api.GenerateRequest {
 	req := api.GenerateRequest{
 		Model:          r.Model,
@@ -997,10 +1004,12 @@ func FromVideoGenerationRequest(r VideoGenerationRequest) api.GenerateRequest {
 func ToVideoGenerationResponse(resp api.GenerateResponse) VideoGenerationResponse {
 	var data []VideoURLOrData
 	if resp.Image != "" {
-		data = []VideoURLOrData{{B64JSON: resp.Image}}
+		// No container was produced (e.g. ffmpeg unavailable); this is the
+		// last streamed frame as a fallback, encoded as PNG.
+		data = []VideoURLOrData{{B64JSON: resp.Image, Format: "png"}}
 	}
 	if resp.Video != "" {
-		data = []VideoURLOrData{{B64JSON: resp.Video}}
+		data = []VideoURLOrData{{B64JSON: resp.Video, Format: "webm"}}
 	}
 	return VideoGenerationResponse{
 		Created: resp.CreatedAt.Unix(),
@@ -1028,6 +1037,7 @@ type VideoEditRequest struct {
 }
 
 // FromVideoEditRequest converts a video edit request to an Ollama GenerateRequest.
+// See FromVideoGenerationRequest for why OutputFormat has no implicit default.
 func FromVideoEditRequest(r VideoEditRequest) (api.GenerateRequest, error) {
 	req := api.GenerateRequest{
 		Model:          r.Model,

@@ -15,6 +15,7 @@ package diffgen
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"image"
@@ -627,6 +628,173 @@ func TestHandlerImageParamsForwarded(t *testing.T) {
 	}
 	if p.SampleParams.CFGScale != 7.5 {
 		t.Errorf("cfg = %f, want 7.5", p.SampleParams.CFGScale)
+	}
+}
+
+// TestHandlerVideoWebMContainer exercises the full handleVideoCompletion path
+// with a real ffmpeg-backed WebM encode (see EncodeWebM in video.go). It
+// skips cleanly when ffmpeg is not found on PATH.
+func TestHandlerVideoWebMContainer(t *testing.T) {
+	requireFFmpeg(t)
+
+	frames := []sdcpp.Image{testImage(), testImage(), testImage()}
+	mock := &mockSDContext{
+		supportsVideo: true,
+		videoResult:   frames,
+	}
+	s := newTestServer(ModeVideo, mock)
+
+	_, resps := doCompletion(t, s, DiffRequest{
+		Prompt: "a dog running", OutputFormat: "webm",
+		Width: 8, Height: 8, Steps: 1, Seed: 1,
+		VideoFrames: 3, FPS: 8,
+	})
+
+	if len(resps) != 1 {
+		t.Fatalf("expected a single container response, got %d responses", len(resps))
+	}
+	resp := resps[0]
+	if !resp.Done {
+		t.Fatal("expected Done=true")
+	}
+	if resp.Video == "" {
+		t.Fatal("expected a base64-encoded webm container in Video")
+	}
+	if resp.Image != "" {
+		t.Errorf("expected no per-frame Image when a container is produced, got %q", resp.Image)
+	}
+	if resp.Frames != 3 {
+		t.Errorf("Frames = %d, want 3", resp.Frames)
+	}
+	if resp.Frame != resp.Frames {
+		t.Errorf("Frame = %d, want equal to Frames (%d) so progress consumers see Completed == Total on the only message sent for this path", resp.Frame, resp.Frames)
+	}
+
+	data, err := base64.StdEncoding.DecodeString(resp.Video)
+	if err != nil {
+		t.Fatalf("failed to decode video base64: %v", err)
+	}
+	ebmlMagic := []byte{0x1A, 0x45, 0xDF, 0xA3}
+	if len(data) < 4 || string(data[:4]) != string(ebmlMagic) {
+		t.Errorf("decoded video does not start with EBML magic header, got % x", data[:min(4, len(data))])
+	}
+}
+
+// TestHandlerVideoWebMFallbackSurfacesWarning confirms that when webm
+// encoding is requested but fails, the resulting frame-stream response
+// surfaces a Warning explaining the fallback, not just a server-side log.
+func TestHandlerVideoWebMFallbackSurfacesWarning(t *testing.T) {
+	requireFFmpeg(t)
+
+	// Mismatched frame dimensions are invalid input for EncodeWebM (which
+	// requires all frames to share the same size), forcing the webm path to
+	// fail and fall back, while each individual frame remains valid for the
+	// per-frame PNG fallback encoding.
+	frames := []sdcpp.Image{solidFrame(8, 8, 1, 2, 3), solidFrame(4, 4, 4, 5, 6)}
+	mock := &mockSDContext{
+		supportsVideo: true,
+		videoResult:   frames,
+	}
+	s := newTestServer(ModeVideo, mock)
+
+	_, resps := doCompletion(t, s, DiffRequest{
+		Prompt: "a dog running", OutputFormat: "webm",
+		Width: 8, Height: 8, Steps: 1, Seed: 1,
+		VideoFrames: 2, FPS: 8,
+	})
+
+	var doneResp *DiffResponse
+	for i := range resps {
+		if resps[i].Done {
+			doneResp = &resps[i]
+		}
+	}
+	if doneResp == nil {
+		t.Fatal("missing done response")
+	}
+	if doneResp.Video != "" {
+		t.Error("expected no video container on the fallback path")
+	}
+	if doneResp.Warning == "" {
+		t.Error("expected the webm-encoding-failure fallback to be surfaced via Warning")
+	}
+}
+
+// TestHandlerVideoWebMFallbackWarningCombinesWithExisting confirms the
+// fallback notice is appended to (not replacing) an existing structural
+// warning (e.g. WAN VAE CPU fallback) without mutating the server's warning
+// across requests.
+func TestHandlerVideoWebMFallbackWarningCombinesWithExisting(t *testing.T) {
+	requireFFmpeg(t)
+
+	frames := []sdcpp.Image{solidFrame(8, 8, 1, 2, 3), solidFrame(4, 4, 4, 5, 6)}
+	mock := &mockSDContext{
+		supportsVideo: true,
+		videoResult:   frames,
+	}
+	s := newTestServer(ModeVideo, mock)
+	s.warning = "WAN video VAE does not support metal backend"
+
+	_, resps := doCompletion(t, s, DiffRequest{
+		Prompt: "a dog running", OutputFormat: "webm",
+		Width: 8, Height: 8, Steps: 1, Seed: 1,
+		VideoFrames: 2, FPS: 8,
+	})
+
+	var doneResp *DiffResponse
+	for i := range resps {
+		if resps[i].Done {
+			doneResp = &resps[i]
+		}
+	}
+	if doneResp == nil {
+		t.Fatal("missing done response")
+	}
+	if !strings.Contains(doneResp.Warning, "WAN video VAE") {
+		t.Errorf("expected the pre-existing structural warning to be preserved, got %q", doneResp.Warning)
+	}
+	if doneResp.Warning == s.warning {
+		t.Errorf("expected the fallback notice to be appended, not just the original warning: got %q", doneResp.Warning)
+	}
+	// s.warning itself must not be mutated by the request (it must stay
+	// scoped to this one response, not leak into subsequent requests).
+	if s.warning != "WAN video VAE does not support metal backend" {
+		t.Errorf("s.warning was mutated by the request: %q", s.warning)
+	}
+}
+
+// TestHandlerVideoWebMFallsBackWithoutOutputFormat confirms that omitting
+// output_format (or requesting a non-webm format) preserves the legacy
+// frame-stream protocol even when ffmpeg is available.
+func TestHandlerVideoWebMFallsBackWithoutOutputFormat(t *testing.T) {
+	frames := []sdcpp.Image{testImage(), testImage()}
+	mock := &mockSDContext{
+		supportsVideo: true,
+		videoResult:   frames,
+	}
+	s := newTestServer(ModeVideo, mock)
+
+	_, resps := doCompletion(t, s, DiffRequest{
+		Prompt: "a dog running",
+		Width:  8, Height: 8, Steps: 1, Seed: 1,
+		VideoFrames: 2, FPS: 8,
+	})
+
+	var sawVideo bool
+	var frameImages int
+	for _, r := range resps {
+		if r.Video != "" {
+			sawVideo = true
+		}
+		if r.Image != "" {
+			frameImages++
+		}
+	}
+	if sawVideo {
+		t.Error("expected no container response when output_format is unset")
+	}
+	if frameImages != 2 {
+		t.Errorf("expected 2 per-frame images (legacy protocol), got %d", frameImages)
 	}
 }
 

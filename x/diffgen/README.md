@@ -77,7 +77,7 @@ ollama run <model>
 | `--negative` | Negative prompt |
 | `--cfg-scale` | Classifier-free guidance scale |
 | `--sampler` | Sampler name (e.g. euler) |
-| `--output-format` | Output format (image: png; video: gif, webm, webp) |
+| `--output-format` | Output format (image: png; video: gif, webm [requires `ffmpeg` on `PATH`], webp) |
 | `--video-frames` | Number of video frames to generate |
 | `--fps` | Output frame rate for video |
 | `--flow-shift` | Flow shift for WAN video models |
@@ -93,6 +93,18 @@ manifest format and `memory.go` for model type detection (image vs video).
 
 ## Video output
 
-Phase 1 streams PNG frames individually via ndjson (no container dependency).
-The CLI assembles frames into a GIF (pure-Go `image/gif`) by default. WebM
-container encoding is planned for a later phase behind a build tag.
+By default, video frames stream individually as PNGs via ndjson (no container
+dependency), and the CLI assembles them into a GIF (pure-Go `image/gif`).
+
+When the request explicitly sets `output_format: "webm"` **and** an
+`ffmpeg` binary is available on `PATH`, `handleVideoCompletion` (`runner.go`)
+instead muxes all generated frames into
+a single VP8/WebM container via `EncodeWebM` (`video.go`) and returns it in
+one `DiffResponse.Video` message. ffmpeg is invoked as an external process
+(`rawvideo` in, `webm`/`libvpx` out) — this is an optional *runtime*
+dependency looked up on `PATH`, not a build-time Go module or cgo dependency,
+so binaries built without ffmpeg present still build and run; they simply
+fall back to the PNG frame-stream protocol. If ffmpeg is missing or the
+encode fails, the runner logs a warning and falls back to the frame-stream
+protocol transparently. Use `SupportsContainerEncoding()` to check
+availability.

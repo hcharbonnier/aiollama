@@ -23,7 +23,7 @@ func RegisterFlags(cmd *cobra.Command) {
 	cmd.Flags().String("negative", "", "Negative prompt")
 	cmd.Flags().Float32("cfg-scale", 0, "Classifier-free guidance scale")
 	cmd.Flags().String("sampler", "", "Sampler name (e.g. euler)")
-	cmd.Flags().String("output-format", "", "Output format (image: png; video: gif, webm, webp)")
+	cmd.Flags().String("output-format", "", "Output format (image: png; video: gif, webm [requires ffmpeg], webp)")
 
 	// Video-specific flags
 	cmd.Flags().Int("video-frames", 0, "Number of video frames to generate")
@@ -55,7 +55,7 @@ Diffusion Generation Flags (image + video, experimental):
       --negative str       Negative prompt
       --cfg-scale float     Classifier-free guidance scale
       --sampler str         Sampler name (e.g. euler)
-      --output-format str   Output format (image: png; video: gif, webm, webp)
+      --output-format str   Output format (image: png; video: gif, webm [requires ffmpeg], webp)
       --video-frames int    Number of video frames to generate
       --fps int             Output frame rate for video
       --flow-shift float    Flow shift for WAN video models

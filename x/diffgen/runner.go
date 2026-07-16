@@ -4,6 +4,7 @@ package diffgen
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -349,6 +350,51 @@ func (s *runnerServer) handleVideoCompletion(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// warning accumulates s.warning (a structural, server-lifetime warning
+	// such as the WAN VAE CPU fallback) plus any request-scoped notice below.
+	// It is intentionally a local copy, not a mutation of s.warning, so it
+	// doesn't leak across unrelated requests handled by this same runner.
+	warning := s.warning
+
+	// If the caller explicitly requested a WebM container and ffmpeg is
+	// available on PATH, mux the frames into a single video blob instead of
+	// streaming them individually. Falls back to the frame-stream protocol
+	// below on any encoding failure (e.g. ffmpeg missing or erroring), in
+	// which case the fallback is surfaced via the Warning field below rather
+	// than only logged server-side.
+	if strings.EqualFold(req.OutputFormat, "webm") && SupportsContainerEncoding() {
+		data, encErr := EncodeWebM(r.Context(), frames, req.FPS)
+		if encErr == nil {
+			resp := DiffResponse{
+				Video: base64.StdEncoding.EncodeToString(data),
+				Done:  true,
+				// Frame equals Frames here (rather than 0) because no
+				// incremental frame-decode progress is streamed on this
+				// path; leaving Frame at its zero value would make
+				// Completed/Total-based progress consumers (e.g. the CLI
+				// step bar) appear to reset to 0 right as generation
+				// finishes.
+				Frame:   len(frames),
+				Frames:  len(frames),
+				Warning: warning,
+			}
+			enc.Encode(resp)
+			w.Write([]byte("\n"))
+			flusher.Flush()
+			return
+		}
+		if r.Context().Err() != nil {
+			return
+		}
+		slog.Warn("webm container encoding failed; falling back to frame stream", "model", s.modelName, "error", encErr)
+		fallbackNotice := "webm container encoding failed (" + encErr.Error() + "); returned individual frames instead"
+		if warning != "" {
+			warning += "; " + fallbackNotice
+		} else {
+			warning = fallbackNotice
+		}
+	}
+
 	for i, frame := range frames {
 		b64, err := EncodeImageBase64(frame)
 		if err != nil {
@@ -360,7 +406,7 @@ func (s *runnerServer) handleVideoCompletion(w http.ResponseWriter, r *http.Requ
 		flusher.Flush()
 	}
 
-	resp := DiffResponse{Done: true, Frames: len(frames), Warning: s.warning}
+	resp := DiffResponse{Done: true, Frames: len(frames), Warning: warning}
 	enc.Encode(resp)
 	w.Write([]byte("\n"))
 	flusher.Flush()

@@ -163,7 +163,9 @@ type GenerateRequest struct {
 	Sampler string `json:"sampler,omitempty"`
 
 	// OutputFormat is the desired output format for video ("webm","webp","gif")
-	// or image ("png") generation.
+	// or image ("png") generation. "webm" requires an `ffmpeg` binary on the
+	// server's PATH; if unavailable, the response falls back to individual
+	// streamed frame images instead of a single video container.
 	OutputFormat string `json:"output_format,omitempty"`
 
 	// EndImage is a base64-encoded end frame for FLF2V video generation.
@@ -982,8 +984,10 @@ type GenerateResponse struct {
 
 	// Experimental: Video generation fields (may change or be removed)
 
-	// Video contains a base64-encoded video container (e.g. webm).
-	// Only present for video generation models.
+	// Video contains a base64-encoded video container (currently always
+	// webm when present). Only populated when output_format="webm" was
+	// requested and container encoding succeeded; otherwise video frames
+	// are streamed individually via Image instead.
 	Video string `json:"video,omitempty"`
 }
 

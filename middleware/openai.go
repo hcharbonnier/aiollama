@@ -680,11 +680,16 @@ func ImageEditsMiddleware() gin.HandlerFunc {
 }
 
 // VideoWriter collects streamed generate responses and outputs a video
-// generation response. The diffgen runner streams video frames as individual
-// images (Done=false) followed by a final Done=true message with no image.
-// VideoWriter accumulates the last frame and emits it when Done arrives.
+// generation response. When a container encoder (e.g. ffmpeg) is available,
+// the diffgen runner emits a single Done=true message carrying the full
+// video container in Video. Otherwise it streams video frames as individual
+// images (Done=false) followed by a final Done=true message with no image;
+// VideoWriter then falls back to returning the last streamed frame. The two
+// cases are tracked separately so a real video container is never mistaken
+// for (or overwritten by) a fallback frame image.
 type VideoWriter struct {
 	BaseWriter
+	lastVideo string
 	lastImage string
 }
 
@@ -695,13 +700,14 @@ func (w *VideoWriter) writeResponse(data []byte) (int, error) {
 	}
 
 	if generateResponse.Video != "" {
-		w.lastImage = generateResponse.Video
+		w.lastVideo = generateResponse.Video
 	}
 	if generateResponse.Image != "" {
 		w.lastImage = generateResponse.Image
 	}
 
-	if generateResponse.Done && w.lastImage != "" {
+	if generateResponse.Done && (w.lastVideo != "" || w.lastImage != "") {
+		generateResponse.Video = w.lastVideo
 		generateResponse.Image = w.lastImage
 		w.ResponseWriter.Header().Set("Content-Type", "application/json")
 		return len(data), json.NewEncoder(w.ResponseWriter).Encode(openai.ToVideoGenerationResponse(generateResponse))
