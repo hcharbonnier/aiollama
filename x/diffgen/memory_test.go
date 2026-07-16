@@ -66,9 +66,9 @@ func TestDetectModelType(t *testing.T) {
 
 func TestResolveBackend(t *testing.T) {
 	tests := []struct {
-		name  string
-		libs  []string
-		want  string
+		name string
+		libs []string
+		want string
 	}{
 		{"cuda preferred", []string{"cpu", "cuda"}, "cuda"},
 		{"metal preferred over vulkan", []string{"vulkan", "metal"}, "metal"},
@@ -93,5 +93,143 @@ func TestResolveBackend(t *testing.T) {
 func TestCheckPlatformSupportAlwaysNil(t *testing.T) {
 	if err := CheckPlatformSupport(); err != nil {
 		t.Fatalf("CheckPlatformSupport() = %v, want nil", err)
+	}
+}
+
+func TestDetectArchitecture(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{"architecture field", `{"architecture":"WanVideoPipeline"}`, "WanVideoPipeline"},
+		{"class name fallback", `{"_class_name":"FluxPipeline"}`, "FluxPipeline"},
+		{"architecture preferred over class", `{"architecture":"SD3Pipeline","_class_name":"FluxPipeline"}`, "SD3Pipeline"},
+		{"empty json", `{}`, ""},
+		{"invalid json", `{not json`, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DetectArchitecture([]byte(tt.data))
+			if got != tt.want {
+				t.Fatalf("DetectArchitecture(%q) = %q, want %q", tt.data, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsWANVideoArchitecture(t *testing.T) {
+	tests := []struct {
+		arch string
+		want bool
+	}{
+		{"WanVideoPipeline", true},
+		{"WanT2VPipeline", true},
+		{"WanI2VPipeline", true},
+		{"WanFLF2VPipeline", true},
+		{"WanVACEPipeline", true},
+		{"WanTI2VPipeline", true},
+		{"LTXVideoPipeline", false},
+		{"FluxPipeline", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.arch, func(t *testing.T) {
+			if got := IsWANVideoArchitecture(tt.arch); got != tt.want {
+				t.Fatalf("IsWANVideoArchitecture(%q) = %v, want %v", tt.arch, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWANVAEDeprecatedBackend(t *testing.T) {
+	tests := []struct {
+		name    string
+		arch    string
+		backend string
+		want    bool
+	}{
+		{"wan on metal", "WanVideoPipeline", "metal", true},
+		{"wan on vulkan", "WanT2VPipeline", "vulkan", true},
+		{"wan on cuda", "WanVideoPipeline", "cuda", false},
+		{"wan on cpu", "WanVideoPipeline", "cpu", false},
+		{"wan on empty backend", "WanVideoPipeline", "", false},
+		{"non-wan on metal", "LTXVideoPipeline", "metal", false},
+		{"non-wan on vulkan", "FluxPipeline", "vulkan", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := WANVAEDeprecatedBackend(tt.arch, tt.backend); got != tt.want {
+				t.Fatalf("WANVAEDeprecatedBackend(%q, %q) = %v, want %v", tt.arch, tt.backend, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEstimateVRAMBudget(t *testing.T) {
+	cudaGPU := func(free uint64) ml.DeviceInfo {
+		return ml.DeviceInfo{DeviceID: ml.DeviceID{Library: "cuda"}, FreeMemory: free}
+	}
+	tests := []struct {
+		name     string
+		gpus     []ml.DeviceInfo
+		backend  string
+		wantZero bool
+	}{
+		{"no gpus", []ml.DeviceInfo{}, "cpu", true},
+		{"gpu with zero free", []ml.DeviceInfo{cudaGPU(0)}, "cuda", true},
+		{"non-matching backend", []ml.DeviceInfo{cudaGPU(8 << 30)}, "metal", true},
+		{"matching backend sums", []ml.DeviceInfo{cudaGPU(4 << 30), cudaGPU(4 << 30)}, "cuda", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := EstimateVRAMBudget(tt.gpus, tt.backend)
+			if tt.wantZero && got != 0 {
+				t.Fatalf("EstimateVRAMBudget() = %d, want 0", got)
+			}
+			if !tt.wantZero && got == 0 {
+				t.Fatalf("EstimateVRAMBudget() = 0, want non-zero")
+			}
+		})
+	}
+}
+
+func TestFormatVRAMGiB(t *testing.T) {
+	gib := uint64(1024 * 1024 * 1024)
+	tests := []struct {
+		bytes uint64
+		want  string
+	}{
+		{0, ""},
+		{1, ""},
+		{gib, "1"},
+		{8 * gib, "8"},
+		{8*gib + gib/2, "9"},         // rounds up at 0.5
+		{8*gib + gib/2 - 1, "8"},     // rounds down just below 0.5
+		{8*gib + 512*1024*1024, "9"}, // 8.5 GiB rounds to 9
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			got := FormatVRAMGiB(tt.bytes)
+			if got != tt.want {
+				t.Fatalf("FormatVRAMGiB(%d) = %q, want %q", tt.bytes, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldStreamLayers(t *testing.T) {
+	gib := uint64(1024 * 1024 * 1024)
+	if ShouldStreamLayers(4*gib, 0) {
+		t.Fatal("ShouldStreamLayers with zero budget = true, want false")
+	}
+	if ShouldStreamLayers(4*gib, 8*gib) {
+		t.Fatal("ShouldStreamLayers with model < budget = true, want false")
+	}
+	if !ShouldStreamLayers(8*gib, 4*gib) {
+		t.Fatal("ShouldStreamLayers with model > budget = false, want true")
+	}
+	if ShouldStreamLayers(8*gib, 8*gib) {
+		t.Fatal("ShouldStreamLayers with model == budget = true, want false (model fits)")
 	}
 }

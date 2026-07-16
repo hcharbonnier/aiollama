@@ -1,6 +1,7 @@
 // Package diffgen provides a unified runner subprocess for image and video
-// generation via the stable-diffusion.cpp native backend. It replaces the
-// former MLX-based x/imagegen package.
+// generation via the stable-diffusion.cpp native backend. It handles video
+// generation (all models) and image generation for models MLX does not support
+// natively, coexisting with the retained MLX-based x/imagegen package.
 //
 // The runner implements llm.LlamaServer and is spawned as a subprocess
 // (`ollama runner --diffgen-engine`), exposing a local HTTP server with
@@ -20,10 +21,10 @@ type DiffRequest struct {
 	Steps  int   `json:"steps,omitempty"`
 	Seed   int64 `json:"seed,omitempty"`
 
-	CFGScale     float32 `json:"cfg_scale,omitempty"`
-	Sampler      string  `json:"sampler,omitempty"`
-	Scheduler    string  `json:"scheduler,omitempty"`
-	OutputFormat string  `json:"output_format,omitempty"` // image: "png"; video: "webm","webp","gif"
+	CFGScale     float32  `json:"cfg_scale,omitempty"`
+	Sampler      string   `json:"sampler,omitempty"`
+	Scheduler    string   `json:"scheduler,omitempty"`
+	OutputFormat string   `json:"output_format,omitempty"` // image: "png"; video: "webm","webp","gif"
 	Images       [][]byte `json:"images,omitempty"`        // init/control images (img2img, I2V)
 
 	BatchCount      int     `json:"batch_count,omitempty"`
@@ -48,11 +49,18 @@ type RequestOptions struct {
 
 // DiffResponse is streamed back per progress update and final result.
 type DiffResponse struct {
-	Content    string `json:"content,omitempty"` // error text
+	Content    string `json:"content,omitempty"` // text content / error text
 	Image      string `json:"image,omitempty"`   // base64 PNG (image mode)
 	Video      string `json:"video,omitempty"`   // base64 container (video mode)
 	Done       bool   `json:"done"`
 	StopReason string `json:"stop_reason,omitempty"`
+
+	// Error carries a non-fatal or fatal error from the runner. When non-empty,
+	// the parent Server.Completion returns it as a Go error (instead of nil) so
+	// the scheduler can detect OOM and trigger eviction/retry. OOM errors
+	// contain "out of memory" so llm.IsOutOfMemory can match them.
+	Error   string `json:"error,omitempty"`
+	Warning string `json:"warning,omitempty"` // non-fatal warning (e.g. WAN VAE CPU fallback)
 
 	Step  int `json:"step,omitempty"`
 	Total int `json:"total,omitempty"`

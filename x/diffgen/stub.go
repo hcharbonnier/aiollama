@@ -29,4 +29,3 @@ func NewServer(modelName, mode string) (llm.LlamaServer, error) {
 func Execute(args []string) error {
 	return errSDCppNotCompiled
 }
-

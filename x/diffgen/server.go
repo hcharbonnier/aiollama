@@ -74,21 +74,17 @@ func (s *Server) Load(ctx context.Context, _ ml.SystemInfo, gpus []ml.DeviceInfo
 		s.vramSize = 8 * 1024 * 1024 * 1024
 	}
 
-	if len(gpus) > 0 {
-		available := gpus[0].FreeMemory
-		overhead := gpus[0].MinimumMemory() + envconfig.GpuOverhead()
-		if available > overhead {
-			available -= overhead
-		} else {
-			available = 0
+	backend := ResolveBackend(gpus)
+	vramBudget := EstimateVRAMBudget(gpus, backend)
+	if s.vramSize > vramBudget {
+		if requireFull {
+			return nil, llm.ErrLoadRequiredFull
 		}
-		if s.vramSize > available {
-			if requireFull {
-				return nil, llm.ErrLoadRequiredFull
-			}
-			return nil, fmt.Errorf("model requires %s but only %s are available", format.HumanBytes2(s.vramSize), format.HumanBytes2(available))
-		}
+		return nil, fmt.Errorf("model requires %s but only %s are available", format.HumanBytes2(s.vramSize), format.HumanBytes2(vramBudget))
 	}
+
+	maxVRAMGiB := FormatVRAMGiB(vramBudget)
+	streamLayers := ShouldStreamLayers(s.vramSize, vramBudget)
 
 	port := 0
 	if a, err := net.ResolveTCPAddr("tcp", "localhost:0"); err == nil {
@@ -110,7 +106,17 @@ func (s *Server) Load(ctx context.Context, _ ml.SystemInfo, gpus []ml.DeviceInfo
 		exe = eval
 	}
 
-	cmd := exec.Command(exe, "runner", "--diffgen-engine", "--model", s.modelName, "--port", strconv.Itoa(port))
+	args := []string{"runner", "--diffgen-engine", "--model", s.modelName, "--port", strconv.Itoa(port)}
+	if backend != "" {
+		args = append(args, "--backend", backend)
+	}
+	if maxVRAMGiB != "" {
+		args = append(args, "--max-vram", maxVRAMGiB)
+	}
+	if streamLayers {
+		args = append(args, "--stream-layers")
+	}
+	cmd := exec.Command(exe, args...)
 	cmd.Env = os.Environ()
 	configureDiffgenSubprocessEnv(cmd, ml.LibraryPaths(gpus))
 	s.cmd = cmd
@@ -264,7 +270,7 @@ func (s *Server) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 			Temperature: float64(req.Options.Temperature),
 			TopP:        float64(req.Options.TopP),
 			TopK:        req.Options.TopK,
-			Stop:         req.Options.Stop,
+			Stop:        req.Options.Stop,
 		}
 	}
 	body, err := json.Marshal(creq)
@@ -297,9 +303,14 @@ func (s *Server) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 			Total   int    `json:"total,omitempty"`
 			Frame   int    `json:"frame,omitempty"`
 			Frames  int    `json:"frames,omitempty"`
+			Error   string `json:"error,omitempty"`
+			Warning string `json:"warning,omitempty"`
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
 			continue
+		}
+		if raw.Warning != "" {
+			slog.Warn("diffgen runner warning", "model", s.modelName, "warning", raw.Warning)
 		}
 		// Map video frame progress onto Step/TotalSteps so the CLI progress
 		// bar works for video too. For image mode, Step/Total come from the
@@ -319,6 +330,9 @@ func (s *Server) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 			Video:      raw.Video,
 		}
 		fn(cresp)
+		if raw.Error != "" {
+			return fmt.Errorf("%s", raw.Error)
+		}
 		if cresp.Done {
 			return nil
 		}
