@@ -85,6 +85,10 @@ func (m *Model) IsMLX() bool {
 	return m.Config.ModelFormat == "safetensors"
 }
 
+func (m *Model) IsDiffGen() bool {
+	return m.Config.ModelFormat == "sdcpp"
+}
+
 func (m *Model) isGGUF() bool {
 	return m.Config.ModelFormat == "" || m.Config.ModelFormat == "gguf"
 }

@@ -608,6 +608,7 @@ func TestSchedGetRunnerReusesSameDigestWhenModelPathEmpty(t *testing.T) {
 		llama:       &mockLlm{vramByGPU: map[ml.DeviceID]uint64{}},
 		Options:     &opts,
 		numParallel: 1,
+		runnerKind:  "llama",
 	}
 
 	s.loadedMu.Lock()
@@ -864,6 +865,7 @@ func TestSchedNeedsReload(t *testing.T) {
 		Options:     &do,
 		llama:       llm,
 		numParallel: 1,
+		runnerKind:  "llama",
 	}
 	req := &LlmRequest{
 		model: &Model{
@@ -940,6 +942,7 @@ func TestSchedNeedsReloadIgnoresAutomaticNumCtxClamp(t *testing.T) {
 		llama:       llm,
 		numParallel: 1,
 		numCtxAuto:  true,
+		runnerKind:  "llama",
 	}
 	req := &LlmRequest{
 		model:      model,
@@ -969,6 +972,7 @@ func TestSchedNeedsReloadUsesEffectiveAutomaticContextShift(t *testing.T) {
 		numParallel:  1,
 		numCtxAuto:   true,
 		contextShift: true,
+		runnerKind:   "llama",
 	}
 	req := &LlmRequest{
 		model:      model,
@@ -998,6 +1002,7 @@ func TestSchedNeedsReloadUsesEffectiveExplicitContext(t *testing.T) {
 		numParallel:  1,
 		contextShift: true,
 		trainContext: 2048,
+		runnerKind:   "llama",
 	}
 	req := &LlmRequest{
 		model: model,
@@ -1025,6 +1030,7 @@ func TestSchedNeedsReloadIgnoresAutomaticNumBatchDerivation(t *testing.T) {
 		llama:        llm,
 		numParallel:  1,
 		numBatchAuto: true,
+		runnerKind:   "llama",
 	}
 	req := &LlmRequest{
 		model:        model,
@@ -1054,6 +1060,7 @@ func TestSchedNeedsReloadIgnoresAutomaticUseMMapDefault(t *testing.T) {
 		llama:       llm,
 		numParallel: 1,
 		useMMapAuto: true,
+		runnerKind:  "llama",
 	}
 	req := &LlmRequest{
 		model: model,
@@ -1072,6 +1079,96 @@ func TestSchedNeedsReloadIgnoresAutomaticUseMMapDefault(t *testing.T) {
 	runner.useMMapAuto = false
 	req.opts.UseMMap = nil
 	require.True(t, runner.needsReload(ctx, req))
+}
+
+func TestRunnerKindForModel(t *testing.T) {
+	tests := []struct {
+		name     string
+		model    *Model
+		wantKind string
+	}{
+		{
+			name:     "gguf default",
+			model:    &Model{Config: model.ConfigV2{ModelFormat: ""}},
+			wantKind: "llama",
+		},
+		{
+			name:     "gguf explicit",
+			model:    &Model{Config: model.ConfigV2{ModelFormat: "gguf"}},
+			wantKind: "llama",
+		},
+		{
+			name:     "safetensors text (mlx)",
+			model:    &Model{Config: model.ConfigV2{ModelFormat: "safetensors"}},
+			wantKind: "mlx",
+		},
+		{
+			name:     "safetensors image (imagegen)",
+			model:    &Model{Config: model.ConfigV2{ModelFormat: "safetensors", Capabilities: []string{"image"}}},
+			wantKind: "imagegen",
+		},
+		{
+			name:     "sdcpp image",
+			model:    &Model{Config: model.ConfigV2{ModelFormat: "sdcpp", Capabilities: []string{"image"}}},
+			wantKind: "diffgen",
+		},
+		{
+			name:     "sdcpp video",
+			model:    &Model{Config: model.ConfigV2{ModelFormat: "sdcpp", Capabilities: []string{"video"}}},
+			wantKind: "diffgen",
+		},
+		{
+			name:     "unknown format falls back to llama",
+			model:    &Model{Config: model.ConfigV2{ModelFormat: "unknown"}},
+			wantKind: "llama",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.wantKind, runnerKindForModel(tt.model))
+		})
+	}
+}
+
+func TestSchedNeedsReloadRunnerKindMismatch(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer done()
+
+	tests := []struct {
+		name        string
+		runnerKind  string
+		modelFormat string
+		caps        []string
+		wantReload  bool
+	}{
+		{name: "llama runner, llama model", runnerKind: "llama", modelFormat: "", wantReload: false},
+		{name: "llama runner, diffgen model", runnerKind: "llama", modelFormat: "sdcpp", wantReload: true},
+		{name: "diffgen runner, llama model", runnerKind: "diffgen", modelFormat: "", wantReload: true},
+		{name: "diffgen runner, diffgen model", runnerKind: "diffgen", modelFormat: "sdcpp", wantReload: false},
+		{name: "empty runnerKind, llama model forces reload", runnerKind: "", modelFormat: "", wantReload: true},
+		{name: "empty runnerKind, diffgen model forces reload", runnerKind: "", modelFormat: "sdcpp", wantReload: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			llm := &mockLlm{vramByGPU: map[ml.DeviceID]uint64{}}
+			opts := api.DefaultOptions()
+			m := &Model{Config: model.ConfigV2{ModelFormat: tt.modelFormat, Capabilities: tt.caps}}
+			runner := &runnerRef{
+				model:       m,
+				Options:     &opts,
+				llama:       llm,
+				numParallel: 1,
+				runnerKind:  tt.runnerKind,
+			}
+			req := &LlmRequest{
+				model: m,
+				opts:  opts,
+			}
+			require.Equal(t, tt.wantReload, runner.needsReload(ctx, req))
+		})
+	}
 }
 
 func TestAutomaticGenerationBatch(t *testing.T) {

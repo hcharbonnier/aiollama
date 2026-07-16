@@ -50,7 +50,7 @@ type Server struct {
 
 // NewServer prepares a new SD.cpp runner server. mode is "image" or "video".
 // The subprocess is not started until Load() is called.
-func NewServer(modelName, mode string) (*Server, error) {
+func NewServer(modelName, mode string) (llm.LlamaServer, error) {
 	if err := CheckPlatformSupport(); err != nil {
 		return nil, err
 	}

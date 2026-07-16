@@ -23,6 +23,7 @@ import (
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/types/model"
+	"github.com/ollama/ollama/x/diffgen"
 	"github.com/ollama/ollama/x/imagegen"
 	"github.com/ollama/ollama/x/mlxrunner"
 )
@@ -528,7 +529,23 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 	if llama == nil {
 		var err error
-		if !req.model.IsMLX() {
+		if req.model.IsDiffGen() {
+			// SD.cpp backend for image and video generation. The mode is
+			// derived from Config.Capabilities here; the runner's Load()
+			// independently validates it against model_index.json via
+			// DetectModelType. Both sources must agree.
+			mode := "image"
+			if slices.Contains(req.model.Config.Capabilities, "video") {
+				mode = "video"
+			}
+			llama, err = diffgen.NewServer(req.model.ShortName, mode)
+			if err != nil {
+				slog.Info("failed to create diffgen server", "model", req.model.ShortName, "error", err)
+				req.errCh <- err
+				s.loadedMu.Unlock()
+				return false
+			}
+		} else if !req.model.IsMLX() {
 			var loadErr error
 			f, loadErr = llm.LoadModel(req.model.ModelPath, 1024)
 			if loadErr != nil {
@@ -656,7 +673,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 		loadedCount := len(s.loaded)
 		s.loadedMu.Unlock()
 		otherLoaded := loadedCount > 0
-		if !req.oomRetryAttempted && llm.IsOutOfMemory(err) {
+		if !req.oomRetryAttempted && llm.IsOutOfMemory(err) && !req.model.IsDiffGen() {
 			if oldNumCtx, effectiveNumCtx, newNumCtx, oldNumBatch, newNumBatch, ok := req.reduceAutoNumCtxForLoadOOM(f, numParallel, completion, systemInfo, loadGpus, launchOpts); ok {
 				req.oomRetryAttempted = true
 				slog.Warn("llama-server load failed; reducing automatic context and retrying once",
@@ -713,6 +730,7 @@ iGPUScan:
 		gpus:            gpuIDs,
 		discreteGPUs:    discreteGPUs,
 		isImagegen:      slices.Contains(req.model.Config.Capabilities, "image"),
+		runnerKind:      runnerKindForModel(req.model),
 		totalSize:       totalSize,
 		vramSize:        vramSize,
 		loading:         true,
@@ -1345,6 +1363,25 @@ func (s *Scheduler) updateFreeSpace(allGpus []ml.DeviceInfo) {
 	}
 }
 
+// runnerKindForModel returns a string identifying which backend the runner
+// uses for the given model: "diffgen", "imagegen", "mlx", or "llama".
+func runnerKindForModel(m *Model) string {
+	switch {
+	case m.IsDiffGen():
+		return "diffgen"
+	case m.IsMLX():
+		if slices.Contains(m.Config.Capabilities, "image") {
+			return "imagegen"
+		}
+		return "mlx"
+	case m.isGGUF():
+		return "llama"
+	default:
+		slog.Warn("unknown model format, defaulting to llama backend", "model_format", m.Config.ModelFormat, "model", m.ShortName)
+		return "llama"
+	}
+}
+
 // TODO consolidate sched_types.go
 type runnerRef struct {
 	refMu    sync.Mutex
@@ -1356,6 +1393,7 @@ type runnerRef struct {
 	gpus         []ml.DeviceID // Recorded at time of provisioning
 	discreteGPUs bool          // True if all devices are discrete GPUs - used to skip VRAM recovery check for iGPUs
 	isImagegen   bool          // True if loaded via imagegen runner (vs mlxrunner)
+	runnerKind   string        // "llama", "imagegen", "mlx", "diffgen" — which backend the runner uses
 	vramSize     uint64
 	totalSize    uint64
 
@@ -1395,7 +1433,13 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	runner.refMu.Lock()
 	defer runner.refMu.Unlock()
 
-	// Check if runner type (imagegen vs mlxrunner) matches what's requested.
+	// Check if runner type (imagegen vs mlxrunner vs diffgen) matches what's requested.
+	wantKind := runnerKindForModel(req.model)
+	if runner.runnerKind != wantKind {
+		return true
+	}
+
+	// Legacy check: imagegen vs mlxrunner for safetensors models.
 	wantImagegen := slices.Contains(req.model.Config.Capabilities, "image")
 	if runner.isImagegen != wantImagegen {
 		return true

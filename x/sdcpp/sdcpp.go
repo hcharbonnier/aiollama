@@ -23,11 +23,14 @@ extern void goPreviewTrampoline(int step, int frame_count, sd_image_t* frames, b
 extern void goLogTrampoline(int level, char* text, void* data);
 
 // sd_install_progress installs the progress + preview trampolines with the
-// given data pointer (a cgo.Handle value). Called per-generate to route
-// callbacks to the active request.
-static void sd_install_progress(void* data) {
-    sd_set_progress_callback(goProgressTrampoline, data);
-    sd_set_preview_callback(goPreviewTrampoline, SD_PREVIEW_NATIVE, 1, false, false, data);
+// given data value (a cgo.Handle uintptr). The uintptr->void* cast happens
+// here in C to avoid a Go-side unsafe.Pointer(uintptr) conversion that vet
+// flags as a possible misuse. Called per-generate to route callbacks to the
+// active request.
+static void sd_install_progress(uintptr_t data) {
+    void* p = (void*)data;
+    sd_set_progress_callback(goProgressTrampoline, p);
+    sd_set_preview_callback(goPreviewTrampoline, SD_PREVIEW_NATIVE, 1, false, false, p);
 }
 
 // sd_clear_progress uninstalls the progress + preview trampolines.
@@ -143,7 +146,7 @@ func installProgressCallback(fn ProgressFunc) cgo.Handle {
 		return 0
 	}
 	handle := cgo.NewHandle(fn)
-	C.sd_install_progress(unsafe.Pointer(handle))
+	C.sd_install_progress(C.uintptr_t(handle))
 	return handle
 }
 

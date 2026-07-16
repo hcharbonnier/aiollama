@@ -50,20 +50,6 @@ func DefaultOptions() Options {
 	}
 }
 
-// IsDiffModel reports whether the given model name resolves to a diffgen model.
-func IsDiffModel(name string) bool {
-	_, err := loadManifestForCheck(name)
-	return err == nil
-}
-
-// ResolveModelName returns the model name if it is a known diffgen model.
-func ResolveModelName(modelName string) string {
-	if _, err := loadManifestForCheck(modelName); err != nil {
-		return ""
-	}
-	return modelName
-}
-
 // RunCLI handles the CLI for diffgen models (image and video).
 func RunCLI(cmd *cobra.Command, name string, prompt string, interactive bool, keepAlive *api.Duration) error {
 	opts := DefaultOptions()
