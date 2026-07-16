@@ -8,15 +8,27 @@ running models with optional GPU acceleration (Metal, CUDA, ROCm, Vulkan, MLX).
 
 ## Fork Goals
 
-This fork aims to add the following capabilities on top of upstream Ollama:
+This fork adds the following capabilities on top of upstream Ollama:
 
-- **Image generation/editing** via [stablediffusion.cpp](https://github.com/leejet/stablediffusion.cpp),
-  integrated as a new native backend alongside the existing llama.cpp runner.
+- **Image generation/editing** via [stablediffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
+  (SD.cpp), integrated as a third native backend alongside llama.cpp and MLX.
+- **Video generation** via SD.cpp (WAN, LTX, …) — SD.cpp is the only video
+  backend.
 - **Audio generation/editing** (planned for a later phase; backend not yet chosen).
 
-These features are not yet implemented. When adding them, follow the existing
-runner/subprocess architecture (see `llm/` and `x/imagegen/` for reference) and
-expose them through the OpenAI-compatible API layer (`openai/`, `middleware/`)
+The fork carries three native inference stacks, dispatched per model by the
+scheduler (`server/sched.go`):
+
+| Stack | Purpose | Platforms |
+|-------|---------|-----------|
+| llama.cpp | Text (LLM) generation from GGUF | Win, Linux, Mac |
+| MLX | Image gen for natively-supported models (Z-Image, FLUX.2) + safetensors LLM text on macOS | Mac (primary), CUDA |
+| stable-diffusion.cpp | Video (all models) + image gen for models MLX does not support + image/video on Linux/Windows | Win, Linux, Mac |
+
+Routing uses `Config.ModelFormat`: `"gguf"`/`""` → llama.cpp, `"safetensors"`
+→ MLX, `"sdcpp"` → SD.cpp. Follow the runner/subprocess architecture (see
+`llm/`, `x/imagegen/`, and `x/diffgen/` for reference) and expose new
+capabilities through the OpenAI-compatible API layer (`openai/`, `middleware/`)
 as well as the CLI (`cmd/`).
 
 ## Building
@@ -64,7 +76,12 @@ the full development workflow.
 - `api/` defines the public Go client and API types (`types.go`)
 - `openai/` and `middleware/` provide OpenAI- and Anthropic-compatible API layers
 - `fs/` handles GGML/GGUF file parsing and config; `envconfig/` centralizes `OLLAMA_*` environment configuration
-- `x/` contains experimental subsystems (MLX runner, image generation, safetensors, quantization)
+- `x/` contains experimental subsystems:
+  - `x/imagegen/` — MLX image generation (Z-Image, FLUX.2 on macOS, retained)
+  - `x/diffgen/` — SD.cpp image + video generation runner (video + broad image coverage, all platforms)
+  - `x/sdcpp/` — CGO bridge to the stable-diffusion.cpp C library
+  - `x/mlxrunner/` — MLX safetensors LLM text runner (9 architectures on macOS, retained)
+  - `x/create/`, `x/safetensors/` — model import utilities
 - `integration/` holds end-to-end tests (disabled by default; enable with `-tags=integration`)
 - Platform-specific files use Go build constraints (e.g. `*_windows.go`); respect this pattern for new platform code
 - Native payloads are looked up in `build/lib/ollama`, `dist/<platform>/lib/ollama`, and standard install prefixes

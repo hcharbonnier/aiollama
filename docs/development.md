@@ -155,6 +155,63 @@ cmake -B build . -DOLLAMA_MLX_BACKENDS=cuda_v13
 cmake --build build --parallel 8
 ```
 
+## stable-diffusion.cpp Engine (Optional)
+
+The stable-diffusion.cpp (SD.cpp) engine enables image and video generation
+via diffusion models (SDXL, SD3, FLUX, Qwen-Image, WAN video, LTX video, …).
+It complements the MLX engine: SD.cpp covers video (all models) and image
+generation for models MLX does not support natively, on all platforms
+(Linux, macOS, Windows). MLX remains the optimized path for Z-Image and FLUX.2
+image generation on macOS. SD.cpp backends are selected with
+`OLLAMA_SDCPP_BACKENDS`.
+
+```shell
+cmake -B build . -DOLLAMA_SDCPP_BACKENDS=cpu
+cmake --build build --parallel 8
+```
+
+### CUDA
+
+Requires CUDA 12+ (or 13+) and [cuDNN](https://developer.nvidia.com/cudnn) 9+.
+
+```shell
+cmake -B build . -DOLLAMA_SDCPP_BACKENDS=cuda_v12
+cmake --build build --parallel 8
+```
+
+### Metal (macOS)
+
+```shell
+cmake -B build . -DOLLAMA_SDCPP_BACKENDS=metal
+cmake --build build --parallel 8
+```
+
+> [!NOTE]
+> The WAN VAE currently supports only CUDA and CPU (not Metal/Vulkan). On
+> Metal/Vulkan, WAN video models fall back to CPU VAE (`--vae-on-cpu`), which is
+> functional but slower. Track SD.cpp upstream for Metal VAE support.
+
+### Vulkan
+
+```shell
+cmake -B build . -DOLLAMA_SDCPP_BACKENDS=vulkan
+cmake --build build --parallel 8
+```
+
+### Local SD.cpp source override
+
+To build against a local checkout of stable-diffusion.cpp (useful for
+development), set an environment variable before running CMake:
+
+```shell
+export OLLAMA_SD_CPP_SOURCE=/path/to/stable-diffusion.cpp
+cmake -B build . -DOLLAMA_SDCPP_BACKENDS=cpu
+cmake --build build --parallel 8
+```
+
+The three backend sets (`OLLAMA_LLAMA_BACKENDS`, `OLLAMA_MLX_BACKENDS`,
+`OLLAMA_SDCPP_BACKENDS`) are independent and can be combined in a single build.
+
 ## Docker
 
 ```shell

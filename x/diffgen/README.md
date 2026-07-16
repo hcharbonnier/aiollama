@@ -2,8 +2,23 @@
 
 `x/diffgen` is the unified runner subprocess for image and video generation
 via the [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
-(SD.cpp) native backend. It replaces the former MLX-based `x/imagegen` package
-for all diffusion workloads.
+(SD.cpp) native backend. It handles video generation (all models) and image
+generation for models MLX does not support natively, on all platforms. It
+**coexists** with the retained MLX-based `x/imagegen` package, which stays the
+optimized path for MLX-supported image models (Z-Image, FLUX.2) on macOS.
+
+## Backend dispatch
+
+The scheduler picks the backend per model (see `server/sched.go`):
+
+| Request | Backend |
+|---------|---------|
+| Image, model natively supported by MLX (Z-Image, FLUX.2) on macOS | `x/imagegen` (MLX, retained) |
+| Image, model NOT supported by MLX, or Linux/Windows | `x/diffgen` (SD.cpp) |
+| Video (any platform, any model) | `x/diffgen` (SD.cpp, only option) |
+
+Routing uses `Config.ModelFormat`: `"sdcpp"` → diffgen, `"safetensors"` → MLX,
+`"gguf"`/`""` → llama.cpp.
 
 ## Architecture
 
