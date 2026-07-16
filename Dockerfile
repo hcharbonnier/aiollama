@@ -235,6 +235,72 @@ FROM scratch AS publish-mlx
 COPY --from=mlx /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
 
 #
+# SD.cpp stages — rebuild when SD_CPP_VERSION, cmake/sdcpp/, or
+# x/sdcpp/include/ changes.
+#
+# Each backend builds libstable-diffusion (ggml embedded, hidden-visibility
+# isolated per cmake/sdcpp/CMakeLists.txt) into lib/ollama/sdcpp/<backend>/.
+# These reuse the same toolchain stages as the llama-server GPU backends
+# (compiler + CMake/Ninja from `base`; CUDA from cuda-12-deps/cuda-13-deps;
+# Vulkan SDK from vulkan-deps) — no additional build dependencies are
+# required. Not wired into the default image assembly (see "Assembly
+# stages" below); build explicitly with e.g.
+# `docker build --target publish-sdcpp-cpu`.
+#
+
+FROM cpu-deps AS sdcpp-cpu
+WORKDIR /go/src/github.com/ollama/ollama
+COPY CMakeLists.txt CMakePresets.json .
+COPY cmake cmake
+COPY x/sdcpp/include x/sdcpp/include
+COPY SD_CPP_VERSION .
+RUN --mount=type=cache,target=/root/.ccache \
+    cmake -S . -B build/sdcpp-cpu -DOLLAMA_SDCPP_BACKENDS=cpu -DOLLAMA_PAYLOAD_INSTALL_PREFIX=/go/src/github.com/ollama/ollama/dist \
+        && cmake --build build/sdcpp-cpu --target ollama-sdcpp-cpu -- -l $(nproc)
+
+FROM scratch AS publish-sdcpp-cpu
+COPY --from=sdcpp-cpu /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
+
+FROM cuda-12-deps AS sdcpp-cuda_v12
+WORKDIR /go/src/github.com/ollama/ollama
+COPY CMakeLists.txt CMakePresets.json .
+COPY cmake cmake
+COPY x/sdcpp/include x/sdcpp/include
+COPY SD_CPP_VERSION .
+RUN --mount=type=cache,target=/root/.ccache \
+    cmake -S . -B build/sdcpp-cuda_v12 -DOLLAMA_SDCPP_BACKENDS=cuda_v12 -DOLLAMA_PAYLOAD_INSTALL_PREFIX=/go/src/github.com/ollama/ollama/dist \
+        && cmake --build build/sdcpp-cuda_v12 --target ollama-sdcpp-cuda_v12 -- -l $(nproc)
+
+FROM scratch AS publish-sdcpp-cuda_v12
+COPY --from=sdcpp-cuda_v12 /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
+
+FROM cuda-13-deps AS sdcpp-cuda_v13
+WORKDIR /go/src/github.com/ollama/ollama
+COPY CMakeLists.txt CMakePresets.json .
+COPY cmake cmake
+COPY x/sdcpp/include x/sdcpp/include
+COPY SD_CPP_VERSION .
+RUN --mount=type=cache,target=/root/.ccache \
+    cmake -S . -B build/sdcpp-cuda_v13 -DOLLAMA_SDCPP_BACKENDS=cuda_v13 -DOLLAMA_PAYLOAD_INSTALL_PREFIX=/go/src/github.com/ollama/ollama/dist \
+        && cmake --build build/sdcpp-cuda_v13 --target ollama-sdcpp-cuda_v13 -- -l $(nproc)
+
+FROM scratch AS publish-sdcpp-cuda_v13
+COPY --from=sdcpp-cuda_v13 /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
+
+FROM vulkan-deps AS sdcpp-vulkan
+WORKDIR /go/src/github.com/ollama/ollama
+COPY CMakeLists.txt CMakePresets.json .
+COPY cmake cmake
+COPY x/sdcpp/include x/sdcpp/include
+COPY SD_CPP_VERSION .
+RUN --mount=type=cache,target=/root/.ccache \
+    cmake -S . -B build/sdcpp-vulkan -DOLLAMA_SDCPP_BACKENDS=vulkan -DOLLAMA_PAYLOAD_INSTALL_PREFIX=/go/src/github.com/ollama/ollama/dist \
+        && cmake --build build/sdcpp-vulkan --target ollama-sdcpp-vulkan -- -l $(nproc)
+
+FROM scratch AS publish-sdcpp-vulkan
+COPY --from=sdcpp-vulkan /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
+
+#
 # Go build
 #
 
@@ -256,6 +322,25 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 FROM scratch AS publish-go
 COPY --from=build /bin/ollama /bin/ollama
+
+#
+# Go build (sdcpp-enabled) — optional, additive target for a diffgen-capable
+# binary. x/sdcpp links libstable-diffusion directly (unlike the dlopen-based
+# MLX bridge), so the resulting binary requires libstable-diffusion.so to be
+# resolvable at runtime (e.g. via LD_LIBRARY_PATH pointing at a
+# publish-sdcpp-* payload). Not part of the default build/publish-go target
+# or any final image; build explicitly with
+# `docker build --target publish-go-sdcpp`.
+#
+
+FROM build AS build-sdcpp
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=bind,from=sdcpp-cpu,source=/go/src/github.com/ollama/ollama/dist/lib/ollama/sdcpp/cpu,target=/tmp/sdcpp-cpu \
+    CGO_LDFLAGS="${CGO_LDFLAGS} -L/tmp/sdcpp-cpu -lstable-diffusion" \
+    go build -trimpath -tags=sdcpp -buildmode=pie -o /bin/ollama .
+
+FROM scratch AS publish-go-sdcpp
+COPY --from=build-sdcpp /bin/ollama /bin/ollama
 
 #
 # Assembly stages — combine llama-server variants + GPU runtime libs
