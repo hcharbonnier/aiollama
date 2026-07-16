@@ -1115,8 +1115,10 @@ WAN VAE currently supports CUDA and CPU only (not Metal/Vulkan). Mitigations:
 - **Runner tests:** mock `sdcpp.Context` (or use a tiny CPU-only model) to test
   streaming and cancellation without GPU.
 - **Integration tests** (`integration/`, behind `-tags=integration`):
-  end-to-end generation with small models (SD1.5-turbo for image, WAN 1.3B for
-  video). Gated behind `OLLAMA_TEST_DIFF_MODEL`.
+  end-to-end generation with small models on CPU. Use **FLUX.2-Klein-4B**
+  (Q2_K GGUF, 4-step turbo) for image and **WAN 2.2 T2V A14B** (Q2_K GGUF,
+  dual-model MoE) for video. See Section 12.6 for exact weights, sources, and
+  import commands. Gated behind `OLLAMA_TEST_DIFF_MODEL`.
 - **Multi-backend CI matrix:** CUDA, Metal, Vulkan, CPU.
 
 #### 8.5 Error handling
@@ -1377,3 +1379,187 @@ If the priority is video, Phases 0-6 suffice — SD.cpp coexists with MLX out of
 the box. The removal of MLX (Phase 7 as originally planned) adds nothing
 functionally and risks regressions, so it is replaced by a coexistence-
 hardening phase.
+
+---
+
+## 12. Implementation Status
+
+**Date:** 2026-07-16
+**Status:** Phases 0–8 implemented and committed. Go code compiles and unit
+tests pass. Native build validation and E2E testing remain.
+
+### Completed
+
+| Phase | Commit | What was delivered |
+|-------|--------|--------------------|
+| 0 — Build integration | `ca50eac4` | `cmake/sdcpp/CMakeLists.txt`, `ollama_add_sdcpp_build()`, `OLLAMA_SDCPP_BACKENDS`, `SD_CPP_VERSION`, ggml shared-lib strategy |
+| 1 — CGO binding | `ca50eac4` | `x/sdcpp/` (sdcpp.go, types.go, stable-diffusion.h, test helpers) |
+| 2 — Runner | `ca50eac4` | `x/diffgen/` (runner.go, server.go, types.go, image.go, video.go, memory.go, manifest/) |
+| 3 — Scheduler | `909d0fbd` | `server/sched.go` dispatch (`IsDiffGen()`), `runnerKindForModel()`, `server/images.go` `IsDiffGen()`, `needsReload` extended |
+| 4 — API surface | `9fae26f4` | `/v1/video/generations`, `/v1/video/edits`, `middleware/openai.go` (`VideoGenerationsMiddleware`, `VideoEditsMiddleware`, `VideoWriter`), `openai/openai.go` types, `api/types.go` video fields |
+| 5 — Model import | `909d0fbd` | `server/create.go` `convertFromSDCpp`, `detectModelTypeFromFiles` sdcpp detection, `x/diffgen/manifest/` component-file loader |
+| 6 — CLI UX | `b14f815f` | `cmd/cmd.go` diffgen dispatch, `x/diffgen/cli.go` (flags, interactive REPL, progress bars), `x/diffgen/flags.go`, `x/diffutil/` shared helpers |
+| 7 — Coexistence + docs | `9d594c10` | MLX fully retained (verified), `AGENTS.md` three-backend architecture, `x/diffgen/README.md`, `docs/development.md` SD.cpp build instructions |
+| 8 — Multi-backend | `c4f931f6` | VRAM budget estimation + `--backend`/`--max-vram`/`--stream-layers` flags, `EstimateVRAMBudget` (multi-GPU, backend-scoped), `FormatVRAMGiB` (rounded), `ShouldStreamLayers` (size-gated), WAN VAE detection + per-request warning, OOM propagation via `DiffResponse.Error`, `sdcpp.SetLogCallback` → slog, `writeError` helper, unit tests + integration scaffold |
+
+### Remaining work
+
+The following items are explicitly listed in the plan but are **not yet
+implemented**. They are non-blocking for a functional PoC but required for
+production quality.
+
+#### 12.1 Native build validation (Phase 0.4, 7.1)
+
+- **`cmake --build build`** has not been run with real toolchains (CUDA, Metal,
+  Vulkan). The CMake wiring is written but untested at the native link stage.
+- **ggml symbol isolation** (Phase 0.4) is designed (shared lib + hidden
+  visibility) but not validated with `nm`/`dumpbin`. Need to confirm no
+  `ggml_*` symbols leak across `libllama`, `libstable-diffusion`, and the MLX
+  library when loaded in the same process.
+- **Phase 0 validation test binary** (load all three libs, confirm no
+  duplicate-symbol linker errors) is not written.
+
+#### 12.2 Runner handler tests with mock (Phase 8.4)
+
+- The HTTP handlers (`handleImageCompletion`, `handleVideoCompletion`) in
+  `x/diffgen/runner.go` have **no unit tests** for streaming, cancellation, or
+  error propagation. Current tests cover only the helper functions in
+  `memory.go` and the marshaling in `types.go`.
+- To test these without a GPU, the `sdcpp.Context` calls need to be abstracted
+  behind an interface so a mock can substitute `GenerateImage`/`GenerateVideo`.
+  Currently `runnerServer.ctx` is a concrete `*sdcpp.Context`.
+- Alternatively, use a tiny CPU-only model (e.g. SD1.5-turbo at 256×256) for
+  smoke tests — but that requires a built `libstable-diffusion` and a downloaded
+  model.
+
+#### 12.3 Dockerfile (Section 5, modified files inventory)
+
+- The plan's file inventory lists `Dockerfile` as a modified file ("Add SD.cpp
+  build deps"), but the Dockerfile was **not modified**. SD.cpp build
+  dependencies (CMake, a C++ compiler, optional CUDA/Vulkan SDK) need to be
+  added for containerized builds.
+
+#### 12.4 CI multi-backend matrix (Phase 8.4)
+
+- No `.github/workflows/` configuration exists for a CUDA/Metal/Vulkan/CPU test
+  matrix. The plan calls for this under Phase 8.4 ("Multi-backend CI matrix").
+- The integration test scaffold (`integration/diffgen_test.go`) compiles and
+  skips cleanly when `OLLAMA_TEST_DIFF_MODEL` is unset, but no CI job sets it.
+
+#### 12.5 Video container encoding (Phase 2.6)
+
+- **Explicitly deferred** in the plan: video output is currently PNG frame
+  stream only (one `{frame, image}` ndjson line per frame). No WebM/MP4/GIF
+  container encoding is implemented.
+- The CLI assembles frames into a GIF via pure-Go `image/gif` as a basic
+  fallback, but the API response (`DiffResponse.Video`) is not populated — the
+  client receives individual frame images, not a single video blob.
+- WebM encoding (via cgo ffmpeg or a pure-Go muxer) is planned "in a later
+  phase behind a build tag" per Phase 2.6.
+
+#### 12.6 End-to-end testing with real models
+
+- No E2E test has been run against a real SD.cpp model. The integration test
+  scaffold (`TestDiffgenImageGeneration`, `TestDiffgenVideoGeneration`,
+  `TestDiffgenVideoAPI`) is written but requires:
+  1. A built `ollama` binary with the `sdcpp` tag and a linked
+     `libstable-diffusion`.
+  2. A pulled or imported SD.cpp model set via `OLLAMA_TEST_DIFF_MODEL`.
+- The `ollama create` path for SD.cpp models (`convertFromSDCpp`) has no test
+  coverage — it needs a test fixture with a `model_index.json` + dummy
+  component files.
+
+##### Test models (CPU-only, 2-bit quantized where available)
+
+E2E tests run on CPU to avoid GPU dependencies in CI. Use the lowest-bit
+quantized weights available (Q2_K) to keep download size and memory usage
+minimal. Reference docs: [flux2.md](https://github.com/leejet/stable-diffusion.cpp/blob/master/docs/flux2.md),
+[wan.md](https://github.com/leejet/stable-diffusion.cpp/blob/master/docs/wan.md).
+
+**Image — FLUX.2-Klein-4B** (turbo, 4-step generation):
+
+| Component | File | Source |
+|-----------|------|--------|
+| diffusion_model | `flux-2-klein-4b-Q2_K.gguf` | [leejet/FLUX.2-klein-4B-GGUF](https://huggingface.co/leejet/FLUX.2-klein-4B-GGUF/tree/main) |
+| vae | `flux2_ae.safetensors` | [black-forest-labs/FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev/tree/main) |
+| text encoder (llm) | `qwen-3-4b-Q2_K.gguf` | [unsloth/Qwen3-4B-GGUF](https://huggingface.co/unsloth/Qwen3-4B-GGUF/tree/main) |
+
+Test params: `--width 512 --height 512 --steps 4 --cfg-scale 1.0`. The Klein-4B
+model is a 4-step turbo model — fast enough for CPU CI. If Q2_K is not available
+in the GGUF repo, fall back to Q4_K_S (next smallest).
+
+**Video — WAN 2.2 T2V A14B** (dual-model, MoE active ~2B):
+
+| Component | File | Source |
+|-----------|------|--------|
+| diffusion_model (low noise) | `Wan2.2-T2V-A14B-LowNoise-Q2_K.gguf` | [QuantStack/Wan2.2-T2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF/tree/main) |
+| high_noise_diffusion_model | `Wan2.2-T2V-A14B-HighNoise-Q2_K.gguf` | [QuantStack/Wan2.2-T2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF/tree/main) |
+| vae | `wan_2.1_vae.safetensors` | [Comfy-Org/Wan_2.1_ComfyUI_repackaged](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors) |
+| t5xxl | `umt5-xxl-encoder-Q2_K.gguf` | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf/tree/main) |
+
+Test params: `--width 832 --height 480 --steps 10 --cfg-scale 3.5 --flow-shift
+3.0 --video-frames 9 --fps 16` (reduced to 9 frames for CI speed; the SD.cpp
+example uses 33). WAN 2.2 T2V A14B is a dual-stage model (LowNoise +
+HighNoise) — both diffusion models must be present in the manifest. The VAE
+runs on CPU (CUDA/CPU only, per Section 8.3).
+
+> **Note on WAN 2.2 TI2V 5B:** This is a single-model variant (no dual-stage)
+> with a separate VAE (`wan2.2_vae`), but only fp16 safetensors are available
+> (no GGUF quantization). For CI, prefer the A14B GGUF variant for the smaller
+> quantized footprint. If the A14B dual-model download is too heavy, fall back
+> to **Wan2.1 T2V 1.3B** (single safetensors, ~2.5 GB fp16) as a lighter
+> alternative — see [Wan2.1 T2V 1.3B](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/tree/main/split_files/diffusion_models).
+
+##### Importing the test models
+
+```bash
+# Image: FLUX.2-Klein-4B
+ollama create flux2-klein-4b -f Modelfile.flux2-klein
+# Modelfile points to a directory with:
+#   model_index.json  (architecture: "FluxPipeline", capabilities: ["image"], model_format: "sdcpp")
+#   flux-2-klein-4b-Q2_K.gguf
+#   flux2_ae.safetensors
+#   qwen-3-4b-Q2_K.gguf
+
+# Video: WAN 2.2 T2V A14B
+ollama create wan2.2-t2v-a14b -f Modelfile.wan22
+# Modelfile points to a directory with:
+#   model_index.json  (architecture: "WanVideoPipeline", capabilities: ["video"], model_format: "sdcpp")
+#   Wan2.2-T2V-A14B-LowNoise-Q2_K.gguf   (component: "diffusion_model")
+#   Wan2.2-T2V-A14B-HighNoise-Q2_K.gguf  (component: "high_noise_diffusion_model")
+#   wan_2.1_vae.safetensors               (component: "vae")
+#   umt5-xxl-encoder-Q2_K.gguf            (component: "t5xxl")
+```
+
+Then run the integration tests:
+
+```bash
+OLLAMA_TEST_DIFF_MODEL=flux2-klein-4b go test -tags=integration -run TestDiffgenImageGeneration ./integration/...
+OLLAMA_TEST_DIFF_MODEL=wan2.2-t2v-a14b go test -tags=integration -run TestDiffgenVideoGeneration ./integration/...
+```
+
+#### 12.7 Memory estimation refinement (Phase 3.4)
+
+- The current VRAM estimation in `Server.Load()` uses `vramSize =
+  TotalComponentSize()` (raw weight footprint) with no activation overhead
+  factor. The plan calls for:
+  - Image: ~1.5× weights (DiT activations).
+  - Video: ~2–4× weights (frame latents + temporal activations).
+- The pre-flight check compares `vramSize` against the budget, so models that
+  fit in weights but OOM during activation are not caught early. SD.cpp's own
+  `max_vram` offload handles the gap, but the heuristic should be refined by
+  profiling.
+
+### Summary of remaining work
+
+| Item | Priority | Effort | Blocks |
+|------|----------|--------|--------|
+| Native build validation (`cmake --build`) | High | 1–2 days | E2E testing |
+| ggml symbol isolation check | High | 0.5 day | Native build |
+| Runner handler tests (mock or CPU model) | Medium | 2–3 days | None |
+| Dockerfile SD.cpp deps | Medium | 0.5 day | Containerized CI |
+| CI multi-backend matrix | Medium | 1–2 days | Regression prevention |
+| Video container encoding (WebM) | Low | 3–5 days | Non-blocking (PNG stream works) |
+| E2E tests with real models (FLUX.2-Klein-4B + WAN 2.2, CPU, Q2_K) | Medium | 1 day | Requires native build |
+| `convertFromSDCpp` test fixture | Low | 0.5 day | Import path coverage |
+| Memory estimation overhead factor | Low | 0.5 day | Pre-flight accuracy |
