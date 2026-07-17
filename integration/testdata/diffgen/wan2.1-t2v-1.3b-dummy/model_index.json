@@ -1,0 +1,10 @@
+{
+  "architecture": "WanVideoPipeline",
+  "capabilities": ["video"],
+  "model_format": "sdcpp",
+  "components": {
+    "diffusion_model": "diffusion_model.safetensors",
+    "vae": "vae.safetensors",
+    "t5xxl": "t5xxl.gguf"
+  }
+}

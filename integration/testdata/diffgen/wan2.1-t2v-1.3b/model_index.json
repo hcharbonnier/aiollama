@@ -1,0 +1,18 @@
+{
+  "architecture": "WanVideoPipeline",
+  "capabilities": ["video"],
+  "model_format": "sdcpp",
+  "components": {
+    "diffusion_model": "wan2.1_t2v_1.3B_fp16.safetensors",
+    "vae": "wan_2.1_vae.safetensors",
+    "t5xxl": "umt5-xxl-encoder-Q3_K_S.gguf"
+  },
+  "defaults": {
+    "width": 832,
+    "height": 480,
+    "video_frames": 33,
+    "fps": 16,
+    "flow_shift": 3.0,
+    "cfg_scale": 6.0
+  }
+}

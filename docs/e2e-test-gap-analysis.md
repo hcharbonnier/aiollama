@@ -3,23 +3,27 @@
 **Project:** aiollama (Ollama fork)
 **Scope:** Section 12.6 — End-to-end testing with real SD.cpp models
 **Date:** 2026-07-17
-**Status:** Diagnostic report — IMAGE E2E DONE, VIDEO E2E pending download
+**Status:** Diagnostic report — IMAGE + VIDEO E2E DONE
 
 ---
 
 ## 1. Executive summary
 
-The E2E test **harness** is implemented and the **image E2E test now passes
-with real model weights**. `TestDiffgenImageGeneration` and
-`TestDiffgenImageGenerationProgress` both succeed against a real
-FLUX.2-Klein-4B model (Q4_0 diffusion + Q2_K text encoder + VAE) on CPU,
-producing a ~500-700 KB PNG in ~11 minutes with 26 streaming progress events.
+The E2E test **harness** is implemented and both the **image and video E2E
+tests now pass with real model weights**. `TestDiffgenImageGeneration` and
+`TestDiffgenImageGenerationProgress` succeed against a real FLUX.2-Klein-4B
+model (Q4_0 diffusion + Q2_K text encoder + VAE) on CPU, producing a ~500-700
+KB PNG in ~11 minutes with 26 streaming progress events.
+`TestDiffgenVideoGeneration` and `TestDiffgenVideoAPI` succeed against a real
+WAN 2.1 T2V 1.3B model (fp16 diffusion + VAE + Q3_K_S t5xxl) on CPU, producing
+a ~245 KB frame image in ~9 minutes (1 frame, 4 steps) via the frame stream
+protocol.
 
 The test harness was previously blocked by 9 concrete gaps. All have been
-resolved for the image path: the sdcpp-tagged binary is built, `LD_LIBRARY_PATH`
-is documented, model filenames are corrected, `model_index.json` fixtures exist,
-the import helper is recursive, a dummy-weight fixture enables automated import
-testing, and the runner's model-loading path is validated against real weights.
+resolved: the sdcpp-tagged binary is built, `LD_LIBRARY_PATH` is documented,
+model filenames are corrected, `model_index.json` fixtures exist, the import
+helper is recursive, a dummy-weight fixture enables automated import testing,
+and the runner's model-loading path is validated against real weights.
 
 A critical **undocumented ABI bug** was discovered and fixed during this work:
 the vendored header `x/sdcpp/include/stable-diffusion.h` was severely outdated
@@ -30,9 +34,16 @@ were adapted to the new struct layouts (new `sd_ctx_params_t`, `sd_sample_params
 `sd_img_gen_params_t`, `sd_vid_gen_params_t`), and `high_noise_diffusion_model_path`
 wiring was added for WAN 2.2 dual-stage models.
 
-Video E2E remains pending: the WAN 2.2 dual-model download (~10 GB) has not been
-attempted, and CPU video generation is impractically slow for CI (minutes per
-frame on a 14B model). A GPU-backed CI runner is needed for practical video E2E.
+A **GenerateHandler video dispatch bug** was also found and fixed: the handler
+only routed `image`-capability models to `handleImageGenerate`, so video models
+fell through to the completion path and returned "does not support generate".
+The handler now also dispatches `video`-capability models, and the scheduler's
+`CheckCapabilities` was extended with `CapabilityVideo`.
+
+Video E2E uses the lighter WAN 2.1 T2V 1.3B single-stage model (~5.9 GB
+download) instead of the 14B dual-stage WAN 2.2 A14B (~10 GB), which would take
+hours per frame on CPU. Video test params are configurable via
+`OLLAMA_TEST_DIFF_VIDEO_*` env vars for hardware-specific tuning.
 
 ---
 
@@ -51,7 +62,7 @@ frame on a 14B model). A GPU-backed CI runner is needed for practical video E2E.
 | `model_index.json` fixtures | **DONE** — FLUX.2, WAN 2.2, and dummy | `integration/testdata/diffgen/` |
 | Dummy-weight fixture for CI import test | **DONE** | `integration/testdata/diffgen/flux2-dummy/` |
 | Real-model image E2E (FLUX.2-Klein-4B) | **DONE** — PASS (~11 min CPU, 26 progress events) | — |
-| Real-model video E2E (WAN 2.2) | **PENDING** — wiring ready, download not done | — |
+| Real-model video E2E (WAN 2.1 T2V 1.3B) | **DONE** — PASS (~9 min CPU, 1 frame/4 steps, frame stream) | — |
 
 ---
 
@@ -232,13 +243,19 @@ $ go test -tags=integration -run TestDiffgenImageGenerationProgress ./integratio
 --- PASS: TestDiffgenImageGenerationProgress (759.20s)
 ```
 
-### Video E2E (full) — PENDING (download + GPU runner needed)
+### Video E2E (full) — DONE
 ```
-$ export OLLAMA_TEST_DIFF_MODEL=wan2.2-t2v-a14b
-$ export OLLAMA_TEST_DIFF_MODEL_DIR=/path/to/wan22-dir
-$ go test -tags=integration -run 'TestDiffgenVideo' ./integration/...
---- PASS: TestDiffgenVideoGeneration (XXX.Xs)
---- PASS: TestDiffgenVideoAPI (XXX.Xs)
+$ export OLLAMA_TEST_DIFF_MODEL=wan2.1-t2v-1.3b
+$ export OLLAMA_TEST_DIFF_MODEL_DIR=/path/to/wan2.1-t2v-1.3b
+$ export OLLAMA_TEST_EXISTING=1
+$ export LD_LIBRARY_PATH=$PWD/build/lib/ollama/sdcpp/cpu
+$ export OLLAMA_TEST_DIFF_VIDEO_FRAMES=1
+$ export OLLAMA_TEST_DIFF_VIDEO_STEPS=4
+$ go test -tags=integration -run TestDiffgenVideoGeneration ./integration/... -v -timeout 90m
+--- PASS: TestDiffgenVideoGeneration (583.74s)
+
+$ go test -tags=integration -run TestDiffgenVideoAPI ./integration/... -v -timeout 90m
+--- PASS: TestDiffgenVideoAPI (553.76s)
 ```
 
 ### Import path (automated, no download) — DONE

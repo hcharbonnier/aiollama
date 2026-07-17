@@ -423,8 +423,8 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		return
 	}
 
-	// Handle image generation models
-	if slices.Contains(m.Capabilities(), model.CapabilityImage) {
+	// Handle image and video generation models
+	if slices.Contains(m.Capabilities(), model.CapabilityImage) || slices.Contains(m.Capabilities(), model.CapabilityVideo) {
 		s.handleImageGenerate(c, req, name.String(), checkpointStart)
 		return
 	}
@@ -3158,8 +3158,19 @@ func (s *Server) handleImageGenerate(c *gin.Context, req api.GenerateRequest, mo
 		return
 	}
 
-	// Schedule the runner for image generation
-	runner, m, _, err := s.scheduleRunner(c.Request.Context(), modelName, []model.Capability{model.CapabilityImage}, nil, req.KeepAlive, nil)
+	// Load the model to determine its capabilities before scheduling.
+	modelLoaded, err := GetModel(modelName)
+	if err != nil {
+		handleScheduleError(c, req.Model, err)
+		return
+	}
+	// Schedule the runner for image/video generation. Pass the capability the
+	// model actually has so the scheduler's CheckCapabilities accepts it.
+	genCaps := []model.Capability{model.CapabilityImage}
+	if slices.Contains(modelLoaded.Capabilities(), model.CapabilityVideo) {
+		genCaps = []model.Capability{model.CapabilityVideo}
+	}
+	runner, m, _, err := s.scheduleRunner(c.Request.Context(), modelName, genCaps, nil, req.KeepAlive, nil)
 	if err != nil {
 		handleScheduleError(c, req.Model, err)
 		return

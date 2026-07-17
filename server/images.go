@@ -48,6 +48,7 @@ var (
 	errCapabilityEmbedding  = errors.New("embedding")
 	errCapabilityThinking   = errors.New("thinking")
 	errCapabilityImage      = errors.New("image generation")
+	errCapabilityVideo      = errors.New("video generation")
 	errInsecureProtocol     = errors.New("insecure protocol http")
 )
 
@@ -522,6 +523,7 @@ func (m *Model) CheckCapabilities(want ...model.Capability) error {
 		model.CapabilityEmbedding:  errCapabilityEmbedding,
 		model.CapabilityThinking:   errCapabilityThinking,
 		model.CapabilityImage:      errCapabilityImage,
+		model.CapabilityVideo:      errCapabilityVideo,
 	}
 
 	for _, cap := range want {
