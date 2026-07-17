@@ -508,9 +508,9 @@ jobs:
             APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu
             APT_PORTS_MIRROR=http://azure.ports.ubuntu.com/ubuntu-ports
           cache-from: |
-            type=registry,ref=ollama/release:cache-${{ matrix.arch }}-${{ matrix.target }}
+            type=registry,ref=aiollama/release-cache:cache-${{ matrix.arch }}-${{ matrix.target }}
             type=registry,ref=${{ vars.DOCKER_REPO }}:latest
-          cache-to: type=registry,ref=ollama/release:cache-${{ matrix.arch }}-${{ matrix.target }},mode=max
+          cache-to: type=registry,ref=aiollama/release-cache:cache-${{ matrix.arch }}-${{ matrix.target }},mode=max
 
   # Build each Docker variant (OS, arch, and flavor) separately. Using QEMU is unreliable and slower.
   # Heavy stages were pre-built by linux-depends; this job is cache-hit-only for those layers
@@ -531,11 +531,11 @@ jobs:
               OLLAMA_MLX_BUILD_JOBS=16
               OLLAMA_MLX_NVCC_THREADS=6
             cache-from: |
-              type=registry,ref=ollama/release:cache-arm64-llama-server-cpu
-              type=registry,ref=ollama/release:cache-arm64-llama-server-cuda_v12
-              type=registry,ref=ollama/release:cache-arm64-llama-server-cuda_v13
-              type=registry,ref=ollama/release:cache-arm64-jetpack-5
-              type=registry,ref=ollama/release:cache-arm64-jetpack-6
+              type=registry,ref=aiollama/release-cache:cache-arm64-llama-server-cpu
+              type=registry,ref=aiollama/release-cache:cache-arm64-llama-server-cuda_v12
+              type=registry,ref=aiollama/release-cache:cache-arm64-llama-server-cuda_v13
+              type=registry,ref=aiollama/release-cache:cache-arm64-jetpack-5
+              type=registry,ref=aiollama/release-cache:cache-arm64-jetpack-6
               type=registry,ref=${{ vars.DOCKER_REPO }}:latest
           - os: linux
             arch: amd64
@@ -549,12 +549,12 @@ jobs:
               OLLAMA_MLX_BUILD_JOBS=16
               OLLAMA_MLX_NVCC_THREADS=6
             cache-from: |
-              type=registry,ref=ollama/release:cache-amd64-llama-server-cpu
-              type=registry,ref=ollama/release:cache-amd64-llama-server-cuda_v12
-              type=registry,ref=ollama/release:cache-amd64-llama-server-cuda_v13
-              type=registry,ref=ollama/release:cache-amd64-mlx
-              type=registry,ref=ollama/release:cache-amd64-llama-server-rocm_v7_2
-              type=registry,ref=ollama/release:cache-amd64-llama-server-vulkan
+              type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-cpu
+              type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-cuda_v12
+              type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-cuda_v13
+              type=registry,ref=aiollama/release-cache:cache-amd64-mlx
+              type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-rocm_v7_2
+              type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-vulkan
               type=registry,ref=${{ vars.DOCKER_REPO }}:latest
           - os: linux
             arch: amd64
@@ -570,8 +570,8 @@ jobs:
               OLLAMA_MLX_BUILD_JOBS=16
               OLLAMA_MLX_NVCC_THREADS=6
             cache-from: |
-              type=registry,ref=ollama/release:cache-amd64-llama-server-cpu
-              type=registry,ref=ollama/release:cache-amd64-llama-server-rocm_v7_2
+              type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-cpu
+              type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-rocm_v7_2
               type=registry,ref=${{ vars.DOCKER_REPO }}:latest
     runs-on: ubuntu-latest
     environment: release

@@ -18,6 +18,7 @@ jobs:
       - name: Tag images as latest
         env:
           PUSH: "1"
+          FINAL_IMAGE_REPO: ${{ vars.DOCKER_REPO }}
         shell: bash
         run: |
           export "VERSION=${GITHUB_REF_NAME#v}"
