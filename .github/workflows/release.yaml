@@ -27,6 +27,7 @@ jobs:
           echo vendorsha=$(cat LLAMA_CPP_VERSION)-$(cat MLX_VERSION)-$(cat MLX_C_VERSION) | tee -a $GITHUB_OUTPUT
 
   darwin-build:
+    if: false  # temporarily disabled
     runs-on: macos-latest
     environment: release
     needs: setup-environment
@@ -92,6 +93,7 @@ jobs:
             dist/*.dmg
 
   windows-depends:
+    if: false  # temporarily disabled
     needs: setup-environment
     strategy:
       matrix:
@@ -300,6 +302,7 @@ jobs:
           path: dist\*
 
   windows-build:
+    if: false  # temporarily disabled
     runs-on: windows-latest
     environment: release
     needs: [setup-environment]
@@ -364,6 +367,7 @@ jobs:
             dist\*
 
   windows-app:
+    if: false  # temporarily disabled
     runs-on: windows-latest
     environment: release
     needs: [setup-environment, windows-build, windows-depends]
@@ -435,6 +439,7 @@ jobs:
 
   linux-depends:
     strategy:
+      max-parallel: 4
       matrix:
         include:
           - arch: amd64
@@ -472,26 +477,6 @@ jobs:
         with:
           username: ${{ vars.DOCKER_USER }}
           password: ${{ secrets.DOCKER_ACCESS_TOKEN }}
-      - if: matrix.target == 'mlx'
-        name: Increase Linux swap to 200 GB
-        shell: bash
-        run: |
-          set -e
-          SWAP_PATH=/swapfile-mlx
-          SWAP_SIZE_GB=200
-          if [ -f "$SWAP_PATH" ]; then
-              sudo swapoff "$SWAP_PATH" 2>/dev/null || true
-              sudo rm -f "$SWAP_PATH"
-          fi
-          if ! sudo fallocate -l ${SWAP_SIZE_GB}G "$SWAP_PATH" 2>/dev/null; then
-              echo "fallocate unsupported, falling back to dd"
-              sudo dd if=/dev/zero of="$SWAP_PATH" bs=1M count=$((SWAP_SIZE_GB * 1024))
-          fi
-          sudo chmod 600 "$SWAP_PATH"
-          sudo mkswap "$SWAP_PATH"
-          sudo swapon "$SWAP_PATH"
-          swapon --show
-          free -h
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -503,8 +488,8 @@ jobs:
             GOFLAGS=${{ env.GOFLAGS }}
             CGO_CFLAGS=${{ env.CGO_CFLAGS }}
             CGO_CXXFLAGS=${{ env.CGO_CXXFLAGS }}
-            OLLAMA_MLX_BUILD_JOBS=16
-            OLLAMA_MLX_NVCC_THREADS=6
+            OLLAMA_MLX_BUILD_JOBS=1
+            OLLAMA_MLX_NVCC_THREADS=1
             APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu
             APT_PORTS_MIRROR=http://azure.ports.ubuntu.com/ubuntu-ports
           cache-from: |
@@ -517,6 +502,7 @@ jobs:
   # and just assembles, runs the Go build, pushes the final image, and extracts release bundles.
   docker-build-push:
     strategy:
+      max-parallel: 4
       matrix:
         include:
           - os: linux
@@ -528,8 +514,8 @@ jobs:
               GOFLAGS
               APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu
               APT_PORTS_MIRROR=http://azure.ports.ubuntu.com/ubuntu-ports
-              OLLAMA_MLX_BUILD_JOBS=16
-              OLLAMA_MLX_NVCC_THREADS=6
+              OLLAMA_MLX_BUILD_JOBS=1
+              OLLAMA_MLX_NVCC_THREADS=1
             cache-from: |
               type=registry,ref=aiollama/release-cache:cache-arm64-llama-server-cpu
               type=registry,ref=aiollama/release-cache:cache-arm64-llama-server-cuda_v12
@@ -546,8 +532,8 @@ jobs:
               GOFLAGS
               APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu
               APT_PORTS_MIRROR=http://azure.ports.ubuntu.com/ubuntu-ports
-              OLLAMA_MLX_BUILD_JOBS=16
-              OLLAMA_MLX_NVCC_THREADS=6
+              OLLAMA_MLX_BUILD_JOBS=1
+              OLLAMA_MLX_NVCC_THREADS=1
             cache-from: |
               type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-cpu
               type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-cuda_v12
@@ -567,8 +553,8 @@ jobs:
               FLAVOR=rocm
               APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu
               APT_PORTS_MIRROR=http://azure.ports.ubuntu.com/ubuntu-ports
-              OLLAMA_MLX_BUILD_JOBS=16
-              OLLAMA_MLX_NVCC_THREADS=6
+              OLLAMA_MLX_BUILD_JOBS=1
+              OLLAMA_MLX_NVCC_THREADS=1
             cache-from: |
               type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-cpu
               type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-rocm_v7_2
@@ -724,11 +710,9 @@ jobs:
       - name: Verify release artifacts
         run: |
           required=(
-            dist/OllamaSetup.exe
-            dist/install.ps1
             dist/install.sh
-            dist/ollama-windows-amd64.zip
-            dist/ollama-windows-arm64.zip
+            dist/ollama-linux-amd64.tar.zst
+            dist/ollama-linux-arm64.tar.zst
           )
           for payload in "${required[@]}"; do
             if [ ! -f "$payload" ]; then
