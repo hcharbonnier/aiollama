@@ -416,3 +416,226 @@ func errorMessage(e *openai.VideoError) string {
 	}
 	return e.Code
 }
+
+// videoSourceInput is the parsed `video` reference for POST /v1/videos/edits
+// and POST /v1/videos/extensions (spec §2.8/2.9). It can be:
+//   - a multipart file part named "video" (uploaded MP4 bytes), OR
+//   - a JSON object `{"id": "vid_..."}` referencing a previously-generated
+//     completed job.
+type videoSourceInput struct {
+	// videoFile holds the uploaded MP4 bytes when the request sent a file
+	// part. Empty when an id reference is used.
+	videoFile []byte
+	// videoID is the referenced job id when the request sent an {"id":...}
+	// object. Empty when a file part is used.
+	videoID string
+}
+
+// fromForm parses the `video` reference from a multipart form. The `video`
+// field may be a file part (uploaded MP4) or a JSON object string. Returns
+// the source input and the model/size fields (also parsed here so the edit/
+// extend handlers share one parse pass).
+func (v *videoSourceInput) fromForm(r *http.Request, fields map[string]string) error {
+	if file, _, err := r.FormFile("video"); err == nil {
+		defer file.Close()
+		data, err := io.ReadAll(file)
+		if err != nil {
+			return fmt.Errorf("read video file: %w", err)
+		}
+		v.videoFile = data
+		return nil
+	}
+	// No file part: check for a JSON object form field.
+	if refStr, ok := fields["video"]; ok && refStr != "" {
+		var ref openai.VideoReferenceParam
+		if err := json.Unmarshal([]byte(refStr), &ref); err != nil {
+			return fmt.Errorf("invalid video reference: %w", err)
+		}
+		v.videoID = ref.ID
+	}
+	return nil
+}
+
+// hasVideo reports whether a video reference was provided (file or id).
+func (v *videoSourceInput) hasVideo() bool {
+	return len(v.videoFile) > 0 || v.videoID != ""
+}
+
+// editExtendInput is the parsed, validated request for POST /v1/videos/edits
+// and POST /v1/videos/extensions. It is produced by parseEditExtendRequest,
+// which both handlers share to avoid duplicating ~80 lines of identical
+// validation (nil-check, body limit, multipart parse, prompt/model/size
+// validation, video source resolution, source-seconds lookup).
+type editExtendInput struct {
+	prompt        string
+	model         string
+	seconds       string
+	size          string
+	src           videoSourceInput
+	sourceSeconds string
+	width, height int
+}
+
+// parseEditExtendRequest performs the shared validation for the edit and
+// extend handlers. It reads multipart/form-data, validates prompt/model/size,
+// resolves the `video` reference, and looks up the source job's Seconds (for
+// stitched-total reporting on extensions). secondsRequired controls whether
+// `seconds` is mandatory (extensions) or optional with a default (edits);
+// secondsValues selects the allowed set (VideoSecondsValues for edits,
+// VideoExtensionSecondsValues for extensions). On any validation failure it
+// aborts the gin context with a 400/503 and returns ok=false.
+func (s *Server) parseEditExtendRequest(c *gin.Context, secondsRequired bool, secondsValues map[string]bool) (editExtendInput, bool) {
+	if s.videoJobs == nil {
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, openai.NewError(http.StatusServiceUnavailable, "video generation is not available"))
+		return editExtendInput{}, false
+	}
+
+	const maxVideoBodyBytes int64 = 256 << 20 // 256 MiB (accommodate uploaded source MP4)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxVideoBodyBytes)
+
+	contentType := c.GetHeader("Content-Type")
+	if !strings.HasPrefix(contentType, "multipart/form-data") {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "this endpoint requires multipart/form-data"))
+		return editExtendInput{}, false
+	}
+	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "failed to parse multipart form: "+err.Error()))
+		return editExtendInput{}, false
+	}
+
+	in := editExtendInput{
+		prompt:  c.Request.FormValue("prompt"),
+		model:   c.Request.FormValue("model"),
+		seconds: c.Request.FormValue("seconds"),
+		size:    c.Request.FormValue("size"),
+	}
+
+	if in.prompt == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt is required"))
+		return editExtendInput{}, false
+	}
+	if len(in.prompt) > 32000 {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt must be 32000 characters or less"))
+		return editExtendInput{}, false
+	}
+	if in.model == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "model is required"))
+		return editExtendInput{}, false
+	}
+	if secondsRequired {
+		if in.seconds == "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "seconds is required for extensions (4, 8, 12, 16, or 20)"))
+			return editExtendInput{}, false
+		}
+	} else {
+		if in.seconds == "" {
+			in.seconds = openai.VideoDefaultSeconds
+		}
+	}
+	if in.seconds != "" && !secondsValues[in.seconds] {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, fmt.Sprintf("seconds must be one of the allowed values; got %q", in.seconds)))
+		return editExtendInput{}, false
+	}
+	if in.size == "" {
+		in.size = openai.VideoDefaultSize
+	} else if !openai.VideoSizeValues[in.size] {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, fmt.Sprintf("size must be one of 720x1280, 1280x720, 1024x1792, 1792x1024; got %q", in.size)))
+		return editExtendInput{}, false
+	}
+
+	fields := map[string]string{
+		"video": c.Request.FormValue("video"),
+	}
+	if err := in.src.fromForm(c.Request, fields); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
+		return editExtendInput{}, false
+	}
+	if !in.src.hasVideo() {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "video is required (a file part or a {id} object)"))
+		return editExtendInput{}, false
+	}
+
+	// Look up the source job's Seconds (for the remixed job's reporting)
+	// when the source is a {id} reference.
+	if in.src.videoID != "" {
+		if job, err := s.videoJobs.Get(in.src.videoID); err == nil {
+			in.sourceSeconds = job.ToVideo().Seconds
+		}
+	}
+
+	width, height, _ := strings.Cut(in.size, "x")
+	in.width, _ = strconv.Atoi(width)
+	in.height, _ = strconv.Atoi(height)
+
+	return in, true
+}
+
+// VideoEditHandler handles POST /v1/videos/edits. It accepts multipart/form-data
+// with prompt (required) and video (required: a file part or a {id} object
+// referencing a previously-generated completed video). The edit re-renders a
+// new video from the source's first frame as an I2V init image with the new
+// prompt. The result is the new generation (the source is not concatenated).
+// Video.remixed_from_video_id is set when the source was a {id} reference.
+//
+// Spec: https://developers.openai.com/api/reference/resources/videos/edit
+func (s *Server) VideoEditHandler(c *gin.Context) {
+	in, ok := s.parseEditExtendRequest(c, false, openai.VideoSecondsValues)
+	if !ok {
+		return
+	}
+
+	job, err := s.videoJobs.Create(videojobs.CreateParams{
+		Model:         in.model,
+		Prompt:        in.prompt,
+		Seconds:       in.seconds,
+		Size:          in.size,
+		RemixedFromID: in.src.videoID,
+		SourceVideoID: in.src.videoID,
+		SourceVideo:   in.src.videoFile,
+		Extend:        false,
+		SourceSeconds: in.sourceSeconds,
+		Generate:      s.buildVideoGenerateFunc(in.model, int32(in.width), int32(in.height), in.seconds),
+	})
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, err.Error()))
+		return
+	}
+
+	c.Header(openaiPollAfterMS, strconv.Itoa(defaultPollIntervalMS))
+	c.JSON(http.StatusOK, job.ToVideo())
+}
+
+// VideoExtendHandler handles POST /v1/videos/extensions. It accepts
+// multipart/form-data with prompt (required), seconds (required, "4"-"20"),
+// and video (required: file part or {id} object). The extension continues the
+// source scene from its LAST frame as an I2V init image, then concatenates the
+// source + the generated extension into a single clip. The response
+// Video.seconds is the stitched total (source + requested).
+//
+// Spec: https://developers.openai.com/api/reference/resources/videos/extend
+func (s *Server) VideoExtendHandler(c *gin.Context) {
+	in, ok := s.parseEditExtendRequest(c, true, openai.VideoExtensionSecondsValues)
+	if !ok {
+		return
+	}
+
+	job, err := s.videoJobs.Create(videojobs.CreateParams{
+		Model:         in.model,
+		Prompt:        in.prompt,
+		Seconds:       in.seconds,
+		Size:          in.size,
+		RemixedFromID: in.src.videoID,
+		SourceVideoID: in.src.videoID,
+		SourceVideo:   in.src.videoFile,
+		Extend:        true,
+		SourceSeconds: in.sourceSeconds,
+		Generate:      s.buildVideoGenerateFunc(in.model, int32(in.width), int32(in.height), in.seconds),
+	})
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, err.Error()))
+		return
+	}
+
+	c.Header(openaiPollAfterMS, strconv.Itoa(defaultPollIntervalMS))
+	c.JSON(http.StatusOK, job.ToVideo())
+}

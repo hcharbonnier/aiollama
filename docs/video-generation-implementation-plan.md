@@ -1825,3 +1825,116 @@ go test -tags=integration -run TestDiffgenImportFromDirectory ./integration/ -v
 | E2E tests with real models (FLUX.2-Klein-4B + WAN 2.1 1.3B, CPU) | Medium | 1 day | Requires native build | **DONE** (image: `TestDiffgenImageGeneration` + `TestDiffgenImageGenerationProgress` pass with real FLUX.2-Klein-4B Q4_0 on CPU, ~11 min/run, 26 progress events; video: `TestDiffgenVideoGeneration` + `TestDiffgenVideoAPI` pass with real WAN 2.1 T2V 1.3B fp16 on CPU, ~9 min/run with 1 frame/4 steps, frame stream protocol; import: `TestDiffgenImportFromDirectory` passes with both flux2-dummy and wan2.1-t2v-1.3b-dummy fixtures; video E2E params configurable via `OLLAMA_TEST_DIFF_VIDEO_*` env vars) |
 | `convertFromSDCpp` test fixture | Low | 0.5 day | Import path coverage | **DONE** (`TestConvertFromSDCpp` 7 subtests + `TestCreateModelFromSDCppFilesSetsConfig` + `TestCreateModelFromSDCppFilesImageDefaultsToImageCapability` + `TestDetectModelTypeFromFiles` sdcpp cases) |
 | Memory estimation overhead factor | Low | 0.5 day | Pre-flight accuracy | Pending |
+
+---
+
+## 13. Reste à faire (TODO)
+
+État consolidé au 2026-07-17, après revue du repo (commits jusqu'à
+`b78b0f03`). Les Phases 0–8 du plan, la migration OpenAI Videos API Phase 1
+(§4.3 superseded → `docs/openai-videos-api-migration.md`), les E2E image+vidéo
+(§12.6) et l'encodage WebM (§12.5) sont **terminés**. Ce qui reste :
+
+### 13.1 Migration API OpenAI Videos — Phase 2 (edits + extensions) — DONE
+
+Source : `docs/openai-videos-api-migration.md` §5. Implémenté et testé (commit
+à suivre). Conformité SDK OpenAI complète pour la création + édition +
+extension de vidéos.
+
+- [x] `DecodeVideoFrames(ctx, mp4 []byte, maxFrames int) ([]sdcpp.Image, error)`
+      dans `x/diffgen/video.go` — décode un MP4/WebM stocké vers frames
+      `sdcpp.Image` via ffmpeg (`image2pipe` PNG muxer). Tests round-trip
+      (EncodeWebM → DecodeVideoFrames) + maxFrames cap.
+- [x] `Transcoder.DecodeFrames` + `Transcoder.ConcatMP4` dans
+      `server/videojobs/transcoder.go` (le worker n'importe pas x/diffgen,
+      derrière le tag sdcpp). `DecodeFrames` retourne des PNG bytes ;
+      `ConcatMP4` utilise le demuxer `concat` de ffmpeg avec fichiers
+      temporaires (portable Windows — `ExtraFiles` non supporté).
+- [x] `VideoEditHandler` (`POST /v1/videos/edits`) dans `server/videoapi.go` —
+      multipart `prompt` + `video` (file part ou `{id}`). Résout la vidéo
+      source en MP4 (job store par id, ou fichier uploadé), décode en frames,
+      passe la **première** frame comme `req.Images[0]` (I2V) au worker.
+      L'édition produit une **nouvelle** vidéo (re-render avec nouveau prompt),
+      pas une concaténation (sémantique Sora). `Video.remixed_from_video_id`
+      renseigné quand la source est un `{id}`.
+- [x] `VideoExtendHandler` (`POST /v1/videos/extensions`) dans
+      `server/videoapi.go` — multipart `prompt` + `seconds` (requis,
+      `"4"`–`"20"`) + `video` (file ou `{id}`). Décode la source, prend la
+      **dernière** frame comme init frame du segment d'extension, génère le
+      segment via le worker. La réponse `Video.seconds` est le **total
+      stitched** (source + extension) ; le contenu `/content` est le MP4
+      concaténé via `ConcatMP4`.
+- [x] Worker V2V/I2V-from-stored-video dans `server/videojobs/store.go` :
+      `CreateParams.SourceVideoID` / `SourceVideo` / `Extend` /
+      `SourceSeconds` ; dérivation init image (1ʳᵉ frame edit / dernière
+      extend) ; `ConcatMP4` stitching ; `stitchSeconds` total.
+- [x] Tests handler + intégration (mock + vrai modèle) — `server/videoapi_test.go`
+      (8 tests edit/extend), `server/videojobs/store_test.go` (5 tests
+      edit/extend worker + stitchSeconds), `server/videojobs/transcoder_test.go`
+      (DecodeFrames round-trip + ConcatMP4), `x/diffgen/video_test.go`
+      (DecodeVideoFrames round-trip + maxFrames), `integration/diffgen_test.go`
+      (`TestDiffgenVideoEditAPI` E2E, gated `OLLAMA_TEST_DIFF_MODEL` + video
+      capability).
+- [x] Doc : §5 du rapport de migration mis à jour (checklist cochée + §5.5
+      implementation notes) ; cette section §13.1.
+
+### 13.2 Affinage estimation mémoire (Phase 3.4 / §12.7)
+
+- [ ] `x/diffgen/server.go:72` utilise `vramSize = TotalComponentSize()` (poids
+      bruts) sans facteur d'activation. Ajouter les facteurs prévus :
+  - Image : ~1.5× poids (activations DiT pendant le denoising).
+  - Vidéo : ~2–4× poids (latents de frames + activations temporelles).
+- [ ] Affiner par profiling pour que la vérification pré-vol capture les modèles
+      qui tiennent en poids mais OOM en activation. SD.cpp `max_vram` couvre le
+      reste via offload.
+
+### 13.3 Validation builds GPU (§12.1 — partiel)
+
+- [ ] Le build CPU/Linux est validé. **Manquent** : CUDA, Metal, Vulkan
+      (toolchains absentes sur l'environnement courant). Les fichiers CMake
+      (`cmake/sdcpp/CMakeLists.txt`) et les stages Docker (`Dockerfile` sdcpp-*)
+      sont en place mais non testés end-to-end sur ces backends.
+
+### 13.4 CI multi-backends (§12.4 — DEFERRED)
+
+- [ ] Pas de matrix CUDA/Metal/Vulkan/CPU dans `.github/workflows/`. Le scaffold
+      d'intégration compile et skip proprement quand `OLLAMA_TEST_DIFF_MODEL` n'est
+      pas set. Basse priorité : mesure anti-régression, pas un bloqueur
+      fonctionnel. À revoir quand des runners GPU CI seront disponibles.
+
+### 13.5 Variants de contenu `/content` (out-of-spec pour v1)
+
+- [ ] `variant=thumbnail` et `variant=spritesheet` sur
+      `GET /v1/videos/{id}/content` non implémentés (v1 retourne 501/404 pour
+      ces variants ; seul `variant=video` — MP4 — fonctionne).
+
+### 13.6 Hors-scope explicite (§8 du plan — non planifié)
+
+Non implémentés et non prioritaires pour la v1 :
+
+- Audio (`sd_audio_t` / Sora synced audio) — phase séparée.
+- VACE / Fun control modes — en attente des PR SD.cpp correspondants.
+- ControlNet / LoRA runtime hot-swap (image/vidéo) — `sd_ctx_load_control_net`
+  et LoRA runtime existent côté SD.cpp, à câbler si demande.
+- Preview frames streaming via `sd_preview_cb_t` (frames intermédiaires
+  low-res pendant le denoising) — UX, différé.
+- Shared ggml linking (SD.cpp + llama.cpp sur un ggml commun) — seulement si
+  conflits de symboles malgré l'isolation shared-lib.
+- Backends OpenCL / SYCL — à la demande.
+- Benchmark MLX vs SD.cpp+Metal pour image gen — déterminerait si MLX image-gen
+  pourrait un jour être déprécié (le LLM safetensors resterait sur MLX).
+
+### 13.7 Résumé prioritaire
+
+| # | Item | Priorité | Statut |
+|---|------|----------|--------|
+| 1 | OpenAI Videos Phase 2 (edits + extensions) | Moyenne | **DONE** (13.1) |
+| 2 | Facteur d'activation estimation mémoire | Basse | À faire (§12.7) |
+| 3 | Validation builds GPU (CUDA/Metal/Vulkan) | Basse | À faire (CPU validé) |
+| 4 | CI multi-backends | Basse | DEFERRED |
+| 5 | `variant=thumbnail`/`spritesheet` | Basse | Hors-scope v1 |
+| 6 | Audio / VACE / ControlNet runtime / preview / OpenCL / SYCL | — | Hors-scope (§8) |
+
+La conformité SDK OpenAI complète (création + édition + extension + polling +
+download) est **en place**. Les items restants sont de la robustesse/CI/perf
+(§13.2–13.4) ou explicitement hors-scope (§13.6).

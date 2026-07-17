@@ -148,3 +148,104 @@ func TestFFmpegTranscoderEndToEndJob(t *testing.T) {
 		t.Fatalf("content missing ftyp box header: % x", content[:min(8, len(content))])
 	}
 }
+
+// TestFFmpegTranscoderDecodeFrames verifies that DecodeFrames extracts PNG
+// frames from an MP4 produced by EncodeMP4 (round-trip). Requires ffmpeg.
+func TestFFmpegTranscoderDecodeFrames(t *testing.T) {
+	requireFFmpeg(t)
+	tc := &ffmpegTranscoder{}
+
+	// Encode 3 frames, then decode them back.
+	frames := [][]byte{
+		pngFrame(64, 48, color.RGBA{255, 0, 0, 255}),
+		pngFrame(64, 48, color.RGBA{0, 255, 0, 255}),
+		pngFrame(64, 48, color.RGBA{0, 0, 255, 255}),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	mp4, err := tc.EncodeMP4(ctx, frames, 8)
+	if err != nil {
+		t.Fatalf("EncodeMP4 failed: %v", err)
+	}
+
+	decoded, _, err := tc.DecodeFrames(ctx, mp4, 0)
+	if err != nil {
+		t.Fatalf("DecodeFrames failed: %v", err)
+	}
+	if len(decoded) < 3 {
+		t.Fatalf("expected at least 3 decoded frames, got %d", len(decoded))
+	}
+	// Each decoded frame should be a valid PNG (re-decodable).
+	for i, f := range decoded {
+		if _, err := png.Decode(bytes.NewReader(f)); err != nil {
+			t.Errorf("decoded frame %d is not a valid PNG: %v", i, err)
+		}
+	}
+}
+
+// TestFFmpegTranscoderDecodeFramesEmpty verifies that decoding an empty input
+// returns an error.
+func TestFFmpegTranscoderDecodeFramesEmpty(t *testing.T) {
+	tc := &ffmpegTranscoder{}
+	_, _, err := tc.DecodeFrames(context.Background(), nil, 0)
+	if err == nil {
+		t.Fatal("expected error for empty video input")
+	}
+}
+
+// TestFFmpegTranscoderConcatMP4 verifies that ConcatMP4 concatenates two MP4s
+// into a single valid MP4. Requires ffmpeg.
+func TestFFmpegTranscoderConcatMP4(t *testing.T) {
+	requireFFmpeg(t)
+	tc := &ffmpegTranscoder{}
+
+	frames := [][]byte{
+		pngFrame(64, 48, color.RGBA{255, 0, 0, 255}),
+		pngFrame(64, 48, color.RGBA{0, 255, 0, 255}),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	first, err := tc.EncodeMP4(ctx, frames[:1], 8)
+	if err != nil {
+		t.Fatalf("encode first: %v", err)
+	}
+	second, err := tc.EncodeMP4(ctx, frames[1:], 8)
+	if err != nil {
+		t.Fatalf("encode second: %v", err)
+	}
+
+	concat, err := tc.ConcatMP4(ctx, first, second, 8)
+	if err != nil {
+		t.Fatalf("ConcatMP4 failed: %v", err)
+	}
+	if len(concat) < 8 || string(concat[4:8]) != "ftyp" {
+		t.Fatalf("concat output missing ftyp box header: % x", concat[:min(8, len(concat))])
+	}
+
+	// The concatenated MP4 should decode to >= 2 frames.
+	decoded, _, err := tc.DecodeFrames(ctx, concat, 0)
+	if err != nil {
+		t.Fatalf("decode concat: %v", err)
+	}
+	if len(decoded) < 2 {
+		t.Errorf("expected >= 2 frames from concatenated MP4, got %d", len(decoded))
+	}
+}
+
+// TestFFmpegTranscoderConcatMP4EmptyInputs verifies that concat with an empty
+// input returns the other input unchanged (no ffmpeg call needed).
+func TestFFmpegTranscoderConcatMP4EmptyInputs(t *testing.T) {
+	tc := &ffmpegTranscoder{}
+	solo := []byte{0, 0, 0, 0x18, 'f', 't', 'y', 'p'}
+
+	got, err := tc.ConcatMP4(context.Background(), nil, solo, 16)
+	if err != nil || !bytes.Equal(got, solo) {
+		t.Errorf("concat(nil, solo) = %v, %v; want solo, nil", got, err)
+	}
+	got, err = tc.ConcatMP4(context.Background(), solo, nil, 16)
+	if err != nil || !bytes.Equal(got, solo) {
+		t.Errorf("concat(solo, nil) = %v, %v; want solo, nil", got, err)
+	}
+}

@@ -1939,6 +1939,12 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	r.GET("/v1/videos/:video_id", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoRetrieveHandler)
 	r.DELETE("/v1/videos/:video_id", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoDeleteHandler)
 	r.GET("/v1/videos/:video_id/content", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoContentHandler)
+	// Phase 2 (edits + extensions): re-use a previously-generated video as
+	// input. Spec:
+	//   https://developers.openai.com/api/reference/resources/videos/edit
+	//   https://developers.openai.com/api/reference/resources/videos/extend
+	r.POST("/v1/videos/edits", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoEditHandler)
+	r.POST("/v1/videos/extensions", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoExtendHandler)
 	// Deprecated video endpoints (replaced by the conformant /v1/videos
 	// surface above). Return 410 Gone for one release so existing clients
 	// see a clear deprecation signal instead of an opaque 404.

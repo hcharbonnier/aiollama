@@ -6,7 +6,8 @@ official OpenAI Videos API (Sora) as specified by the OpenAI Python SDK and the
 API reference at `https://developers.openai.com/api/reference/resources/videos/`.
 **Author:** Engineering analysis
 **Date:** 2026-07-17
-**Status:** Phase 1 implemented and tested; Phase 2 (edits/extensions) deferred
+**Status:** Phase 1 and Phase 2 implemented and tested; native generation path
+**unaffected**.
 **Replaces:** the non-spec-compliant `/v1/video/generations` + `/v1/video/edits`
 endpoints documented in `docs/video-generation-implementation-plan.md` §4.3–4.4.
 
@@ -570,12 +571,58 @@ I2V/V2V input:
 
 ### 5.4 Phase 2 deliverable checklist
 
-- [ ] `x/diffgen/video.go` `DecodeVideoFrames` + tests
-- [ ] `server/videoapi.go` `VideoEditHandler`, `VideoExtendHandler`
-- [ ] `server/videojobs/worker.go` V2V/I2V-from-stored-video path
-- [ ] Stitched-total `seconds` + concatenated content for extensions
-- [ ] Handler + integration tests (mock + real model)
-- [ ] Doc update (§5 of this report folded into the plan)
+- [x] `server/videojobs/transcoder.go` `DecodeFrames` (PNG-based) +
+      `DecodeLastFrame` (ffmpeg `-sseof` seek-to-end) + `ConcatMP4` (ffmpeg
+      concat demuxer with temp files) + tests. (The original §5.1 design
+      placed `DecodeVideoFrames` in `x/diffgen/video.go`, but that package is
+      behind the `sdcpp` build tag which the worker must not import; the
+      production worker uses `Transcoder.DecodeFrames` / `DecodeLastFrame`
+      instead. `x/diffgen/video.go` retains `EncodeWebM` only.)
+- [x] `server/videoapi.go` `VideoEditHandler` (`POST /v1/videos/edits`),
+      `VideoExtendHandler` (`POST /v1/videos/extensions`)
+- [x] `server/videojobs/store.go` worker V2V/I2V-from-stored-video path:
+      `CreateParams.SourceVideoID` / `SourceVideo` / `Extend` /
+      `SourceSeconds`; first-frame (edit) / last-frame (extend) init image
+      derivation; `ConcatMP4` stitching; `stitchSeconds` total computation
+- [x] Stitched-total `seconds` + concatenated content for extensions
+- [x] Handler + integration tests (mock + real model via
+      `TestDiffgenVideoEditAPI`, gated on `OLLAMA_TEST_DIFF_MODEL` + video
+      capability)
+- [x] Doc update (§5 of this report folded into the plan; implementation plan
+      §13.1 updated)
+
+### 5.5 Implementation notes (deviations from the §5.1–5.3 design)
+
+The shipped implementation matches the §5.1–5.3 design with these concrete
+choices:
+
+- **Frame decode lives in two places.** `x/diffgen/video.go::DecodeVideoFrames`
+  returns `[]sdcpp.Image` (raw RGB) for the diffgen/CLI path, per §5.1. The
+  **worker** (which does not import `x/diffgen` — it is behind the `sdcpp`
+  build tag and would force every server build to link `libstable-diffusion`)
+  instead calls `Transcoder.DecodeFrames`, a PNG-based extractor in
+  `server/videojobs/transcoder.go` that returns `[][]byte` (PNG bytes the
+  worker already understands from the create path). Both use ffmpeg's
+  `image2pipe` PNG muxer and the same `findNextPNGSig` splitter logic.
+- **Concat via temp files, not pipes.** `ConcatMP4` writes both segments to a
+  temp dir and feeds ffmpeg the concat demuxer list (`-f concat -safe 0`).
+  This is portable (the `concat` filter with two pipe inputs requires
+  `os/exec.Cmd.ExtraFiles`, which is unsupported on Windows). Re-encoding
+  through libx264 (rather than `-c copy`) avoids timestamp/codec-mismatch
+  issues across the fragmented-MP4 segments produced by `EncodeMP4`.
+- **Edit semantics: re-render, not concat.** Per Sora's edits semantics, an
+  edit produces a **new** video from the source's first frame (as an I2V init
+  image) with the new prompt; the source is not concatenated. Only
+  extensions stitch source + generated. `Video.remixed_from_video_id` is set
+  on both when the source was a `{id}` reference.
+- **Source duration for extensions.** For `{id}` references, the source job's
+  `Seconds` is read at create time and stored as `SourceSeconds`; the stitched
+  total is `source + requested`. For file uploads, the duration is unknown in
+  v1 (no ffprobe dependency), so `SourceSeconds` is empty and the total falls
+  back to the requested seconds (documented limitation: the content IS
+  stitched but `Video.seconds` reports only the requested portion for file
+  uploads). To get the correct stitched total, reference the source by `{id}`
+  (a previously-generated completed job) rather than re-uploading the MP4.
 
 ---
 

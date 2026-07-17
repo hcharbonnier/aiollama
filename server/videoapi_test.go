@@ -295,6 +295,15 @@ type nilTranscoder struct{}
 func (nilTranscoder) EncodeMP4(ctx context.Context, framePNGs [][]byte, fps int) ([]byte, error) {
 	return nil, errors.New("no transcoder")
 }
+func (nilTranscoder) DecodeFrames(ctx context.Context, mp4 []byte, maxFrames int) ([][]byte, int, error) {
+	return nil, 0, errors.New("no transcoder")
+}
+func (nilTranscoder) DecodeLastFrame(ctx context.Context, mp4 []byte) ([]byte, error) {
+	return nil, errors.New("no transcoder")
+}
+func (nilTranscoder) ConcatMP4(ctx context.Context, first, second []byte, fps int) ([]byte, error) {
+	return nil, errors.New("no transcoder")
+}
 func (nilTranscoder) Available() bool { return false }
 
 // TestVideoListEmpty verifies that GET /v1/videos on an empty store returns
@@ -339,5 +348,251 @@ func TestVideoContentVariantNotImplemented(t *testing.T) {
 
 	if w.Code != http.StatusNotImplemented {
 		t.Fatalf("status = %d, want 501", w.Code)
+	}
+}
+
+// extendableTranscoder is a Transcoder that simulates frame decode + concat
+// for edit/extend handler tests without a real ffmpeg. It returns a single
+// stub "frame" from DecodeFrames and a stub MP4 from ConcatMP4.
+type extendableTranscoder struct{}
+
+func (extendableTranscoder) EncodeMP4(ctx context.Context, framePNGs [][]byte, fps int) ([]byte, error) {
+	return []byte{0, 0, 0, 0x18, 'f', 't', 'y', 'p'}, nil
+}
+func (extendableTranscoder) DecodeFrames(ctx context.Context, mp4 []byte, maxFrames int) ([][]byte, int, error) {
+	return [][]byte{[]byte("decoded-frame")}, 16, nil
+}
+func (extendableTranscoder) DecodeLastFrame(ctx context.Context, mp4 []byte) ([]byte, error) {
+	return []byte("decoded-last-frame"), nil
+}
+func (extendableTranscoder) ConcatMP4(ctx context.Context, first, second []byte, fps int) ([]byte, error) {
+	return []byte("stitched"), nil
+}
+func (extendableTranscoder) Available() bool { return true }
+
+// setupVideoRouterWithEdits binds all video routes (including edits/extensions)
+// to the server's job store.
+func setupVideoRouterWithEdits(t *testing.T, store videojobs.JobStore) (*Server, *gin.Engine) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	s := &Server{videoJobs: store}
+	r := gin.New()
+	r.POST("/v1/videos", s.VideoCreateHandler)
+	r.GET("/v1/videos", s.VideoListHandler)
+	r.GET("/v1/videos/:video_id", s.VideoRetrieveHandler)
+	r.DELETE("/v1/videos/:video_id", s.VideoDeleteHandler)
+	r.GET("/v1/videos/:video_id/content", s.VideoContentHandler)
+	r.POST("/v1/videos/edits", s.VideoEditHandler)
+	r.POST("/v1/videos/extensions", s.VideoExtendHandler)
+	return s, r
+}
+
+// newMultipartRequestWithVideo builds a multipart/form-data POST with text
+// fields plus an optional "video" file part (for edit/extend requests).
+func newMultipartRequestWithVideo(t *testing.T, url string, fields map[string]string, videoFile []byte) *http.Request {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	for k, v := range fields {
+		_ = mw.WriteField(k, v)
+	}
+	if len(videoFile) > 0 {
+		fw, err := mw.CreateFormFile("video", "source.mp4")
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		fw.Write(videoFile)
+	}
+	_ = mw.Close()
+	req, err := http.NewRequest(http.MethodPost, url, &body)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	return req
+}
+
+// TestVideoEditRejectsMissingPrompt verifies POST /v1/videos/edits without a
+// prompt returns 400.
+func TestVideoEditRejectsMissingPrompt(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	req := newMultipartRequestWithVideo(t, "/v1/videos/edits", map[string]string{
+		"model": "wan2.1-t2v",
+	}, []byte("fake-mp4"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "prompt is required") {
+		t.Errorf("body = %q, want 'prompt is required'", w.Body.String())
+	}
+}
+
+// TestVideoEditRejectsMissingVideo verifies that a missing `video` field
+// (neither file part nor {id}) returns 400.
+func TestVideoEditRejectsMissingVideo(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	req := newMultipartRequestWithVideo(t, "/v1/videos/edits", map[string]string{
+		"prompt": "a cat",
+		"model":  "wan2.1-t2v",
+	}, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "video is required") {
+		t.Errorf("body = %q, want 'video is required'", w.Body.String())
+	}
+}
+
+// TestVideoEditRejectsMissingModel verifies that a missing model returns 400.
+func TestVideoEditRejectsMissingModel(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	req := newMultipartRequestWithVideo(t, "/v1/videos/edits", map[string]string{
+		"prompt": "a cat",
+	}, []byte("fake-mp4"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "model is required") {
+		t.Errorf("body = %q, want 'model is required'", w.Body.String())
+	}
+}
+
+// TestVideoEditWithFileUploadAccepts verifies that a valid edit request with
+// an uploaded source file is accepted (returns 200 with a queued Video).
+func TestVideoEditWithFileUploadAccepts(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	req := newMultipartRequestWithVideo(t, "/v1/videos/edits", map[string]string{
+		"prompt":  "a cat running",
+		"model":   "wan2.1-t2v",
+		"seconds": "4",
+		"size":    "720x1280",
+	}, []byte("fake-source-mp4"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var v openai.Video
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v.ID == "" {
+		t.Error("id is empty")
+	}
+	if v.Object != openai.VideoObject {
+		t.Errorf("object = %q, want %q", v.Object, openai.VideoObject)
+	}
+}
+
+// TestVideoExtendRejectsMissingSeconds verifies that extensions require an
+// explicit seconds field (no default).
+func TestVideoExtendRejectsMissingSeconds(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	req := newMultipartRequestWithVideo(t, "/v1/videos/extensions", map[string]string{
+		"prompt": "continue the scene",
+		"model":  "wan2.1-t2v",
+	}, []byte("fake-mp4"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "seconds is required") {
+		t.Errorf("body = %q, want 'seconds is required'", w.Body.String())
+	}
+}
+
+// TestVideoExtendRejectsInvalidSeconds verifies that seconds outside the
+// extension range (4-20) is rejected.
+func TestVideoExtendRejectsInvalidSeconds(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	req := newMultipartRequestWithVideo(t, "/v1/videos/extensions", map[string]string{
+		"prompt":  "continue the scene",
+		"model":   "wan2.1-t2v",
+		"seconds": "24",
+	}, []byte("fake-mp4"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "seconds must be one of") {
+		t.Errorf("body = %q, want seconds validation error", w.Body.String())
+	}
+}
+
+// TestVideoExtendAcceptsValidSeconds verifies the full extension seconds range
+// (4, 8, 12, 16, 20) is accepted.
+func TestVideoExtendAcceptsValidSeconds(t *testing.T) {
+	for _, sec := range []string{"4", "8", "12", "16", "20"} {
+		t.Run(sec, func(t *testing.T) {
+			store := videojobs.NewJobStore(extendableTranscoder{})
+			defer store.Close()
+			_, r := setupVideoRouterWithEdits(t, store)
+
+			req := newMultipartRequestWithVideo(t, "/v1/videos/extensions", map[string]string{
+				"prompt":  "continue the scene",
+				"model":   "wan2.1-t2v",
+				"seconds": sec,
+				"size":    "720x1280",
+			}, []byte("fake-mp4"))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("seconds=%s: status = %d, want 200: %s", sec, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestVideoEditRejectsNonMultipart verifies that a JSON body is rejected
+// (edits/extensions require multipart/form-data per spec).
+func TestVideoEditRejectsNonMultipart(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	body := `{"prompt":"a cat","model":"wan2.1-t2v","video":{"id":"vid_abc"}}`
+	req, _ := http.NewRequest(http.MethodPost, "/v1/videos/edits", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (multipart required)", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "multipart/form-data") {
+		t.Errorf("body = %q, want multipart requirement", w.Body.String())
 	}
 }

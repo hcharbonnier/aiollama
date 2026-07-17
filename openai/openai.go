@@ -1011,12 +1011,26 @@ const (
 // POST /v1/videos (create).
 var VideoSecondsValues = map[string]bool{"4": true, "8": true, "12": true}
 
+// VideoExtensionSecondsValues are the allowed values for the seconds field on
+// POST /v1/videos/extensions, per spec §2.9 ("4"–"20"). Strictly a superset of
+// VideoSecondsValues.
+var VideoExtensionSecondsValues = map[string]bool{"4": true, "8": true, "12": true, "16": true, "20": true}
+
 // VideoSizeValues are the allowed values for the size request field.
 var VideoSizeValues = map[string]bool{
 	"720x1280":  true,
 	"1280x720":  true,
 	"1024x1792": true,
 	"1792x1024": true,
+}
+
+// VideoReferenceParam is the `video` object shape on POST /v1/videos/edits
+// and POST /v1/videos/extensions (spec §2.8/2.9). It references a previously
+// generated video by its id, or when the SDK uploads a file the handler
+// substitutes a file part instead. Exactly one of ID is set when sent as an
+// object (file-part uploads bypass this struct).
+type VideoReferenceParam struct {
+	ID string `json:"id,omitempty"`
 }
 
 // ErrVideoFileIDNotSupported is returned when input_reference.file_id is used

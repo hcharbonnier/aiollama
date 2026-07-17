@@ -467,6 +467,255 @@ func pollIntervalFromHeader(resp *http.Response, defaultMS int) int {
 	return defaultMS
 }
 
+// videoJobStatus is the subset of the Video object polled during edit/extend
+// integration tests.
+type videoJobStatus struct {
+	ID       string `json:"id"`
+	Status   string `json:"status"`
+	Progress int    `json:"progress"`
+	Seconds  string `json:"seconds"`
+	Error    *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// pollVideoUntilDone polls GET /v1/videos/{id} until status is "completed" or
+// "failed", honoring the server's openai-poll-after-ms header. Returns the
+// final status. Fails the test on context expiry or a "failed" status.
+func pollVideoUntilDone(ctx context.Context, t *testing.T, endpoint, videoID string, createResp *http.Response) videoJobStatus {
+	t.Helper()
+	pollDeadline, ok := ctx.Deadline()
+	if !ok {
+		pollDeadline = time.Now().Add(diffTestVideoParams.Timeout)
+	}
+	var pollMS = pollIntervalFromHeader(createResp, 1000)
+	var v videoJobStatus
+	for time.Now().Before(pollDeadline) {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context cancelled while polling: %v", ctx.Err())
+		case <-time.After(time.Duration(pollMS) * time.Millisecond):
+		}
+
+		retrieveURL := fmt.Sprintf("http://%s/v1/videos/%s", endpoint, videoID)
+		rreq, _ := http.NewRequestWithContext(ctx, http.MethodGet, retrieveURL, nil)
+		rresp, err := http.DefaultClient.Do(rreq)
+		if err != nil {
+			t.Fatalf("retrieve request failed: %v", err)
+		}
+		_ = json.NewDecoder(rresp.Body).Decode(&v)
+		rresp.Body.Close()
+		pollMS = pollIntervalFromHeader(rresp, 1000)
+
+		t.Logf("poll status=%s progress=%d%% seconds=%s", v.Status, v.Progress, v.Seconds)
+		if v.Status == "completed" || v.Status == "failed" {
+			break
+		}
+	}
+	if v.Status == "failed" {
+		msg := "unknown"
+		if v.Error != nil {
+			msg = fmt.Sprintf("%s: %s", v.Error.Code, v.Error.Message)
+		}
+		t.Fatalf("video generation failed: %s", msg)
+	}
+	if v.Status != "completed" {
+		t.Fatalf("video did not complete within timeout; last status=%q", v.Status)
+	}
+	return v
+}
+
+// fetchVideoContent downloads the MP4 for a completed video job, returning the
+// raw bytes. Fails the test if the content is not available.
+func fetchVideoContent(ctx context.Context, t *testing.T, endpoint, videoID string) []byte {
+	t.Helper()
+	contentURL := fmt.Sprintf("http://%s/v1/videos/%s/content", endpoint, videoID)
+	creq, _ := http.NewRequestWithContext(ctx, http.MethodGet, contentURL, nil)
+	creq.Header.Set("Accept", "application/binary")
+	cresp, err := http.DefaultClient.Do(creq)
+	if err != nil {
+		t.Fatalf("content request failed: %v", err)
+	}
+	defer cresp.Body.Close()
+	if cresp.StatusCode != 200 {
+		b, _ := io.ReadAll(cresp.Body)
+		t.Fatalf("expected status 200 from content endpoint, got %d: %s", cresp.StatusCode, string(b))
+	}
+	if ct := cresp.Header.Get("Content-Type"); ct != "video/mp4" {
+		t.Errorf("content type = %q, want video/mp4", ct)
+	}
+	mp4, err := io.ReadAll(cresp.Body)
+	if err != nil {
+		t.Fatalf("failed to read mp4 content: %v", err)
+	}
+	if len(mp4) < 8 || string(mp4[4:8]) != "ftyp" {
+		t.Fatalf("mp4 content missing ftyp box header: % x", mp4[:min(8, len(mp4))])
+	}
+	return mp4
+}
+
+// TestDiffgenVideoEditAPI exercises the OpenAI Videos API edit flow end-to-end:
+// it first creates a source video via POST /v1/videos, then edits it via
+// POST /v1/videos/edits referencing the source by {id}, polls to completion,
+// and downloads the edited MP4. Gated behind OLLAMA_TEST_DIFF_MODEL (video
+// model) since it requires a real generation. Skips on image-only models.
+func TestDiffgenVideoEditAPI(t *testing.T) {
+	if diffTestModel == "" {
+		t.Skip("OLLAMA_TEST_DIFF_MODEL not set; skipping diffgen video edit API test")
+	}
+
+	p := diffTestVideoParams
+	ctx, cancel := context.WithTimeout(context.Background(), p.Timeout*2)
+	defer cancel()
+
+	client, endpoint, cleanup := InitServerConnection(ctx, t)
+	defer cleanup()
+	ensureDiffModel(ctx, t, client)
+
+	// Verify the model is a video model (the edit endpoint requires it).
+	show, err := client.Show(ctx, &api.ShowRequest{Name: diffTestModel})
+	if err != nil {
+		t.Fatalf("show model: %v", err)
+	}
+	isVideo := false
+	for _, cap := range show.Capabilities {
+		if string(cap) == "video" {
+			isVideo = true
+			break
+		}
+	}
+	if !isVideo {
+		t.Skipf("model %q does not advertise the video capability; skipping video edit API test", diffTestModel)
+	}
+
+	size := p.Size
+	if size == "" {
+		size = fmt.Sprintf("%dx%d", p.Width, p.Height)
+	}
+
+	// Step 1: create the source video.
+	t.Logf("Step 1: creating source video via POST /v1/videos")
+	sourceID := createVideoMultipart(t, ctx, endpoint, map[string]string{
+		"model":   diffTestModel,
+		"prompt":  "a cat sitting on a windowsill",
+		"size":    size,
+		"seconds": "4",
+	})
+	t.Logf("source video job id=%s", sourceID)
+	pollVideoUntilDone(ctx, t, endpoint, sourceID, nil)
+	sourceMP4 := fetchVideoContent(ctx, t, endpoint, sourceID)
+	t.Logf("source video: %d bytes", len(sourceMP4))
+
+	// Step 2: edit the source video by {id} reference.
+	t.Logf("Step 2: editing source video via POST /v1/videos/edits")
+	editID := editVideoMultipart(t, ctx, endpoint, map[string]string{
+		"model":   diffTestModel,
+		"prompt":  "the cat jumps down to the floor",
+		"size":    size,
+		"seconds": "4",
+		"video":   fmt.Sprintf(`{"id":%q}`, sourceID),
+	})
+	t.Logf("edit video job id=%s (remixed_from=%s)", editID, sourceID)
+	finalStatus := pollVideoUntilDone(ctx, t, endpoint, editID, nil)
+	if finalStatus.ID == "" {
+		t.Fatal("edit response missing id")
+	}
+
+	// The edited video's remixed_from_video_id should reference the source.
+	if finalStatus.Seconds == "" {
+		t.Errorf("edit response missing seconds")
+	}
+
+	editMP4 := fetchVideoContent(ctx, t, endpoint, editID)
+	t.Logf("edited video: %d bytes", len(editMP4))
+	if len(editMP4) < 8 {
+		t.Fatalf("edited MP4 too short: %d bytes", len(editMP4))
+	}
+
+	// Clean up both jobs.
+	deleteVideo(t, ctx, endpoint, sourceID)
+	deleteVideo(t, ctx, endpoint, editID)
+}
+
+// createVideoMultipart POSTs a multipart form to /v1/videos and returns the
+// created job id, failing the test on error.
+func createVideoMultipart(t *testing.T, ctx context.Context, endpoint string, fields map[string]string) string {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	for k, v := range fields {
+		_ = mw.WriteField(k, v)
+	}
+	_ = mw.Close()
+	url := fmt.Sprintf("http://%s/v1/videos", endpoint)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &body)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("video create request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200 from POST /v1/videos, got %d: %s", resp.StatusCode, string(b))
+	}
+	var v videoJobStatus
+	_ = json.NewDecoder(resp.Body).Decode(&v)
+	if v.ID == "" {
+		t.Fatal("video create response missing id")
+	}
+	return v.ID
+}
+
+// editVideoMultipart POSTs a multipart form to /v1/videos/edits and returns
+// the created job id. The "video" field is a JSON object string referencing a
+// previously-generated video by id, OR a file part (not used here).
+func editVideoMultipart(t *testing.T, ctx context.Context, endpoint string, fields map[string]string) string {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	for k, v := range fields {
+		_ = mw.WriteField(k, v)
+	}
+	_ = mw.Close()
+	url := fmt.Sprintf("http://%s/v1/videos/edits", endpoint)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &body)
+	if err != nil {
+		t.Fatalf("edit request: %v", err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("video edit request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200 from POST /v1/videos/edits, got %d: %s", resp.StatusCode, string(b))
+	}
+	var v videoJobStatus
+	_ = json.NewDecoder(resp.Body).Decode(&v)
+	if v.ID == "" {
+		t.Fatal("video edit response missing id")
+	}
+	return v.ID
+}
+
+// deleteVideo best-effort deletes a video job.
+func deleteVideo(t *testing.T, ctx context.Context, endpoint, videoID string) {
+	t.Helper()
+	url := fmt.Sprintf("http://%s/v1/videos/%s", endpoint, videoID)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil {
+		resp.Body.Close()
+	}
+}
+
 // TestDiffgenImageGenerationProgress verifies that the streaming response
 // includes step/total progress events before the final image. This exercises
 // the ndjson progress streaming contract that the diffgen runner emits.

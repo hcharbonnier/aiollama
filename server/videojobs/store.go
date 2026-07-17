@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -104,6 +105,39 @@ type CreateParams struct {
 	// injected so the package does not depend on the scheduler directly,
 	// enabling unit tests with a mock. See Worker.GenerateFunc.
 	Generate GenerateFunc
+
+	// --- Edit / Extension parameters (Phase 2) ---
+
+	// SourceVideoID references a previously-completed job whose MP4 is the
+	// input to an edit or extension. The worker decodes its frames to derive
+	// the I2V init image (edit: first frame) or the continuation point
+	// (extension: last frame). Mutually exclusive with SourceVideo (an
+	// uploaded file). Empty for plain create.
+	SourceVideoID string
+
+	// SourceVideo is an uploaded source MP4 (from a multipart file part) for
+	// edit/extension. Mutually exclusive with SourceVideoID. The worker
+	// does NOT store this on the job (the resulting video is what's kept);
+	// it decodes frames from it for the init image.
+	SourceVideo []byte
+
+	// Extend indicates this is an extension (not an edit). When true:
+	//   - the worker uses the LAST frame of the source as the init image.
+	//   - the worker concatenates the source MP4 + the generated extension
+	//     via ConcatMP4, and the resulting Video.seconds is the stitched
+	//     total (source seconds + requested seconds).
+	// When false (edit): the worker uses the FIRST frame as the init image
+	// and discards the source after generation (the result is the new
+	// generation only, per the Sora edits semantics: re-render from a
+	// reference frame with a new prompt).
+	Extend bool
+
+	// SourceSeconds is the duration of the source video, used to compute the
+	// stitched total seconds for extensions. The caller fills this from the
+	// referenced job's Seconds field (for SourceVideoID) or by parsing the
+	// uploaded file (for SourceVideo — left 0/unknown in v1). For edits, it
+	// is ignored.
+	SourceSeconds string
 }
 
 // GenerateFunc drives the diffgen runner for a single video generation,
@@ -204,13 +238,31 @@ type memStore struct {
 	transcoder Transcoder
 }
 
-// Transcoder converts a sequence of PNG-encoded frames into an MP4 container.
-// It is injected so the package does not import x/diffgen (which is behind
-// the sdcpp build tag). The default implementation shells out to ffmpeg.
+// Transcoder converts a sequence of PNG-encoded frames into an MP4 container
+// and back. It is injected so the package does not import x/diffgen (which is
+// behind the sdcpp build tag). The default implementation shells out to
+// ffmpeg.
 type Transcoder interface {
 	// EncodeMP4 transcodes the given PNG frames (in order) to a single MP4
 	// container at fps. Returns the MP4 bytes or an error.
 	EncodeMP4(ctx context.Context, framePNGs [][]byte, fps int) ([]byte, error)
+	// DecodeFrames extracts PNG-encoded frames from an MP4/MKV video, starting
+	// from the BEGINNING. maxFrames <= 0 means all frames (capped by
+	// maxDecodedFrames). Used by /v1/videos/edits (first frame as I2V init).
+	// The returned int is the probed fps (0 if unknown).
+	DecodeFrames(ctx context.Context, mp4 []byte, maxFrames int) ([][]byte, int, error)
+	// DecodeLastFrame extracts only the LAST frame of a video as a PNG. This
+	// is used by /v1/videos/extensions, which continues the scene from the
+	// source's final frame. It uses ffmpeg's -sseof (seek from end) so it does
+	// not decode the entire source, avoiding the O(n) cost and the
+	// first-N-frames truncation bug that DecodeFrames would hit for long
+	// sources.
+	DecodeLastFrame(ctx context.Context, mp4 []byte) ([]byte, error)
+	// ConcatMP4 concatenates two MP4 byte streams (produced by EncodeMP4)
+	// into a single MP4, preserving the fps. Used by /v1/videos/extensions to
+	// stitch the source segment and the generated extension into one clip.
+	// Either input may be nil/empty (the other is returned as-is).
+	ConcatMP4(ctx context.Context, first, second []byte, fps int) ([]byte, error)
 	// Available reports whether transcoding is possible (e.g. ffmpeg on PATH).
 	Available() bool
 }
@@ -317,6 +369,55 @@ func (s *memStore) run(j *Job, params CreateParams, ctx context.Context) {
 	j.status = openai.VideoStatusInProgress
 	j.mu.Unlock()
 
+	// For edit/extension jobs, derive the init image from the source video
+	// before generation. Edits use the first frame (I2V init); extensions use
+	// the last frame (continuation point). These are decoded via separate
+	// ffmpeg calls so we don't hold the whole source in memory.
+	var sourceMP4 []byte
+	var sourceFps int
+	if params.SourceVideoID != "" || len(params.SourceVideo) > 0 {
+		var err error
+		sourceMP4, sourceFps, err = s.resolveSourceVideo(ctx, params)
+		if err != nil {
+			j.fail(&openai.VideoError{Code: "source_video_unavailable", Message: err.Error()})
+			return
+		}
+		if params.Extend {
+			// Extensions continue from the LAST frame. Use DecodeLastFrame
+			// (ffmpeg -sseof) which seeks to the end and decodes only the
+			// final frame — correct for any source length and O(1) vs
+			// DecodeFrames' O(n) + first-N-truncation bug.
+			lastFrame, err := s.transcoder.DecodeLastFrame(ctx, sourceMP4)
+			if err != nil {
+				j.fail(&openai.VideoError{Code: "source_decode_failed", Message: fmt.Sprintf("failed to decode last frame: %v", err)})
+				return
+			}
+			if len(lastFrame) == 0 {
+				j.fail(&openai.VideoError{Code: "source_decode_failed", Message: "source video produced no frames"})
+				return
+			}
+			params.InitImage = lastFrame
+		} else {
+			// Edits re-render from the FIRST frame as an I2V init image.
+			frames, _, err := s.transcoder.DecodeFrames(ctx, sourceMP4, 1)
+			if err != nil {
+				j.fail(&openai.VideoError{Code: "source_decode_failed", Message: fmt.Sprintf("failed to decode source video: %v", err)})
+				return
+			}
+			if len(frames) == 0 {
+				j.fail(&openai.VideoError{Code: "source_decode_failed", Message: "source video produced no frames"})
+				return
+			}
+			params.InitImage = frames[0]
+		}
+		// Free the source MP4 bytes now that frames are extracted, so the
+		// large slice is GC-eligible before the (slow) generation + concat.
+		// The extension still needs it for ConcatMP4, so only nil it for edits.
+		if !params.Extend {
+			sourceMP4 = nil
+		}
+	}
+
 	var framePNGs [][]byte
 	var lastStep, lastTotal int
 	err := params.Generate(ctx, params, func(framePNG []byte, step, total int) {
@@ -356,6 +457,22 @@ func (s *memStore) run(j *Job, params CreateParams, ctx context.Context) {
 		return
 	}
 
+	// For extensions, stitch source + generated into a single clip and
+	// update the job's seconds to the stitched total.
+	if params.Extend && len(sourceMP4) > 0 {
+		concatFps := fps
+		if sourceFps > 0 {
+			concatFps = sourceFps
+		}
+		stitched, err := s.transcoder.ConcatMP4(ctx, sourceMP4, mp4, concatFps)
+		if err != nil {
+			j.fail(&openai.VideoError{Code: "concat_failed", Message: fmt.Sprintf("failed to stitch extension: %v", err)})
+			return
+		}
+		mp4 = stitched
+		j.setSeconds(stitchSeconds(params.SourceSeconds, params.Seconds))
+	}
+
 	now := time.Now().Unix()
 	j.mu.Lock()
 	j.status = openai.VideoStatusCompleted
@@ -369,6 +486,52 @@ func (s *memStore) run(j *Job, params CreateParams, ctx context.Context) {
 	// Enforce the global memory bound: if adding this content pushes total
 	// retained bytes over the cap, evict the oldest completed jobs.
 	s.evictForMemoryBudget()
+}
+
+// resolveSourceVideo returns the MP4 bytes and probed fps for an edit/extend
+// job's source video. For SourceVideoID, it looks up the referenced completed
+// job's content. For SourceVideo (an uploaded file), it returns the bytes
+// directly with fps 0 (the caller falls back to the requested fps).
+func (s *memStore) resolveSourceVideo(ctx context.Context, params CreateParams) ([]byte, int, error) {
+	if len(params.SourceVideo) > 0 {
+		return params.SourceVideo, 0, nil
+	}
+	if params.SourceVideoID != "" {
+		src, err := s.Get(params.SourceVideoID)
+		if err != nil {
+			return nil, 0, fmt.Errorf("source video %q not found", params.SourceVideoID)
+		}
+		if src.Status() != openai.VideoStatusCompleted {
+			return nil, 0, fmt.Errorf("source video %q is not completed (status: %s)", params.SourceVideoID, src.Status())
+		}
+		content, _ := src.Content()
+		if len(content) == 0 {
+			return nil, 0, fmt.Errorf("source video %q has no content", params.SourceVideoID)
+		}
+		return content, 0, nil
+	}
+	return nil, 0, errors.New("no source video provided")
+}
+
+// setSeconds updates the job's reported seconds (used for extension stitching).
+func (j *Job) setSeconds(s string) {
+	j.mu.Lock()
+	j.seconds = s
+	j.mu.Unlock()
+}
+
+// stitchSeconds computes the total seconds for an extension by adding the
+// source seconds to the requested extension seconds. Both are spec strings
+// ("4", "8", "12", ...). Non-numeric/empty values fall back to the requested
+// seconds alone. The result is the decimal sum as a string (e.g. "8" + "4" =
+// "12").
+func stitchSeconds(source, requested string) string {
+	src, err1 := strconv.Atoi(source)
+	req, err2 := strconv.Atoi(requested)
+	if err1 != nil || err2 != nil || src <= 0 {
+		return requested
+	}
+	return strconv.Itoa(src + req)
 }
 
 // getJob returns the job for the given id under the store lock.

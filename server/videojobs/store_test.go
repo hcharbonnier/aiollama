@@ -20,7 +20,11 @@ type mockTranscoder struct {
 		frames int
 		fps    int
 	}
-	output []byte
+	output      []byte
+	decodeFrames [][]byte
+	decodeErr    error
+	concatErr    error
+	concatOutput []byte
 }
 
 func (m *mockTranscoder) EncodeMP4(ctx context.Context, framePNGs [][]byte, fps int) ([]byte, error) {
@@ -37,6 +41,41 @@ func (m *mockTranscoder) EncodeMP4(ctx context.Context, framePNGs [][]byte, fps 
 		return m.output, nil
 	}
 	// Return a stub MP4 (ftyp box header) so the result is non-empty.
+	return []byte{0, 0, 0, 0x18, 'f', 't', 'y', 'p'}, nil
+}
+
+// DecodeFrames returns the canned decodeFrames (or a single stub frame if nil)
+// so edit/extend worker tests can exercise the full path without a real MP4.
+func (m *mockTranscoder) DecodeFrames(ctx context.Context, mp4 []byte, maxFrames int) ([][]byte, int, error) {
+	if m.decodeErr != nil {
+		return nil, 0, m.decodeErr
+	}
+	if m.decodeFrames != nil {
+		return m.decodeFrames, 16, nil
+	}
+	// Default: one small stub PNG frame.
+	return [][]byte{[]byte("stub-frame")}, 16, nil
+}
+
+// DecodeLastFrame returns the last canned frame (or a stub).
+func (m *mockTranscoder) DecodeLastFrame(ctx context.Context, mp4 []byte) ([]byte, error) {
+	if m.decodeErr != nil {
+		return nil, m.decodeErr
+	}
+	if m.decodeFrames != nil && len(m.decodeFrames) > 0 {
+		return m.decodeFrames[len(m.decodeFrames)-1], nil
+	}
+	return []byte("stub-last-frame"), nil
+}
+
+// ConcatMP4 returns the canned concat output, or a stub for tests.
+func (m *mockTranscoder) ConcatMP4(ctx context.Context, first, second []byte, fps int) ([]byte, error) {
+	if m.concatErr != nil {
+		return nil, m.concatErr
+	}
+	if m.concatOutput != nil {
+		return m.concatOutput, nil
+	}
 	return []byte{0, 0, 0, 0x18, 'f', 't', 'y', 'p'}, nil
 }
 
@@ -495,5 +534,213 @@ func TestCreateRequiresGenerateFunc(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error when Generate is nil")
+	}
+}
+
+// TestEditJobUsesFirstFrameAsInitImage verifies that an edit job (Extend=false)
+// with a SourceVideoID resolves the source's MP4, decodes its frames, and
+// passes the FIRST frame as InitImage to the Generate func.
+func TestEditJobUsesFirstFrameAsInitImage(t *testing.T) {
+	tc := &mockTranscoder{
+		available:    true,
+		decodeFrames: [][]byte{[]byte("first-frame"), []byte("second-frame"), []byte("third-frame")},
+	}
+	store := NewJobStore(tc)
+	defer store.Close()
+
+	// First, create a completed source job to reference.
+	var capturedInitImage []byte
+	sourceGen := func(ctx context.Context, params CreateParams, fn func(framePNG []byte, step, total int)) error {
+		fn([]byte("source-frame"), 0, 0)
+		return nil
+	}
+	srcJob, err := store.Create(CreateParams{
+		Model: "wan2.1-t2v", Prompt: "source", Seconds: "4", Size: "720x1280",
+		Generate: sourceGen,
+	})
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	waitForStatus(t, srcJob, openai.VideoStatusCompleted, 5*time.Second)
+
+	// Now create an edit job referencing the source.
+	editGen := func(ctx context.Context, params CreateParams, fn func(framePNG []byte, step, total int)) error {
+		capturedInitImage = params.InitImage
+		fn([]byte("edited-frame"), 0, 0)
+		return nil
+	}
+	editJob, err := store.Create(CreateParams{
+		Model:         "wan2.1-t2v",
+		Prompt:        "edited",
+		Seconds:       "4",
+		Size:          "720x1280",
+		SourceVideoID: srcJob.ID(),
+		RemixedFromID: srcJob.ID(),
+		Extend:        false,
+		Generate:      editGen,
+	})
+	if err != nil {
+		t.Fatalf("create edit: %v", err)
+	}
+	waitForStatus(t, editJob, openai.VideoStatusCompleted, 5*time.Second)
+
+	if string(capturedInitImage) != "first-frame" {
+		t.Errorf("edit init image = %q, want %q (first frame)", string(capturedInitImage), "first-frame")
+	}
+
+	v := editJob.ToVideo()
+	if v.RemixedFromVideoID != srcJob.ID() {
+		t.Errorf("remixed_from_video_id = %q, want %q", v.RemixedFromVideoID, srcJob.ID())
+	}
+}
+
+// TestExtendJobUsesLastFrameAsInitImage verifies that an extension job
+// (Extend=true) passes the LAST frame as InitImage (via DecodeLastFrame) and
+// stitches the source + generated via ConcatMP4, with seconds = source + requested.
+func TestExtendJobUsesLastFrameAsInitImage(t *testing.T) {
+	tc := &mockTranscoder{
+		available:    true,
+		decodeFrames: [][]byte{[]byte("f1"), []byte("f2"), []byte("f3-last")},
+		concatOutput: []byte("stitched-mp4"),
+	}
+	store := NewJobStore(tc)
+	defer store.Close()
+
+	// Create a completed source job with seconds="8".
+	sourceGen := func(ctx context.Context, params CreateParams, fn func(framePNG []byte, step, total int)) error {
+		fn([]byte("source-frame"), 0, 0)
+		return nil
+	}
+	srcJob, err := store.Create(CreateParams{
+		Model: "wan2.1-t2v", Prompt: "source", Seconds: "8", Size: "720x1280",
+		Generate: sourceGen,
+	})
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	waitForStatus(t, srcJob, openai.VideoStatusCompleted, 5*time.Second)
+
+	var capturedInitImage []byte
+	extGen := func(ctx context.Context, params CreateParams, fn func(framePNG []byte, step, total int)) error {
+		capturedInitImage = params.InitImage
+		fn([]byte("ext-frame"), 0, 0)
+		return nil
+	}
+	extJob, err := store.Create(CreateParams{
+		Model:         "wan2.1-t2v",
+		Prompt:        "extend",
+		Seconds:       "4",
+		Size:          "720x1280",
+		SourceVideoID: srcJob.ID(),
+		RemixedFromID: srcJob.ID(),
+		Extend:        true,
+		SourceSeconds: "8",
+		Generate:      extGen,
+	})
+	if err != nil {
+		t.Fatalf("create extension: %v", err)
+	}
+	waitForStatus(t, extJob, openai.VideoStatusCompleted, 5*time.Second)
+
+	// Init image should be the LAST frame via DecodeLastFrame.
+	if string(capturedInitImage) != "f3-last" {
+		t.Errorf("extend init image = %q, want %q (last frame via DecodeLastFrame)", string(capturedInitImage), "f3-last")
+	}
+
+	v := extJob.ToVideo()
+	// Stitched seconds = 8 (source) + 4 (requested) = 12.
+	if v.Seconds != "12" {
+		t.Errorf("stitched seconds = %q, want %q", v.Seconds, "12")
+	}
+	// Content should be the concat output, not the generated segment alone.
+	content, _ := extJob.Content()
+	if string(content) != "stitched-mp4" {
+		t.Errorf("content = %q, want %q (stitched)", string(content), "stitched-mp4")
+	}
+}
+
+// TestExtendJobWithFileUpload verifies the SourceVideo (uploaded file) path
+// also decodes the last frame (via DecodeLastFrame) and stitches.
+func TestExtendJobWithFileUpload(t *testing.T) {
+	tc := &mockTranscoder{
+		available:    true,
+		concatOutput: []byte("stitched"),
+	}
+	store := NewJobStore(tc)
+	defer store.Close()
+
+	var capturedInitImage []byte
+	extGen := func(ctx context.Context, params CreateParams, fn func(framePNG []byte, step, total int)) error {
+		capturedInitImage = params.InitImage
+		fn([]byte("gen"), 0, 0)
+		return nil
+	}
+	extJob, err := store.Create(CreateParams{
+		Model:         "wan2.1-t2v",
+		Prompt:        "extend",
+		Seconds:       "4",
+		Size:          "720x1280",
+		SourceVideo:   []byte("uploaded-mp4-bytes"),
+		Extend:        true,
+		SourceSeconds: "0", // unknown for file uploads
+		Generate:      extGen,
+	})
+	if err != nil {
+		t.Fatalf("create extension: %v", err)
+	}
+	waitForStatus(t, extJob, openai.VideoStatusCompleted, 5*time.Second)
+
+	// DecodeLastFrame returns the stub "stub-last-frame" when decodeFrames is nil.
+	if string(capturedInitImage) != "stub-last-frame" {
+		t.Errorf("extend init image = %q, want %q", string(capturedInitImage), "stub-last-frame")
+	}
+
+	v := extJob.ToVideo()
+	// SourceSeconds unknown (0) → falls back to requested seconds.
+	if v.Seconds != "4" {
+		t.Errorf("seconds = %q, want %q (fallback to requested)", v.Seconds, "4")
+	}
+}
+
+// TestEditJobFailsOnUnknownSourceID verifies that referencing a nonexistent
+// source job id fails the new job with source_video_unavailable.
+func TestEditJobFailsOnUnknownSourceID(t *testing.T) {
+	tc := &mockTranscoder{available: true}
+	store := NewJobStore(tc)
+	defer store.Close()
+
+	editGen := func(ctx context.Context, params CreateParams, fn func(framePNG []byte, step, total int)) error {
+		fn([]byte("frame"), 0, 0)
+		return nil
+	}
+	editJob, _ := store.Create(CreateParams{
+		Model: "wan2.1-t2v", Prompt: "p", Seconds: "4", Size: "720x1280",
+		SourceVideoID: "vid_nonexistent", Extend: false, Generate: editGen,
+	})
+	waitForStatus(t, editJob, openai.VideoStatusFailed, 5*time.Second)
+
+	v := editJob.ToVideo()
+	if v.Error == nil || v.Error.Code != "source_video_unavailable" {
+		t.Fatalf("expected source_video_unavailable error, got %+v", v.Error)
+	}
+}
+
+// TestStitchSeconds verifies the seconds-stitching helper.
+func TestStitchSeconds(t *testing.T) {
+	cases := []struct {
+		source, requested, want string
+	}{
+		{"8", "4", "12"},
+		{"4", "4", "8"},
+		{"12", "8", "20"},
+		{"", "4", "4"},     // unknown source → requested
+		{"abc", "4", "4"},  // invalid source → requested
+		{"8", "", ""},      // invalid requested → empty
+	}
+	for _, c := range cases {
+		got := stitchSeconds(c.source, c.requested)
+		if got != c.want {
+			t.Errorf("stitchSeconds(%q, %q) = %q, want %q", c.source, c.requested, got, c.want)
+		}
 	}
 }

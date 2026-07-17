@@ -8,7 +8,9 @@ import (
 	"image"
 	"image/png"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -223,4 +225,391 @@ func pngToRGB(pngBytes []byte, w, h, frameSize int) ([]byte, error) {
 		}
 	}
 	return rgb, nil
+}
+
+// maxDecodedFrames bounds how many frames DecodeFrames will extract from a
+// source video. This prevents a pathological source (e.g. a 2-hour movie) from
+// exhausting memory; the edit/extend handlers only need the first or last
+// frame(s) anyway. It is a variable (not a const) so tests can lower it.
+var maxDecodedFrames int = 120
+
+// DecodeFrames extracts PNG-encoded frames from an MP4 (or any ffmpeg-readable
+// container) by piping it through ffmpeg as image2png output. Frames are
+// returned in playback order as PNG bytes. maxFrames <= 0 means all frames
+// (capped by maxDecodedFrames). The returned int is the fps ffmpeg probed
+// from the source container (0 if unknown).
+//
+// This is the inverse of EncodeMP4 and is used by /v1/videos/edits and
+// /v1/videos/extensions: the source video (a previously-generated completed
+// job's MP4) is decoded back to frames so the first/last frame can be fed to
+// the diffgen runner as an I2V/V2V init image.
+func (t *ffmpegTranscoder) DecodeFrames(ctx context.Context, mp4 []byte, maxFrames int) ([][]byte, int, error) {
+	if len(mp4) == 0 {
+		return nil, 0, errors.New("no video to decode")
+	}
+	ffmpeg, err := t.lookup()
+	if err != nil {
+		return nil, 0, fmt.Errorf("ffmpeg not found on PATH: %w", err)
+	}
+	if maxFrames <= 0 || maxFrames > maxDecodedFrames {
+		maxFrames = maxDecodedFrames
+	}
+
+	// Read the source from stdin and emit PNG frames to stdout via the
+	// image2 muxer. -v quiet suppresses the per-frame progress banner.
+	args := []string{
+		"-hide_banner", "-loglevel", "error",
+		"-i", "pipe:0",
+		"-frames:v", strconv.Itoa(maxFrames),
+		"-f", "image2pipe",
+		"-vcodec", "png",
+		"pipe:1",
+	}
+	cmd := exec.CommandContext(ctx, ffmpeg, args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to open ffmpeg stdin: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to open ffmpeg stdout: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, 0, fmt.Errorf("failed to start ffmpeg: %w", err)
+	}
+
+	// Write the MP4 bytes to stdin on a goroutine so stdout can be drained
+	// concurrently (ffmpeg reads input and writes output in parallel).
+	writeDone := make(chan error, 1)
+	go func() {
+		defer stdin.Close()
+		_, err := io.Copy(stdin, bytes.NewReader(mp4))
+		writeDone <- err
+	}()
+
+	// Split the PNG stream into individual frames. The image2pipe muxer
+	// concatenates PNGs; png.Decode reads exactly one image per call.
+	frames, fps, readErr := splitPNGStream(stdout, maxFrames)
+	runErr := cmd.Wait()
+	writeErr := <-writeDone
+
+	if runErr != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = runErr.Error()
+		}
+		return nil, 0, fmt.Errorf("ffmpeg decode failed: %s", msg)
+	}
+	if writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
+		return nil, 0, fmt.Errorf("failed to stream video to ffmpeg: %w", writeErr)
+	}
+	if readErr != nil && len(frames) == 0 {
+		return nil, 0, fmt.Errorf("failed to read ffmpeg frames: %w", readErr)
+	}
+	return frames, fps, nil
+}
+
+// DecodeLastFrame extracts only the final frame of a video as a PNG. It uses
+// ffmpeg's -sseof (seek from end of file) with a small negative offset so
+// ffmpeg decodes only the last frame, not the whole clip. This avoids the O(n)
+// decode cost of DecodeFrames and, critically, returns the TRUE last frame
+// regardless of source length (DecodeFrames with -frames:v N returns the first
+// N frames, which is wrong for "last frame" when the source exceeds the cap).
+//
+// Some ffmpeg builds / containers do not support -sseof with pipe input; in
+// that case it falls back to decoding all frames and returning the last one
+// (bounded by maxDecodedFrames).
+func (t *ffmpegTranscoder) DecodeLastFrame(ctx context.Context, mp4 []byte) ([]byte, error) {
+	if len(mp4) == 0 {
+		return nil, errors.New("no video to decode")
+	}
+	ffmpeg, err := t.lookup()
+	if err != nil {
+		return nil, fmt.Errorf("ffmpeg not found on PATH: %w", err)
+	}
+
+	// -sseof -0.1 seeks to 0.1s before the end; -frames:v 1 grabs one frame
+	// from there. For pipe input, -sseof may not work (it needs a seekable
+	// input); we handle that with the fallback below.
+	args := []string{
+		"-hide_banner", "-loglevel", "error",
+		"-sseof", "-0.1",
+		"-i", "pipe:0",
+		"-frames:v", "1",
+		"-f", "image2pipe",
+		"-vcodec", "png",
+		"pipe:1",
+	}
+	frame, err := t.decodeOneFrame(ctx, ffmpeg, args, mp4)
+	if err == nil && len(frame) > 0 {
+		return frame, nil
+	}
+
+	// Fallback: decode all frames (capped) and return the last one. This is
+	// the correct but slower path for containers/ffmpeg builds where -sseof
+	// doesn't work with pipe input.
+	frames, _, decodeErr := t.DecodeFrames(ctx, mp4, maxDecodedFrames)
+	if decodeErr != nil && len(frames) == 0 {
+		return nil, fmt.Errorf("decode last frame (sseof failed: %v; fallback also failed: %v)", err, decodeErr)
+	}
+	if len(frames) == 0 {
+		return nil, fmt.Errorf("decode last frame: source produced no frames (sseof failed: %v)", err)
+	}
+	return frames[len(frames)-1], nil
+}
+
+// decodeOneFrame runs ffmpeg with the given args, writes mp4 to stdin, and
+// reads a single PNG frame from stdout. Returns the PNG bytes or an error.
+func (t *ffmpegTranscoder) decodeOneFrame(ctx context.Context, ffmpeg string, args []string, mp4 []byte) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, ffmpeg, args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open ffmpeg stdin: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open ffmpeg stdout: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start ffmpeg: %w", err)
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		defer stdin.Close()
+		_, err := io.Copy(stdin, bytes.NewReader(mp4))
+		writeDone <- err
+	}()
+
+	// Read the single PNG frame. Use io.ReadAll since it's one frame.
+	data, readErr := io.ReadAll(stdout)
+	runErr := cmd.Wait()
+	writeErr := <-writeDone
+
+	if runErr != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = runErr.Error()
+		}
+		return nil, fmt.Errorf("ffmpeg decode failed: %s", msg)
+	}
+	if writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
+		return nil, fmt.Errorf("failed to stream video to ffmpeg: %w", writeErr)
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("failed to read ffmpeg output: %w", readErr)
+	}
+	if len(data) == 0 {
+		return nil, errors.New("ffmpeg produced no output")
+	}
+	return data, nil
+}
+
+// splitPNGStream reads a stream of concatenated PNG images from r, decoding
+// each via png.DecodeConfig to discover its boundaries. Returns the slice of
+// raw PNG bytes (one per image) and the probed fps (always 0 from image2pipe;
+// fps is reported by a separate probe when needed). Stops after max frames or
+// at EOF.
+func splitPNGStream(r io.Reader, max int) ([][]byte, int, error) {
+	// Read the whole stream into memory (bounded by maxFrames of small
+	// frames for the edit/extend use case). A streaming chunked reader would
+	// be more memory-efficient, but PNG frames do not have a length prefix
+	// so we must scan for IEND chunks; buffering then splitting is simplest.
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, 0, err
+	}
+	var frames [][]byte
+	pos := 0
+	for pos < len(data) && (max <= 0 || len(frames) < max) {
+		cfg, err := png.DecodeConfig(bytes.NewReader(data[pos:]))
+		if err != nil {
+			// Trailing bytes after the last frame: stop cleanly.
+			break
+		}
+		// Re-encode the frame's bytes by decoding the full image to find
+		// its end. png.Decode consumes exactly one image.
+		img, err := png.Decode(bytes.NewReader(data[pos:]))
+		if err != nil {
+			break
+		}
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, img); err != nil {
+			break
+		}
+		frames = append(frames, buf.Bytes())
+		// Advance past the decoded image: use the re-encoded length as an
+		// approximation only if the source isn't a clean stream; in
+		// practice image2pipe emits clean concatenated PNGs so we rescan
+		// from pos+len(buf). To be robust to minor differences, fall back to
+		// scanning for the next PNG signature.
+		next := findNextPNGSig(data, pos+1)
+		if next < 0 {
+			break
+		}
+		_ = cfg // (cfg retained for future dimension validation)
+		pos = next
+	}
+	return frames, 0, nil
+}
+
+// findNextPNGSig returns the index of the next PNG signature (8 bytes:
+// \x89PNG\r\n\x1a\n) at or after start, or -1 if none.
+func findNextPNGSig(data []byte, start int) int {
+	sig := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i <= len(data)-len(sig); i++ {
+		match := true
+		for j := 0; j < len(sig); j++ {
+			if data[i+j] != sig[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+// maxConcatInputBytes bounds how much input ConcatMP4 will read into memory.
+// Each input is a generated MP4 (bounded by maxMP4OutputBytes), so this is a
+// generous safety cap against accidental misuse with huge external files.
+var maxConcatInputBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
+
+// ConcatMP4 concatenates two MP4 byte streams into a single MP4 using ffmpeg's
+// concat demuxer. Both inputs should have been produced by EncodeMP4 (same
+// codec/fps). fps sets the output frame rate explicitly to avoid drift. If
+// either input is empty, the other is returned unchanged.
+//
+// Temp files are used because (a) the concat demuxer requires seekable inputs
+// (pipes are not seekable) and (b) os/exec.Cmd.ExtraFiles (extra fds) is not
+// supported on Windows, so piping two inputs simultaneously into one ffmpeg
+// invocation is not portable. The temp files are cleaned up on return.
+func (t *ffmpegTranscoder) ConcatMP4(ctx context.Context, first, second []byte, fps int) ([]byte, error) {
+	if len(first) == 0 {
+		return second, nil
+	}
+	if len(second) == 0 {
+		return first, nil
+	}
+	if int64(len(first))+int64(len(second)) > maxConcatInputBytes {
+		return nil, fmt.Errorf("concat input too large: %d bytes", int64(len(first))+int64(len(second)))
+	}
+	ffmpeg, err := t.lookup()
+	if err != nil {
+		return nil, fmt.Errorf("ffmpeg not found on PATH: %w", err)
+	}
+	if fps <= 0 {
+		fps = 16
+	}
+
+	// Write both segments to temp files and build a concat demuxer list.
+	dir, err := os.MkdirTemp("", "videojobs-concat-")
+	if err != nil {
+		return nil, fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	firstPath := filepath.Join(dir, "first.mp4")
+	secondPath := filepath.Join(dir, "second.mp4")
+	listPath := filepath.Join(dir, "list.txt")
+	if err := os.WriteFile(firstPath, first, 0o600); err != nil {
+		return nil, fmt.Errorf("write first segment: %w", err)
+	}
+	if err := os.WriteFile(secondPath, second, 0o600); err != nil {
+		return nil, fmt.Errorf("write second segment: %w", err)
+	}
+	// The concat demuxer list format requires single-quoted, escaped paths.
+	list := fmt.Sprintf("file '%s'\nfile '%s'\n", strings.ReplaceAll(firstPath, "'", "'\\''"), strings.ReplaceAll(secondPath, "'", "'\\''"))
+	if err := os.WriteFile(listPath, []byte(list), 0o600); err != nil {
+		return nil, fmt.Errorf("write concat list: %w", err)
+	}
+
+	// Try stream-copy first (-c copy): both segments came from EncodeMP4
+	// with the same codec/fps, so a copy concat is far cheaper (no re-encode).
+	// If the concat demuxer rejects the copy (mismatched params, fragmented
+	// MP4 boundaries), fall back to a full re-encode through libx264.
+	result, err := t.concatWithCodec(ctx, ffmpeg, firstPath, secondPath, listPath, fps, true)
+	if err == nil && len(result) > 0 {
+		return result, nil
+	}
+	// Fallback: re-encode through libx264.
+	return t.concatWithCodec(ctx, ffmpeg, firstPath, secondPath, listPath, fps, false)
+}
+
+// concatWithCodec runs the ffmpeg concat demuxer with either stream-copy
+// (-c copy, fast) or re-encode (-c:v libx264, slower but always works). The
+// temp files and list must already be written. copyOnly selects the mode.
+func (t *ffmpegTranscoder) concatWithCodec(ctx context.Context, ffmpeg, firstPath, secondPath, listPath string, fps int, copyOnly bool) ([]byte, error) {
+	args := []string{
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "concat", "-safe", "0",
+		"-i", listPath,
+	}
+	if copyOnly {
+		args = append(args, "-c", "copy")
+	} else {
+		args = append(args,
+			"-r", strconv.Itoa(fps),
+			"-c:v", "libx264",
+			"-pix_fmt", "yuv420p",
+			"-preset", "veryfast",
+			"-crf", "23",
+		)
+	}
+	args = append(args,
+		"-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+		"-f", "mp4", "pipe:1",
+	)
+	cmd := exec.CommandContext(ctx, ffmpeg, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open ffmpeg stdout: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start ffmpeg: %w", err)
+	}
+
+	var buf bytes.Buffer
+	n, readErr := io.CopyN(&buf, stdout, maxMP4OutputBytes+1)
+	if errors.Is(readErr, io.EOF) {
+		readErr = nil
+	}
+	oversized := n > maxMP4OutputBytes
+	if oversized {
+		io.Copy(io.Discard, stdout)
+	}
+
+	runErr := cmd.Wait()
+
+	if runErr != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = runErr.Error()
+		}
+		return nil, fmt.Errorf("ffmpeg concat failed: %s", msg)
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("failed to read ffmpeg concat output: %w", readErr)
+	}
+	if oversized {
+		return nil, fmt.Errorf("ffmpeg concat output exceeded %d byte limit", maxMP4OutputBytes)
+	}
+	if buf.Len() == 0 {
+		return nil, errors.New("ffmpeg concat produced no output")
+	}
+	return buf.Bytes(), nil
 }
