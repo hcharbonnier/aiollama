@@ -27,7 +27,7 @@ jobs:
           echo vendorsha=$(cat LLAMA_CPP_VERSION)-$(cat MLX_VERSION)-$(cat MLX_C_VERSION) | tee -a $GITHUB_OUTPUT
 
   darwin-build:
-    runs-on: macos-26-xlarge
+    runs-on: macos
     environment: release
     needs: setup-environment
     env:
