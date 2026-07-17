@@ -48,13 +48,16 @@ jobs:
             'LLAMA_CPP_VERSION' \
             'MLX_VERSION' \
             'MLX_C_VERSION' \
+            'SD_CPP_VERSION' \
             'llama/llama.cpp/**/*' \
             'ml/backend/ggml/ggml/**/*' \
             'x/imagegen/mlx/**' \
             'x/imagegen/mlx/**/*' \
+            'x/sdcpp/include/**' \
+            'x/sdcpp/include/**/*' \
             '.github/**/*') | tee -a $GITHUB_OUTPUT
           echo app_changed=$(changed 'app/**' 'app/**/*') | tee -a $GITHUB_OUTPUT
-          echo enginehash=$(cat LLAMA_CPP_VERSION)-$(cat MLX_VERSION)-$(cat MLX_C_VERSION) | tee -a $GITHUB_OUTPUT
+          echo enginehash=$(cat LLAMA_CPP_VERSION)-$(cat MLX_VERSION)-$(cat MLX_C_VERSION)-$(cat SD_CPP_VERSION) | tee -a $GITHUB_OUTPUT
 
   patches:
     strategy:
@@ -118,6 +121,13 @@ jobs:
             superbuild_args: '-DOLLAMA_MLX_BACKENDS=cuda_v13 -DCMAKE_CUDA_ARCHITECTURES=87 -DMLX_CUDA_ARCHITECTURES=80-virtual -DBLAS_INCLUDE_DIRS=/usr/include/x86_64-linux-gnu -DLAPACK_INCLUDE_DIRS=/usr/include/x86_64-linux-gnu'
             expected_payload: lib/ollama/mlx_cuda_v13/libmlx.so
             install-go: true
+          - preset: 'SDCPP CPU'
+            superbuild_target: ollama-sdcpp-cpu
+            superbuild_dir: build/local-superbuild-sdcpp-cpu
+            superbuild_args: '-DOLLAMA_SDCPP_BACKENDS=cpu'
+            expected_payload: lib/ollama/sdcpp/cpu/libstable-diffusion.so
+            install-go: true
+            coexist: true
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
     steps:
@@ -159,6 +169,15 @@ jobs:
           cmake -S . -B "${{ matrix.superbuild_dir }}" ${{ matrix.superbuild_args }}
           CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build "${{ matrix.superbuild_dir }}" --target "${{ matrix.superbuild_target }}" -- -l $(nproc)
           test -e "${{ matrix.superbuild_dir }}/${{ matrix.expected_payload }}"
+      - name: SD.cpp / llama.cpp coexistence symbol check
+        if: matrix.coexist
+        run: |
+          # The sdcpp-coexist target (Phase 0.4) requires both an SD.cpp backend
+          # and the llama.cpp local build in the same superbuild. Reconfigure
+          # with both enabled so the coexist test can link libstable-diffusion
+          # against libggml-base and assert no duplicate ggml_* symbols.
+          cmake -S . -B build/sdcpp-coexist -DOLLAMA_SDCPP_BACKENDS=cpu
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/sdcpp-coexist --target sdcpp-coexist -- -l $(nproc)
       - name: Verify local superbuild install
         if: matrix.superbuild_target == 'ollama-local'
         run: |
@@ -229,6 +248,12 @@ jobs:
               - '"nvvm"'
               - '"nvptxcompiler"'
             cuda-version: '13.0'
+          - preset: 'SDCPP CPU'
+            superbuild_target: ollama-sdcpp-cpu
+            superbuild_dir: build\local-superbuild-sdcpp-cpu
+            superbuild_args: '-DOLLAMA_SDCPP_BACKENDS=cpu'
+            expected_payload: lib\ollama\sdcpp\cpu\stable-diffusion.dll
+            install-go: true
     runs-on: windows-latest
     steps:
       - run: |
@@ -380,6 +405,7 @@ jobs:
             LLAMA_CPP_VERSION
             MLX_VERSION
             MLX_C_VERSION
+            SD_CPP_VERSION
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -418,3 +444,43 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
         with:
           only-new-issues: true
+
+  sdcpp-test:
+    needs: [changes]
+    if: needs.changes.outputs.changed == 'True'
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache-dependency-path: |
+            go.sum
+            LLAMA_CPP_VERSION
+            SD_CPP_VERSION
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ccache curl git build-essential
+          curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.31.2/cmake-3.31.2-linux-$(uname -m).tar.gz | sudo tar xz -C /usr/local --strip-components 1
+      - uses: actions/cache@v4
+        with:
+          path: /github/home/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-SDCPP-CPU-${{ needs.changes.outputs.enginehash }}
+      - name: Build SD.cpp CPU library
+        run: |
+          cmake -S . -B build/sdcpp-cpu -DOLLAMA_SDCPP_BACKENDS=cpu
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/sdcpp-cpu --target ollama-sdcpp-cpu -- -l $(nproc)
+          test -e build/sdcpp-cpu/lib/ollama/sdcpp/cpu/libstable-diffusion.so
+      - name: go build with sdcpp tag
+        run: |
+          CGO_LDFLAGS="-L$(pwd)/build/sdcpp-cpu/lib/ollama/sdcpp/cpu -lstable-diffusion" \
+            go build -tags=sdcpp ./...
+      - name: go test with sdcpp tag
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build/sdcpp-cpu/lib/ollama/sdcpp/cpu
+        run: |
+          CGO_LDFLAGS="-L$(pwd)/build/sdcpp-cpu/lib/ollama/sdcpp/cpu -lstable-diffusion" \
+            go test -tags=sdcpp -count=1 ./x/sdcpp/... ./x/diffgen/...

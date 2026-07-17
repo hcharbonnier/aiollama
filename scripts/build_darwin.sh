@@ -45,11 +45,12 @@ _build_darwin() {
 
     SOURCE_BUILD=build/darwin-sources
     status "Preparing shared native sources"
-    cmake -S . -B "$SOURCE_BUILD" -DOLLAMA_MLX_BACKENDS=metal_v3 -DOLLAMA_LLAMA_BACKENDS=
-    cmake --build "$SOURCE_BUILD" --target ollama-llama-cpp-source --target ollama-mlx-sources
+    cmake -S . -B "$SOURCE_BUILD" -DOLLAMA_MLX_BACKENDS=metal_v3 -DOLLAMA_LLAMA_BACKENDS= -DOLLAMA_SDCPP_BACKENDS=metal
+    cmake --build "$SOURCE_BUILD" --target ollama-llama-cpp-source --target ollama-mlx-sources --target ollama-sdcpp-source
     LLAMA_CPP_SHARED_SRC="$(pwd)/$SOURCE_BUILD/_deps/llama_cpp-src"
     MLX_SHARED_SRC="$(pwd)/$SOURCE_BUILD/_deps/mlx-src"
     MLX_C_SHARED_SRC="$(pwd)/$SOURCE_BUILD/_deps/mlx-c-src"
+    SD_CPP_SHARED_SRC="$(pwd)/$SOURCE_BUILD/_deps/stable_diffusion_cpp-src"
 
     for ARCH in $ARCHS; do
         status "Building darwin $ARCH"
@@ -79,14 +80,17 @@ _build_darwin() {
             -DOLLAMA_GO_OUTPUT=$INSTALL_PREFIX/ollama \
             -DOLLAMA_VERSION="$VERSION" \
             -DOLLAMA_MLX_BACKENDS="$MLX_BACKENDS" \
+            -DOLLAMA_SDCPP_BACKENDS=metal \
             -DOLLAMA_LLAMA_BACKENDS= \
+            -DOLLAMA_GO_TAGS=sdcpp \
             -DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP=$LLAMA_CPP_SHARED_SRC \
             -DFETCHCONTENT_SOURCE_DIR_MLX=$MLX_SHARED_SRC \
             -DFETCHCONTENT_SOURCE_DIR_MLX-C=$MLX_C_SHARED_SRC \
+            -DFETCHCONTENT_SOURCE_DIR_STABLE_DIFFUSION_CPP=$SD_CPP_SHARED_SRC \
             $MLX_EXTRA_ARGS
 
         GOOS=darwin GOARCH=$ARCH CGO_ENABLED=1 CGO_CFLAGS="$MLX_CGO_CFLAGS" CGO_LDFLAGS="$MLX_CGO_LDFLAGS" \
-            cmake --build "$BUILD_DIR" --target ollama-local --target ollama-mlx-backends --parallel "$BUILD_JOBS" -- -l "$BUILD_LOAD"
+            cmake --build "$BUILD_DIR" --target ollama-local --target ollama-mlx-backends --target ollama-sdcpp-backends --parallel "$BUILD_JOBS" -- -l "$BUILD_LOAD"
     done
 }
 
@@ -133,6 +137,37 @@ _merge_darwin_payload() {
             cp "$F" "$DEST/"
         done
     done
+
+    # Merge SD.cpp libstable-diffusion.dylib into a universal binary.
+    # The metal backend is built per-arch under lib/ollama/sdcpp/metal/.
+    SDCPP_ARM_DIR=dist/darwin-arm64/lib/ollama/sdcpp/metal
+    SDCPP_AMD_DIR=dist/darwin-amd64/lib/ollama/sdcpp/metal
+    SDCPP_DEST=dist/darwin/lib/ollama/sdcpp/metal
+    if [ -d "$SDCPP_ARM_DIR" ] || [ -d "$SDCPP_AMD_DIR" ]; then
+        mkdir -p "$SDCPP_DEST"
+        ARM_LIB="$SDCPP_ARM_DIR/libstable-diffusion.dylib"
+        AMD_LIB="$SDCPP_AMD_DIR/libstable-diffusion.dylib"
+        if [ -f "$AMD_LIB" ] && [ -f "$ARM_LIB" ]; then
+            lipo -create -output "$SDCPP_DEST/libstable-diffusion.dylib" "$AMD_LIB" "$ARM_LIB"
+        elif [ -f "$ARM_LIB" ]; then
+            cp "$ARM_LIB" "$SDCPP_DEST/"
+        elif [ -f "$AMD_LIB" ]; then
+            cp "$AMD_LIB" "$SDCPP_DEST/"
+        fi
+        # Copy non-.dylib support files (e.g. metallib) from whichever arch
+        # directory exists. These are arch-independent Metal shader blobs.
+        for _SRC_DIR in "$SDCPP_ARM_DIR" "$SDCPP_AMD_DIR"; do
+            [ -d "$_SRC_DIR" ] || continue
+            for F in "$_SRC_DIR"/*; do
+                [ -f "$F" ] || continue
+                case "$(basename "$F")" in
+                    libstable-diffusion.dylib) continue ;;
+                esac
+                cp "$F" "$SDCPP_DEST/"
+            done
+            break
+        done
+    fi
 }
 
 _prepare_darwin_runtime() {
@@ -169,7 +204,7 @@ _package_darwin_runtime() {
 _sign_darwin() {
     _prepare_darwin_runtime
     if [ -n "$APPLE_IDENTITY" ]; then
-        for F in dist/darwin/ollama dist/darwin/llama-server dist/darwin/llama-quantize dist/darwin/lib/ollama/* dist/darwin/lib/ollama/mlx_metal_v*/*; do
+        for F in dist/darwin/ollama dist/darwin/llama-server dist/darwin/llama-quantize dist/darwin/lib/ollama/* dist/darwin/lib/ollama/mlx_metal_v*/* dist/darwin/lib/ollama/sdcpp/metal/*; do
             [ -f "$F" ] && [ ! -L "$F" ] || continue
             codesign -f --timestamp -s "$APPLE_IDENTITY" --identifier ai.ollama.ollama --options=runtime "$F"
         done
@@ -246,7 +281,7 @@ _build_macapp() {
         codesign -f --timestamp -s "$APPLE_IDENTITY" --identifier ai.ollama.ollama --options=runtime dist/Ollama.app/Contents/Resources/ollama
         codesign -f --timestamp -s "$APPLE_IDENTITY" --identifier ai.ollama.ollama --options=runtime dist/Ollama.app/Contents/Resources/llama-server
         codesign -f --timestamp -s "$APPLE_IDENTITY" --identifier ai.ollama.ollama --options=runtime dist/Ollama.app/Contents/Resources/llama-quantize
-        for lib in dist/Ollama.app/Contents/Resources/*.so dist/Ollama.app/Contents/Resources/*.dylib dist/Ollama.app/Contents/Resources/*.metallib dist/Ollama.app/Contents/Resources/mlx_metal_v*/*.dylib dist/Ollama.app/Contents/Resources/mlx_metal_v*/*.metallib dist/Ollama.app/Contents/Resources/mlx_metal_v*/*.so; do
+        for lib in dist/Ollama.app/Contents/Resources/*.so dist/Ollama.app/Contents/Resources/*.dylib dist/Ollama.app/Contents/Resources/*.metallib dist/Ollama.app/Contents/Resources/mlx_metal_v*/*.dylib dist/Ollama.app/Contents/Resources/mlx_metal_v*/*.metallib dist/Ollama.app/Contents/Resources/mlx_metal_v*/*.so dist/Ollama.app/Contents/Resources/sdcpp/metal/*.dylib; do
             [ -f "$lib" ] || continue
             codesign -f --timestamp -s "$APPLE_IDENTITY" --identifier ai.ollama.ollama --options=runtime "$lib"
         done
@@ -255,7 +290,7 @@ _build_macapp() {
 
     rm -f dist/Ollama-darwin.zip
     ditto -c -k --norsrc --keepParent dist/Ollama.app dist/Ollama-darwin.zip
-    (cd dist/Ollama.app/Contents/Resources/; tar -cf - ollama llama-server llama-quantize *.so *.dylib *.metallib mlx_metal_v*/ 2>/dev/null) | gzip -9vc > dist/ollama-darwin.tgz
+    (cd dist/Ollama.app/Contents/Resources/; tar -cf - ollama llama-server llama-quantize *.so *.dylib *.metallib mlx_metal_v*/ sdcpp/ 2>/dev/null) | gzip -9vc > dist/ollama-darwin.tgz
 
     # Notarize and Staple
     if [ -n "$APPLE_IDENTITY" ]; then

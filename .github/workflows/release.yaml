@@ -24,7 +24,7 @@ jobs:
         run: |
           echo GOFLAGS="'-ldflags=-w -s \"-X=github.com/ollama/ollama/version.Version=${GITHUB_REF_NAME#v}\" \"-X=github.com/ollama/ollama/server.mode=release\"'" | tee -a $GITHUB_OUTPUT
           echo VERSION="${GITHUB_REF_NAME#v}" | tee -a $GITHUB_OUTPUT
-          echo vendorsha=$(cat LLAMA_CPP_VERSION)-$(cat MLX_VERSION)-$(cat MLX_C_VERSION) | tee -a $GITHUB_OUTPUT
+          echo vendorsha=$(cat LLAMA_CPP_VERSION)-$(cat MLX_VERSION)-$(cat MLX_C_VERSION)-$(cat SD_CPP_VERSION) | tee -a $GITHUB_OUTPUT
 
   darwin-build:
     if: false  # temporarily disabled
@@ -78,6 +78,7 @@ jobs:
             LLAMA_CPP_VERSION
             MLX_VERSION
             MLX_C_VERSION
+            SD_CPP_VERSION
       - run: |
           ./scripts/build_darwin.sh
       - name: Log build results
@@ -100,7 +101,7 @@ jobs:
         os: [windows]
         arch: [amd64]
         preset: ['CPU']
-        build-steps: ['cpu cpuArm64']
+        build-steps: ['cpu sdcpp cpuArm64']
         include:
           - os: windows
             arch: amd64
@@ -305,7 +306,7 @@ jobs:
     if: false  # temporarily disabled
     runs-on: windows-latest
     environment: release
-    needs: [setup-environment]
+    needs: [setup-environment, windows-depends]
     env:
       GOFLAGS: ${{ needs.setup-environment.outputs.GOFLAGS }}
       VERSION: ${{ needs.setup-environment.outputs.VERSION }}
@@ -322,6 +323,11 @@ jobs:
             throw "llvm-mingw x86_64 package is missing the aarch64 cross compiler"
           }
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: depends-windows*
+          path: dist
+          merge-multiple: true
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -330,6 +336,7 @@ jobs:
             LLAMA_CPP_VERSION
             MLX_VERSION
             MLX_C_VERSION
+            SD_CPP_VERSION
       - name: Verify gcc is actually clang
         run: |
           $ErrorActionPreference='Continue'
@@ -399,6 +406,7 @@ jobs:
             LLAMA_CPP_VERSION
             MLX_VERSION
             MLX_C_VERSION
+            SD_CPP_VERSION
       - uses: actions/download-artifact@v4
         with:
           pattern: depends-windows*
@@ -454,16 +462,28 @@ jobs:
             target: llama-server-rocm_v7_2
           - arch: amd64
             target: llama-server-vulkan
-          - arch: arm64
-            target: llama-server-cpu
-          - arch: arm64
-            target: llama-server-cuda_v12
-          - arch: arm64
-            target: llama-server-cuda_v13
-          - arch: arm64
-            target: jetpack-5
-          - arch: arm64
-            target: jetpack-6
+          - arch: amd64
+            target: sdcpp-cpu
+          - arch: amd64
+            target: sdcpp-cuda_v12
+          - arch: amd64
+            target: sdcpp-cuda_v13
+          - arch: amd64
+            target: sdcpp-vulkan
+          # arm64 builds temporarily disabled — the sdcpp-tagged default Go
+          # binary requires libstable-diffusion at link/runtime, and arm64
+          # SD.cpp stages are not yet wired into the Dockerfile assembly.
+          # Re-enable when arm64 sdcpp-cpu is added to the Dockerfile.
+          # - arch: arm64
+          #   target: llama-server-cpu
+          # - arch: arm64
+          #   target: llama-server-cuda_v12
+          # - arch: arm64
+          #   target: llama-server-cuda_v13
+          # - arch: arm64
+          #   target: jetpack-5
+          # - arch: arm64
+          #   target: jetpack-6
     runs-on: ubuntu-latest
     environment: release
     needs: setup-environment
@@ -505,24 +525,28 @@ jobs:
       max-parallel: 4
       matrix:
         include:
-          - os: linux
-            arch: arm64
-            archive-target: archive
-            build-args: |
-              CGO_CFLAGS
-              CGO_CXXFLAGS
-              GOFLAGS
-              APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu
-              APT_PORTS_MIRROR=http://azure.ports.ubuntu.com/ubuntu-ports
-              OLLAMA_MLX_BUILD_JOBS=1
-              OLLAMA_MLX_NVCC_THREADS=1
-            cache-from: |
-              type=registry,ref=aiollama/release-cache:cache-arm64-llama-server-cpu
-              type=registry,ref=aiollama/release-cache:cache-arm64-llama-server-cuda_v12
-              type=registry,ref=aiollama/release-cache:cache-arm64-llama-server-cuda_v13
-              type=registry,ref=aiollama/release-cache:cache-arm64-jetpack-5
-              type=registry,ref=aiollama/release-cache:cache-arm64-jetpack-6
-              type=registry,ref=${{ vars.DOCKER_REPO }}:latest
+          # arm64 temporarily disabled — the default sdcpp-tagged Go binary
+          # requires libstable-diffusion at link/runtime, and arm64 SD.cpp
+          # stages are not yet in the Dockerfile assembly. Re-enable when
+          # arm64 sdcpp-cpu is added.
+          # - os: linux
+          #   arch: arm64
+          #   archive-target: archive
+          #   build-args: |
+          #     CGO_CFLAGS
+          #     CGO_CXXFLAGS
+          #     GOFLAGS
+          #     APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu
+          #     APT_PORTS_MIRROR=http://azure.ports.ubuntu.com/ubuntu-ports
+          #     OLLAMA_MLX_BUILD_JOBS=1
+          #     OLLAMA_MLX_NVCC_THREADS=1
+          #   cache-from: |
+          #     type=registry,ref=aiollama/release-cache:cache-arm64-llama-server-cpu
+          #     type=registry,ref=aiollama/release-cache:cache-arm64-llama-server-cuda_v12
+          #     type=registry,ref=aiollama/release-cache:cache-arm64-llama-server-cuda_v13
+          #     type=registry,ref=aiollama/release-cache:cache-arm64-jetpack-5
+          #     type=registry,ref=aiollama/release-cache:cache-arm64-jetpack-6
+          #     type=registry,ref=${{ vars.DOCKER_REPO }}:latest
           - os: linux
             arch: amd64
             archive-target: archive
@@ -541,6 +565,10 @@ jobs:
               type=registry,ref=aiollama/release-cache:cache-amd64-mlx
               type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-rocm_v7_2
               type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-vulkan
+              type=registry,ref=aiollama/release-cache:cache-amd64-sdcpp-cpu
+              type=registry,ref=aiollama/release-cache:cache-amd64-sdcpp-cuda_v12
+              type=registry,ref=aiollama/release-cache:cache-amd64-sdcpp-cuda_v13
+              type=registry,ref=aiollama/release-cache:cache-amd64-sdcpp-vulkan
               type=registry,ref=${{ vars.DOCKER_REPO }}:latest
           - os: linux
             arch: amd64
@@ -558,6 +586,7 @@ jobs:
             cache-from: |
               type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-cpu
               type=registry,ref=aiollama/release-cache:cache-amd64-llama-server-rocm_v7_2
+              type=registry,ref=aiollama/release-cache:cache-amd64-sdcpp-cpu
               type=registry,ref=${{ vars.DOCKER_REPO }}:latest
     runs-on: ubuntu-latest
     environment: release
@@ -624,6 +653,7 @@ jobs:
               lib/ollama/llama-server*|lib/ollama/llama-quantize*)  echo $COMPONENT >>ollama-${{ matrix.os }}-${{ matrix.arch }}.tar.in ;;
               lib/ollama/cuda_v*)        echo $COMPONENT >>ollama-${{ matrix.os }}-${{ matrix.arch }}.tar.in ;;
               lib/ollama/vulkan*)        echo $COMPONENT >>ollama-${{ matrix.os }}-${{ matrix.arch }}.tar.in ;;
+              lib/ollama/sdcpp*)         echo $COMPONENT >>ollama-${{ matrix.os }}-${{ matrix.arch }}.tar.in ;;
               lib/ollama/mlx*)           echo $COMPONENT >>ollama-${{ matrix.os }}-${{ matrix.arch }}-mlx.tar.in ;;
               lib/ollama/include*)       echo $COMPONENT >>ollama-${{ matrix.os }}-${{ matrix.arch }}-mlx.tar.in ;;
               lib/ollama/cuda_jetpack5)  echo $COMPONENT >>ollama-${{ matrix.os }}-${{ matrix.arch }}-jetpack5.tar.in ;;
@@ -686,7 +716,13 @@ jobs:
         working-directory: ${{ runner.temp }}
 
   # Final release process
+  # NOTE: darwin-build and windows-app are temporarily disabled (if: false).
+  # arm64 Docker builds are also disabled. This release job therefore publishes
+  # an amd64-Linux-only release. Re-enable the disabled jobs and re-add
+  # ollama-linux-arm64.tar.zst to the required artifacts when restoring
+  # full platform coverage.
   release:
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     environment: release
     needs: [darwin-build, windows-app, docker-build-push]
@@ -712,8 +748,8 @@ jobs:
           required=(
             dist/install.sh
             dist/ollama-linux-amd64.tar.zst
-            dist/ollama-linux-arm64.tar.zst
           )
+          # arm64 temporarily disabled (see docker-build-push matrix)
           for payload in "${required[@]}"; do
             if [ ! -f "$payload" ]; then
               echo "::error::Missing expected release artifact: $payload"

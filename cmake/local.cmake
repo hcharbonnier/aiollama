@@ -14,6 +14,8 @@ set(OLLAMA_SDCPP_BACKENDS "" CACHE STRING "${_ollama_sdcpp_backends_doc}")
 set(OLLAMA_VERSION "0.0.0" CACHE STRING "Ollama version embedded in the local Go binary")
 set(OLLAMA_PAYLOAD_INSTALL_PREFIX "${CMAKE_BINARY_DIR}" CACHE PATH
     "Build-time staging prefix for nested Ollama native payloads")
+set(OLLAMA_GO_TAGS "" CACHE STRING
+    "Space-separated Go build tags to pass to the local ollama-go target (e.g. 'sdcpp')")
 
 string(REGEX REPLACE "^v" "" OLLAMA_VERSION "${OLLAMA_VERSION}")
 
@@ -685,14 +687,57 @@ if(OLLAMA_HAVE_LLAMA_SERVER)
 
     set(OLLAMA_GO_LDFLAGS
         "-s -w -X=github.com/ollama/ollama/version.Version=${OLLAMA_VERSION} -X=github.com/ollama/ollama/server.mode=release")
+    # When OLLAMA_GO_TAGS contains "sdcpp", the Go binary links
+    # libstable-diffusion directly via CGO. Point CGO_LDFLAGS at the SD.cpp
+    # payload install prefix so the linker can resolve -lstable-diffusion.
+    set(_ollama_go_env CGO_ENABLED=1)
+    set(_ollama_go_depends)
+    if(OLLAMA_GO_TAGS MATCHES "sdcpp")
+        set(_sdcpp_lib_dir "${OLLAMA_PAYLOAD_INSTALL_PREFIX}/${OLLAMA_LIB_DIR}/sdcpp")
+        # The per-backend subdirectory depends on which SD.cpp backend was
+        # built. At configure time the library may not exist yet (it is built
+        # by ExternalProject_Add at build time), so we probe all candidates
+        # and use the first match. If none exist yet (clean build), we fall
+        # back to "cpu" as the default and rely on the build dependency
+        # (ollama-sdcpp-backends) to ensure the library is present at link
+        # time.
+        set(_sdcpp_backend_dir "cpu")
+        foreach(_candidate cpu metal vulkan cuda_v12 cuda_v13)
+            if(EXISTS "${_sdcpp_lib_dir}/${_candidate}/${CMAKE_SHARED_LIBRARY_PREFIX}stable-diffusion${CMAKE_SHARED_LIBRARY_SUFFIX}")
+                set(_sdcpp_backend_dir "${_candidate}")
+                break()
+            endif()
+        endforeach()
+        set(_sdcpp_cgo_ldflags "-L${_sdcpp_lib_dir}/${_sdcpp_backend_dir} -lstable-diffusion")
+        # Append the pre-existing CGO_LDFLAGS from the environment (e.g.
+        # -mmacosx-version-min=14.0 set by build_darwin.sh) so platform-
+        # specific linker flags are not silently dropped when cmake -E env
+        # sets CGO_LDFLAGS for the child process.
+        if(DEFINED ENV{CGO_LDFLAGS} AND NOT "$ENV{CGO_LDFLAGS}" STREQUAL "")
+            set(_sdcpp_cgo_ldflags "${_sdcpp_cgo_ldflags} $ENV{CGO_LDFLAGS}")
+        endif()
+        set(_ollama_go_env ${_ollama_go_env} "CGO_LDFLAGS=${_sdcpp_cgo_ldflags}")
+        # Ensure the SD.cpp libraries are built before the Go binary links
+        # against them. Without this, ollama-go can execute before the
+        # ExternalProject_Add targets install libstable-diffusion, causing
+        # a non-deterministic link failure.
+        if(_sdcpp_targets)
+            set(_ollama_go_depends ollama-sdcpp-backends)
+        endif()
+    endif()
+    set(_ollama_go_tags_arg)
+    if(OLLAMA_GO_TAGS)
+        set(_ollama_go_tags_arg "-tags=${OLLAMA_GO_TAGS}")
+    endif()
     if(GO_EXECUTABLE)
         add_custom_target(ollama-go ALL
             COMMAND ${CMAKE_COMMAND} -E make_directory "${OLLAMA_GO_OUTPUT_DIR}"
-            COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=1
-                ${GO_EXECUTABLE} build -trimpath -ldflags "${OLLAMA_GO_LDFLAGS}" -o "${OLLAMA_GO_OUTPUT}" .
+            COMMAND ${CMAKE_COMMAND} -E env ${_ollama_go_env}
+                ${GO_EXECUTABLE} build -trimpath ${_ollama_go_tags_arg} -ldflags "${OLLAMA_GO_LDFLAGS}" -o "${OLLAMA_GO_OUTPUT}" .
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
             BYPRODUCTS ${OLLAMA_GO_OUTPUT}
             COMMENT "Building Ollama Go binary"
+            DEPENDS ${_ollama_go_depends}
             VERBATIM)
     else()
         add_custom_target(ollama-go ALL

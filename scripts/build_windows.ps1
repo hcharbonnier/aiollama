@@ -509,6 +509,48 @@ function vulkan {
     }
 }
 
+function sdcpp {
+    # Build the SD.cpp CPU backend (libstable-diffusion.dll). Required so the
+    # sdcpp-tagged Go binary can link and load it at runtime. The library is
+    # installed into lib\ollama\sdcpp\cpu\ alongside the other payloads.
+    mkdir -Force -path "${script:DIST_DIR}\" | Out-Null
+    if ($script:ARCH -ne "arm64") {
+        Write-Output "Building SD.cpp CPU backend"
+        $oldCC = $env:CC
+        $oldCXX = $env:CXX
+        try {
+            if (-not $env:CC -and -not $env:CXX) {
+                $cpuCompiler = findWindowsCPUCompiler
+                if ($cpuCompiler) {
+                    $env:CC = $cpuCompiler.CC
+                    $env:CXX = $cpuCompiler.CXX
+                    Write-Output "Using $($cpuCompiler.Name) for SD.cpp CPU backend"
+                } else {
+                    Write-Output "WARNING: llvm-mingw/MSYS2 compiler not found; SD.cpp CPU backend will be skipped"
+                    return
+                }
+            }
+            & cmake -S . -B build\sdcpp-cpu -DOLLAMA_SDCPP_BACKENDS=cpu --install-prefix $script:DIST_DIR
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+            & cmake --build build\sdcpp-cpu --target ollama-sdcpp-cpu --config Release --parallel $script:JOBS
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+            & cmake --install build\sdcpp-cpu --component sdcpp --strip
+            if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+        } finally {
+            if ($null -eq $oldCC) {
+                Remove-Item Env:CC -ErrorAction SilentlyContinue
+            } else {
+                $env:CC = $oldCC
+            }
+            if ($null -eq $oldCXX) {
+                Remove-Item Env:CXX -ErrorAction SilentlyContinue
+            } else {
+                $env:CXX = $oldCXX
+            }
+        }
+    }
+}
+
 function mlxCuda13 {
     mkdir -Force -path "${script:DIST_DIR}\" | Out-Null
     $cudaMajorVer="13"
@@ -611,8 +653,30 @@ function buildOllamaCLI {
         [string]$distDir
     )
     mkdir -Force -path "${distDir}\" | Out-Null
-    & go build -trimpath -ldflags "-s -w -X=github.com/ollama/ollama/version.Version=$script:VERSION -X=github.com/ollama/ollama/server.mode=release" -o "${distDir}\ollama.exe" .
-    if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+    # Build with -tags=sdcpp so the binary supports diffgen (image/video)
+    # models. The SD.cpp CPU library (stable-diffusion.dll) must be resolvable
+    # at link time via CGO_LDFLAGS and at runtime (co-located DLL or PATH).
+    $sdcppLibDir = "${script:DIST_DIR}\lib\ollama\sdcpp\cpu"
+    $cgoLdflags = $env:CGO_LDFLAGS
+    $sdcppAvailable = Test-Path "${sdcppLibDir}\stable-diffusion.dll"
+    if ($sdcppAvailable) {
+        $env:CGO_LDFLAGS = "${cgoLdflags} -L${sdcppLibDir} -lstable-diffusion"
+    }
+    try {
+        if ($sdcppAvailable) {
+            & go build -trimpath -tags=sdcpp -ldflags "-s -w -X=github.com/ollama/ollama/version.Version=$script:VERSION -X=github.com/ollama/ollama/server.mode=release" -o "${distDir}\ollama.exe" .
+        } else {
+            Write-Output "WARNING: SD.cpp library not found at ${sdcppLibDir}; building without sdcpp tag"
+            & go build -trimpath -ldflags "-s -w -X=github.com/ollama/ollama/version.Version=$script:VERSION -X=github.com/ollama/ollama/server.mode=release" -o "${distDir}\ollama.exe" .
+        }
+        if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE)}
+    } finally {
+        if ($null -eq $cgoLdflags) {
+            Remove-Item Env:CGO_LDFLAGS -ErrorAction SilentlyContinue
+        } else {
+            $env:CGO_LDFLAGS = $cgoLdflags
+        }
+    }
 }
 
 function ollama {
@@ -967,6 +1031,7 @@ try {
         rocm7
         vulkan
         mlxCuda13
+        sdcpp
         ollama
         app
         cpuArm64

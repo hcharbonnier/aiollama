@@ -243,9 +243,10 @@ COPY --from=mlx /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
 # These reuse the same toolchain stages as the llama-server GPU backends
 # (compiler + CMake/Ninja from `base`; CUDA from cuda-12-deps/cuda-13-deps;
 # Vulkan SDK from vulkan-deps) — no additional build dependencies are
-# required. Not wired into the default image assembly (see "Assembly
-# stages" below); build explicitly with e.g.
-# `docker build --target publish-sdcpp-cpu`.
+# required. The SD.cpp CPU library is linked into the default Go binary
+# (build stage) via -tags=sdcpp, and all sdcpp-* payloads are copied into
+# the final image by the amd64 assembly stage. Individual backends can also
+# be built explicitly with e.g. `docker build --target publish-sdcpp-cpu`.
 #
 
 FROM cpu-deps AS sdcpp-cpu
@@ -317,33 +318,36 @@ ARG CGO_CFLAGS
 ARG CGO_CXXFLAGS
 ENV CGO_CFLAGS="${CGO_CFLAGS}"
 ENV CGO_CXXFLAGS="${CGO_CXXFLAGS}"
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    go build -trimpath -buildmode=pie -o /bin/ollama .
-
-FROM scratch AS publish-go
-COPY --from=build /bin/ollama /bin/ollama
-
-#
-# Go build (sdcpp-enabled) — optional, additive target for a diffgen-capable
-# binary. x/sdcpp links libstable-diffusion directly (unlike the dlopen-based
-# MLX bridge), so the resulting binary requires libstable-diffusion.so to be
-# resolvable at runtime (e.g. via LD_LIBRARY_PATH pointing at a
-# publish-sdcpp-* payload). Not part of the default build/publish-go target
-# or any final image; build explicitly with
-# `docker build --target publish-go-sdcpp`.
-#
-
-FROM build AS build-sdcpp
+# Build the default Go binary with -tags=sdcpp so the released ollama binary
+# supports diffgen (image/video) models out of the box. The SD.cpp CPU library
+# is linked directly via CGO (not dlopen), so it must be resolvable at link
+# time (bind-mounted from the sdcpp-cpu stage below) and at runtime (copied
+# into the final image by the assembly stages).
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=bind,from=sdcpp-cpu,source=/go/src/github.com/ollama/ollama/dist/lib/ollama/sdcpp/cpu,target=/tmp/sdcpp-cpu \
     CGO_LDFLAGS="${CGO_LDFLAGS} -L/tmp/sdcpp-cpu -lstable-diffusion" \
     go build -trimpath -tags=sdcpp -buildmode=pie -o /bin/ollama .
 
-FROM scratch AS publish-go-sdcpp
-COPY --from=build-sdcpp /bin/ollama /bin/ollama
+FROM scratch AS publish-go
+COPY --from=build /bin/ollama /bin/ollama
 
 #
-# Assembly stages — combine llama-server variants + GPU runtime libs
+# Go build (sdcpp-disabled) — legacy fallback target for a diffgen-incapable
+# binary, kept for environments that cannot ship libstable-diffusion. Not part
+# of the default release image; build explicitly with
+# `docker build --target publish-go-nosdcpp`.
+#
+
+FROM build AS build-nosdcpp
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go build -trimpath -buildmode=pie -o /bin/ollama-nosdcpp .
+
+FROM scratch AS publish-go-nosdcpp
+COPY --from=build-nosdcpp /bin/ollama-nosdcpp /bin/ollama
+
+#
+# Assembly stages — combine llama-server variants + GPU runtime libs + SD.cpp
+# libs. The SD.cpp CPU library is required by the sdcpp-tagged Go binary.
 #
 
 FROM --platform=linux/amd64 scratch AS amd64
@@ -351,7 +355,11 @@ COPY --from=llama-server-cpu      dist/lib/ollama /lib/ollama/
 COPY --from=llama-server-cuda_v12 dist/lib/ollama /lib/ollama/
 COPY --from=llama-server-cuda_v13 dist/lib/ollama /lib/ollama/
 COPY --from=llama-server-vulkan   dist/lib/ollama /lib/ollama/
-COPY --from=mlx     /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
+COPY --from=mlx                   /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
+COPY --from=sdcpp-cpu      /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
+COPY --from=sdcpp-cuda_v12 /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
+COPY --from=sdcpp-cuda_v13 /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
+COPY --from=sdcpp-vulkan   /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
 
 FROM --platform=linux/arm64 scratch AS arm64
 COPY --from=llama-server-cpu dist/lib/ollama /lib/ollama/
