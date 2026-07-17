@@ -448,14 +448,10 @@ func TestDiffgenImportFromDirectory(t *testing.T) {
 		t.Errorf("imported model %q not found in model list", modelName)
 	}
 
-	// Verify the model can be shown (manifest is valid). This is non-fatal
-	// because the show handler has a known issue with sdcpp video models
-	// (returns 404 despite the model being listed in /api/tags); the import
-	// itself is validated by the /api/tags check above.
+	// Verify the model can be shown (manifest is valid).
 	show, err := client.Show(ctx, &api.ShowRequest{Name: modelName})
 	if err != nil {
-		t.Logf("show model %s failed (non-fatal for sdcpp video models): %v", modelName, err)
-	} else {
-		t.Logf("imported model %s: capabilities=%v", modelName, show.Details.Families)
+		t.Fatalf("show model %s: %v", modelName, err)
 	}
+	t.Logf("imported model %s: capabilities=%v", modelName, show.Details.Families)
 }

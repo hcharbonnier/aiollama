@@ -425,7 +425,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 	// Handle image and video generation models
 	if slices.Contains(m.Capabilities(), model.CapabilityImage) || slices.Contains(m.Capabilities(), model.CapabilityVideo) {
-		s.handleImageGenerate(c, req, name.String(), checkpointStart)
+		s.handleImageGenerate(c, req, m, checkpointStart)
 		return
 	}
 
@@ -1533,7 +1533,7 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 		return resp, nil
 	}
 
-	if slices.Contains(m.Capabilities(), model.CapabilityImage) {
+	if slices.Contains(m.Capabilities(), model.CapabilityImage) || slices.Contains(m.Capabilities(), model.CapabilityVideo) {
 		// Populate tensor info if verbose
 		if req.Verbose {
 			if tensors, err := xserver.GetSafetensorsTensorInfo(name); err == nil {
@@ -3148,9 +3148,11 @@ func filterThinkTags(msgs []api.Message, m *Model) []api.Message {
 	return msgs
 }
 
-// handleImageGenerate handles image generation requests within GenerateHandler.
-// This is called when the model has the Image capability.
-func (s *Server) handleImageGenerate(c *gin.Context, req api.GenerateRequest, modelName string, checkpointStart time.Time) {
+// handleImageGenerate handles image and video generation requests within
+// GenerateHandler. This is called when the model has the Image or Video
+// capability. The pre-loaded model is passed from GenerateHandler to avoid
+// a redundant GetModel call.
+func (s *Server) handleImageGenerate(c *gin.Context, req api.GenerateRequest, modelLoaded *Model, checkpointStart time.Time) {
 	// Validate image dimensions
 	const maxDimension int32 = 4096
 	if req.Width > maxDimension || req.Height > maxDimension {
@@ -3158,19 +3160,13 @@ func (s *Server) handleImageGenerate(c *gin.Context, req api.GenerateRequest, mo
 		return
 	}
 
-	// Load the model to determine its capabilities before scheduling.
-	modelLoaded, err := GetModel(modelName)
-	if err != nil {
-		handleScheduleError(c, req.Model, err)
-		return
-	}
 	// Schedule the runner for image/video generation. Pass the capability the
 	// model actually has so the scheduler's CheckCapabilities accepts it.
 	genCaps := []model.Capability{model.CapabilityImage}
 	if slices.Contains(modelLoaded.Capabilities(), model.CapabilityVideo) {
 		genCaps = []model.Capability{model.CapabilityVideo}
 	}
-	runner, m, _, err := s.scheduleRunner(c.Request.Context(), modelName, genCaps, nil, req.KeepAlive, nil)
+	runner, m, _, err := s.scheduleRunner(c.Request.Context(), modelLoaded.Name, genCaps, nil, req.KeepAlive, nil)
 	if err != nil {
 		handleScheduleError(c, req.Model, err)
 		return

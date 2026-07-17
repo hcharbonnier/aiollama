@@ -1660,15 +1660,17 @@ production quality.
   completion path and returned `"%q does not support generate"`. The handler
   now also dispatches video-capable models to `handleImageGenerate`, and
   `handleImageGenerate` passes the correct capability (`video` vs `image`) to
-  `scheduleRunner` so `CheckCapabilities` accepts it. `CheckCapabilities`
-  was extended with `CapabilityVideo` → `errCapabilityVideo` in the capability
-  error map.
-- **Known issue (non-blocking):** `ollama show <video-model>` returns 404
-  despite the model being listed in `/api/tags`. This affects only the show
-  handler for sdcpp video models; image sdcpp models show correctly. The
-  import and generation paths are unaffected. The `TestDiffgenImportFromDirectory`
-  test treats this as non-fatal (logs a warning) since the model's presence
-  in `/api/tags` validates the import.
+  `scheduleRunner` so `CheckCapabilities` accepts it. The pre-loaded `*Model`
+  is passed from `GenerateHandler` to `handleImageGenerate` to avoid a
+  redundant `GetModel` call. `CheckCapabilities` was extended with
+  `CapabilityVideo` → `errCapabilityVideo` in the capability error map.
+- **Show handler video fix.** `GetModelInfo` previously returned early for
+  `CapabilityImage` models (skipping GGUF tensor metadata loading), but video
+  models fell through to `getModelData(m.ModelPath, ...)` with an empty
+  `ModelPath` (sdcpp models have no `application/vnd.ollama.image.model`
+  layer), causing `stat : no such file or directory` → 404. The early-return
+  check now also covers `CapabilityVideo`, so `ollama show <video-model>`
+  works correctly.
 
 ##### Test models (CPU-only, 2-bit quantized where available)
 
