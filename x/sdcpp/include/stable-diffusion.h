@@ -1,32 +1,28 @@
+#ifndef __STABLE_DIFFUSION_H__
+#define __STABLE_DIFFUSION_H__
+
 // stable-diffusion.h
 //
-// Vendored subset of the stable-diffusion.cpp public C API surface, used by
-// the CGO bridge in x/sdcpp. This mirrors the declarations from
+// Vendored copy of the stable-diffusion.cpp public C API header, used by the
+// CGO bridge in x/sdcpp. This mirrors the declarations from
 // https://github.com/leejet/stable-diffusion.cpp so the Go package can compile
 // against the installed libstable-diffusion shared library without the full
 // upstream source tree.
 //
 // The real header is fetched at CMake configure time; if present it takes
-// precedence. This vendored copy provides the API contract the bridge targets.
-#pragma once
-
-#include <stdint.h>
-#include <stdbool.h>
-#include <stddef.h>
-
-#ifdef __cplusplus
-extern "C" {
-#endif
+// precedence. This vendored copy must be kept in sync with the SD.cpp version
+// pinned in SD_CPP_VERSION to avoid ABI mismatches (the struct layouts below
+// are the ABI contract the Go bridge compiles against).
 
 #if defined(_WIN32) || defined(__CYGWIN__)
-#if defined(SD_BUILD_SHARED_LIBS)
-#if defined(sd_EXPORTS)
+#ifndef SD_BUILD_SHARED_LIB
+#define SD_API
+#else
+#ifdef SD_BUILD_DLL
 #define SD_API __declspec(dllexport)
 #else
 #define SD_API __declspec(dllimport)
 #endif
-#else
-#define SD_API
 #endif
 #else
 #if __GNUC__ >= 4
@@ -36,38 +32,93 @@ extern "C" {
 #endif
 #endif
 
-typedef struct sd_ctx_t sd_ctx_t;
-typedef struct sd_image_t sd_image_t;
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-struct sd_image_t {
-    int width;
-    int height;
-    int channel;
-    uint8_t* data;
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+enum rng_type_t {
+    STD_DEFAULT_RNG,
+    CUDA_RNG,
+    CPU_RNG,
+    RNG_TYPE_COUNT
 };
 
-typedef struct sd_audio_t {
-    uint32_t sample_rate;
-    uint32_t sample_count;
-    uint16_t channel_count;
-    uint8_t* data;
-} sd_audio_t;
+enum sample_method_t {
+    EULER_SAMPLE_METHOD,
+    EULER_A_SAMPLE_METHOD,
+    HEUN_SAMPLE_METHOD,
+    DPM2_SAMPLE_METHOD,
+    DPMPP2S_A_SAMPLE_METHOD,
+    DPMPP2M_SAMPLE_METHOD,
+    DPMPP2Mv2_SAMPLE_METHOD,
+    IPNDM_SAMPLE_METHOD,
+    IPNDM_V_SAMPLE_METHOD,
+    LCM_SAMPLE_METHOD,
+    DDIM_TRAILING_SAMPLE_METHOD,
+    TCD_SAMPLE_METHOD,
+    RES_MULTISTEP_SAMPLE_METHOD,
+    RES_2S_SAMPLE_METHOD,
+    ER_SDE_SAMPLE_METHOD,
+    EULER_CFG_PP_SAMPLE_METHOD,
+    EULER_A_CFG_PP_SAMPLE_METHOD,
+    EULER_GE_SAMPLE_METHOD,
+    DPMPP2M_SDE_SAMPLE_METHOD,
+    DPMPP2M_SDE_BT_SAMPLE_METHOD,
+    SAMPLE_METHOD_COUNT
+};
 
-typedef enum {
+enum scheduler_t {
+    DISCRETE_SCHEDULER,
+    KARRAS_SCHEDULER,
+    EXPONENTIAL_SCHEDULER,
+    AYS_SCHEDULER,
+    GITS_SCHEDULER,
+    SGM_UNIFORM_SCHEDULER,
+    SIMPLE_SCHEDULER,
+    SMOOTHSTEP_SCHEDULER,
+    KL_OPTIMAL_SCHEDULER,
+    LCM_SCHEDULER,
+    BONG_TANGENT_SCHEDULER,
+    LTX2_SCHEDULER,
+    LOGIT_NORMAL_SCHEDULER,
+    FLUX2_SCHEDULER,
+    FLUX_SCHEDULER,
+    BETA_SCHEDULER,
+    SCHEDULER_COUNT
+};
+
+enum prediction_t {
+    EPS_PRED,
+    V_PRED,
+    EDM_V_PRED,
+    FLOW_PRED,
+    FLUX_FLOW_PRED,
+    SEFI_FLOW_PRED,
+    MINIT2I_FLOW_PRED,
+    PREDICTION_COUNT
+};
+
+// same as enum ggml_type
+enum sd_type_t {
     SD_TYPE_F32  = 0,
     SD_TYPE_F16  = 1,
     SD_TYPE_Q4_0 = 2,
     SD_TYPE_Q4_1 = 3,
-    SD_TYPE_Q5_0 = 6,
-    SD_TYPE_Q5_1 = 7,
-    SD_TYPE_Q8_0 = 8,
-    SD_TYPE_Q8_1 = 9,
-    SD_TYPE_Q2_K = 10,
-    SD_TYPE_Q3_K = 11,
-    SD_TYPE_Q4_K = 12,
-    SD_TYPE_Q5_K = 13,
-    SD_TYPE_Q6_K = 14,
-    SD_TYPE_Q8_K = 15,
+    SD_TYPE_Q5_0    = 6,
+    SD_TYPE_Q5_1    = 7,
+    SD_TYPE_Q8_0    = 8,
+    SD_TYPE_Q8_1    = 9,
+    SD_TYPE_Q2_K    = 10,
+    SD_TYPE_Q3_K    = 11,
+    SD_TYPE_Q4_K    = 12,
+    SD_TYPE_Q5_K    = 13,
+    SD_TYPE_Q6_K    = 14,
+    SD_TYPE_Q8_K    = 15,
     SD_TYPE_IQ2_XXS = 16,
     SD_TYPE_IQ2_XS  = 17,
     SD_TYPE_IQ3_XXS = 18,
@@ -81,97 +132,62 @@ typedef enum {
     SD_TYPE_I32     = 26,
     SD_TYPE_I64     = 27,
     SD_TYPE_F64     = 28,
-    SD_TYPE_BF16    = 29,
-    SD_TYPE_COUNT,
-} sd_type_t;
+    SD_TYPE_IQ1_M   = 29,
+    SD_TYPE_BF16    = 30,
+    SD_TYPE_TQ1_0 = 34,
+    SD_TYPE_TQ2_0 = 35,
+    SD_TYPE_MXFP4 = 39,
+    SD_TYPE_NVFP4 = 40,
+    SD_TYPE_Q1_0  = 41,
+    SD_TYPE_COUNT = 42,
+};
 
-typedef enum {
-    SD_SAMPLE_EULER_A = 0,
-    SD_SAMPLE_EULER   = 1,
-    SD_SAMPLE_HEUN    = 2,
-    SD_SAMPLE_DPM2    = 3,
-    SD_SAMPLE_DPMPP2M = 4,
-    SD_SAMPLE_DPMPP2M_A = 5,
-    SD_SAMPLE_LCM     = 6,
-    SD_SAMPLE_DPMPP_SDE = 7,
-    SD_SAMPLE_DPM_FAST = 8,
-    SD_SAMPLE_DPM_ADAPTIVE = 9,
-    SD_SAMPLE_TCD = 10,
-    SD_SAMPLE_EULER_A_TRAILING = 11,
-    SD_SAMPLE_EULER_TRAILING = 12,
-} sd_sample_method_t;
+enum sd_log_level_t {
+    SD_LOG_DEBUG,
+    SD_LOG_INFO,
+    SD_LOG_WARN,
+    SD_LOG_ERROR
+};
 
-typedef enum {
-    SD_SCHEDULER_DEFAULT = 0,
-    SD_SCHEDULER_DISCRETE = 1,
-    SD_SCHEDULER_KARRAS = 2,
-    SD_SCHEDULER_EXPONENTIAL = 3,
-    SD_SCHEDULER_AYS = 4,
-    SD_SCHEDULER_GITS = 5,
-    SD_SCHEDULER_BETA = 6,
-    SD_SCHEDULER_SIMPLE = 7,
-    SD_SCHEDULER_UNIFORM = 8,
-} sd_schedule_t;
+enum preview_t {
+    PREVIEW_NONE,
+    PREVIEW_PROJ,
+    PREVIEW_TAE,
+    PREVIEW_VAE,
+    PREVIEW_COUNT
+};
 
-typedef enum {
-    SD_PREVIEW_NATIVE = 0,
-    SD_PREVIEW_ACCURATE = 1,
-} preview_t;
-
-typedef enum {
-    SD_CANCEL_NONE = 0,
-    SD_CANCEL_IMAGE = 1,
-    SD_CANCEL_ALL = 2,
-} sd_cancel_mode_t;
+enum lora_apply_mode_t {
+    LORA_APPLY_AUTO,
+    LORA_APPLY_IMMEDIATELY,
+    LORA_APPLY_AT_RUNTIME,
+    LORA_APPLY_MODE_COUNT,
+};
 
 typedef struct {
-    int sample_steps;
-    int thread_count;
-    float cfg_scale;
-    float guidance;
-    float clip_skip;
-    sd_sample_method_t sample_method;
-    sd_schedule_t schedule;
-    float flow_shift;
-    float old_rate_coef;
-    float omega_at_x0;
-    float omega_at_xt;
-    float omega_at_vt;
-    int smpt_at;
-    int smpt_at_dynamic_thresholding_max;
-    float vary_at_x0;
-    int vary_at_xt;
-    float x0_weight;
-    int xt_weight;
-    float eta;
-    int discrete_flow_shift;
-    int neg_tau_at_x0;
-    float neg_tau_at_xt;
-    int use_karras;
-    int use_beta_dy_shift;
-    float beta_dy_shift_strength;
-} sd_sample_params_t;
-
-typedef struct {
-    int enable;
-    int upscale_factor;
-    float strength;
-    float denoise;
-    float scale_emphasis;
+    bool enabled;
+    bool temporal_tiling;
+    int tile_size_x;
+    int tile_size_y;
+    float target_overlap;
+    float rel_size_x;
+    float rel_size_y;
+    const char* extra_tiling_args;
 } sd_tiling_params_t;
 
 typedef struct {
-    bool no_unload;
-    bool model_offload;
-    float moe_boundary;
-    float vace_strength;
-    bool use_cache;
-    bool keep_model_loaded;
-    bool neg_embd_mask;
-    bool use_guidance;
-    float guidance_scale;
-    float seed_frame_idx;
-} sd_cache_params_t;
+    const char* name;
+    const char* path;
+} sd_embedding_t;
+
+enum sd_vae_format_t {
+    SD_VAE_FORMAT_AUTO = -1,
+    SD_VAE_FORMAT_FLUX,
+    SD_VAE_FORMAT_SD3,
+    SD_VAE_FORMAT_FLUX2,
+    SD_VAE_FORMAT_WAN,
+    SD_VAE_FORMAT_COUNT,
+};
 
 typedef struct {
     const char* model_path;
@@ -179,138 +195,387 @@ typedef struct {
     const char* clip_g_path;
     const char* clip_vision_path;
     const char* t5xxl_path;
+    const char* llm_path;
+    const char* llm_vision_path;
+    const char* diffusion_model_path;
+    const char* high_noise_diffusion_model_path;
+    const char* uncond_diffusion_model_path;
+    const char* embeddings_connectors_path;
     const char* vae_path;
+    const char* audio_vae_path;
     const char* taesd_path;
     const char* control_net_path;
-    const char* backend;
-    const char* params_backend;
+    const char* motion_module_path;
+    const sd_embedding_t* embeddings;
+    uint32_t embedding_count;
+    const char* photo_maker_path;
+    const char* pulid_weights_path;
+    const char* tensor_type_rules;
+    int n_threads;
+    enum sd_type_t wtype;
+    enum rng_type_t rng_type;
+    enum rng_type_t sampler_rng_type;
+    enum prediction_t prediction;
+    enum lora_apply_mode_t lora_apply_mode;
+    bool enable_mmap;
     bool flash_attn;
     bool diffusion_flash_attn;
-    bool vae_conv_direct;
+    bool tae_preview_only;
     bool diffusion_conv_direct;
-    sd_type_t wtype;
-    int n_threads;
-    bool enable_mmap;
+    bool vae_conv_direct;
+    bool force_sdxl_vae_conv_scale;
+    enum sd_vae_format_t vae_format;
     const char* max_vram;
     bool stream_layers;
-    const char* lora_model_dir;
-    size_t* lora_models;
-    float* lora_multipliers;
-    int n_lora_models;
-    const char* embedding_path;
-    const char* id_embeddings_path;
-    bool rfb;
-    const char* photo_maker_path;
-    const char* ipadapter_path;
-    const char* pulid_path;
-    int pulid_strength;
-    float ipadapter_strength;
-    const char* boogu_edit_path;
-    float boogu_edit_strength;
-    int upscale_repeats;
-    float style_ratio;
-    bool normalization;
-    bool clip_apply_weighted_sum;
-    const char* koala_ii_path;
+    bool eager_load;
+    const char* backend;
+    const char* params_backend;
+    const char* split_mode;
+    bool auto_fit;
+    const char* rpc_servers;
+    const char* model_args;
 } sd_ctx_params_t;
 
 typedef struct {
+    uint32_t sample_rate;
+    uint32_t channels;
+    uint64_t sample_count;
+    float* data;
+} sd_audio_t;
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t channel;
+    uint8_t* data;
+} sd_image_t;
+
+typedef struct {
+    int* layers;
+    size_t layer_count;
+    float layer_start;
+    float layer_end;
+    float scale;
+} sd_slg_params_t;
+
+typedef struct {
+    float txt_cfg;
+    float img_cfg;
+    float distilled_guidance;
+    sd_slg_params_t slg;
+} sd_guidance_params_t;
+
+typedef struct {
+    sd_guidance_params_t guidance;
+    enum scheduler_t scheduler;
+    enum sample_method_t sample_method;
+    int sample_steps;
+    float eta;
+    int shifted_timestep;
+    float* custom_sigmas;
+    int custom_sigmas_count;
+    float flow_shift;
+    const char* extra_sample_args;
+} sd_sample_params_t;
+
+typedef struct {
+    sd_image_t* id_images;
+    int id_images_count;
+    const char* id_embed_path;
+    float style_strength;
+} sd_pm_params_t;
+
+typedef struct {
+    const char* id_embedding_path;
+    float id_weight;
+} sd_pulid_params_t;
+
+enum sd_cache_mode_t {
+    SD_CACHE_DISABLED = 0,
+    SD_CACHE_EASYCACHE,
+    SD_CACHE_UCACHE,
+    SD_CACHE_DBCACHE,
+    SD_CACHE_TAYLORSEER,
+    SD_CACHE_CACHE_DIT,
+    SD_CACHE_SPECTRUM,
+};
+
+typedef struct {
+    enum sd_cache_mode_t mode;
+    float reuse_threshold;
+    float start_percent;
+    float end_percent;
+    float error_decay_rate;
+    bool use_relative_threshold;
+    bool reset_error_on_compute;
+    int Fn_compute_blocks;
+    int Bn_compute_blocks;
+    float residual_diff_threshold;
+    int max_warmup_steps;
+    int max_cached_steps;
+    int max_continuous_cached_steps;
+    int taylorseer_n_derivatives;
+    int taylorseer_skip_interval;
+    const char* scm_mask;
+    bool scm_policy_dynamic;
+    float spectrum_w;
+    int spectrum_m;
+    float spectrum_lam;
+    int spectrum_window_size;
+    float spectrum_flex_window;
+    int spectrum_warmup_steps;
+    float spectrum_stop_percent;
+} sd_cache_params_t;
+
+typedef struct {
+    bool is_high_noise;
+    float multiplier;
+    const char* path;
+} sd_lora_t;
+
+enum sd_hires_upscaler_t {
+    SD_HIRES_UPSCALER_NONE,
+    SD_HIRES_UPSCALER_LATENT,
+    SD_HIRES_UPSCALER_LATENT_NEAREST,
+    SD_HIRES_UPSCALER_LATENT_NEAREST_EXACT,
+    SD_HIRES_UPSCALER_LATENT_ANTIALIASED,
+    SD_HIRES_UPSCALER_LATENT_BICUBIC,
+    SD_HIRES_UPSCALER_LATENT_BICUBIC_ANTIALIASED,
+    SD_HIRES_UPSCALER_LANCZOS,
+    SD_HIRES_UPSCALER_NEAREST,
+    SD_HIRES_UPSCALER_MODEL,
+    SD_HIRES_UPSCALER_COUNT,
+};
+
+typedef struct {
+    bool enabled;
+    enum sd_hires_upscaler_t upscaler;
+    const char* model_path;
+    float scale;
+    int target_width;
+    int target_height;
+    int steps;
+    float denoising_strength;
+    int upscale_tile_size;
+    float* custom_sigmas;
+    int custom_sigmas_count;
+} sd_hires_params_t;
+
+typedef struct {
+    const sd_lora_t* loras;
+    uint32_t lora_count;
     const char* prompt;
     const char* negative_prompt;
+    int clip_skip;
+    sd_image_t init_image;
+    sd_image_t* ref_images;
+    int ref_images_count;
+    const char* ref_image_args;
+    sd_image_t mask_image;
     int width;
     int height;
     sd_sample_params_t sample_params;
+    float strength;
     int64_t seed;
     int batch_count;
-    sd_image_t init_image;
-    sd_image_t mask_image;
     sd_image_t control_image;
     float control_strength;
+    sd_pm_params_t pm_params;
+    sd_pulid_params_t pulid_params;
     sd_tiling_params_t vae_tiling_params;
-    const char* lora_models;
-    const float* lora_multipliers;
-    int n_lora_models;
-    const char* id_embeddings_path;
-    float style_ratio;
-    bool normalization;
-    bool clip_apply_weighted_sum;
-    sd_image_t* pm_params;
-    int n_pm_params;
-    bool use_karras;
-    sd_image_t* pulid_images;
-    int n_pulid_images;
-    bool is_kontext;
-    sd_image_t* clip_vision_h;
-    int clip_vision_h_count;
-    sd_image_t* image2image_init;
-    bool keep_model_loaded;
-    bool use_cache;
-    const char* upscale_path;
-    int upscale_repeats;
-    int upscale_factor;
-    float upscale_strength;
-    float upscale_denoise;
-    bool video_generation;
-    float image2image_strength;
-    float image2image_steps;
+    sd_cache_params_t cache;
+    sd_hires_params_t hires;
+    int qwen_image_layers;
+    bool circular_x;
+    bool circular_y;
 } sd_img_gen_params_t;
 
 typedef struct {
+    const sd_lora_t* loras;
+    uint32_t lora_count;
     const char* prompt;
     const char* negative_prompt;
+    int clip_skip;
     sd_image_t init_image;
     sd_image_t end_image;
     sd_image_t* control_frames;
+    int control_frames_size;
     int width;
     int height;
     sd_sample_params_t sample_params;
     sd_sample_params_t high_noise_sample_params;
     float moe_boundary;
-    float vace_strength;
+    float strength;
     int64_t seed;
     int video_frames;
     int fps;
+    float vace_strength;
     sd_tiling_params_t vae_tiling_params;
     sd_cache_params_t cache;
+    sd_hires_params_t hires;
+    bool circular_x;
+    bool circular_y;
 } sd_vid_gen_params_t;
 
+typedef struct sd_ctx_t sd_ctx_t;
+struct ggml_tensor;
+
+typedef void (*sd_log_cb_t)(enum sd_log_level_t level, const char* text, void* data);
 typedef void (*sd_progress_cb_t)(int step, int steps, float time, void* data);
 typedef void (*sd_preview_cb_t)(int step, int frame_count, sd_image_t* frames, bool is_noisy, void* data);
-typedef void (*sd_log_cb_t)(int level, char* text, void* data);
+typedef bool (*sd_graph_eval_callback_t)(struct ggml_tensor* t, bool ask, void* user_data);
 
-SD_API sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* params);
-SD_API void free_sd_ctx(sd_ctx_t* ctx);
-SD_API bool sd_ctx_supports_image_generation(const sd_ctx_t* ctx);
-SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* ctx);
+SD_API void sd_set_log_callback(sd_log_cb_t sd_log_cb, void* data);
+SD_API void sd_set_progress_callback(sd_progress_cb_t cb, void* data);
+SD_API void sd_set_preview_callback(sd_preview_cb_t cb, enum preview_t mode, int interval, bool denoised, bool noisy, void* data);
+SD_API void sd_set_backend_eval_callback(sd_graph_eval_callback_t cb, void* data);
+SD_API int32_t sd_get_num_physical_cores();
+SD_API const char* sd_get_system_info();
+SD_API bool sd_ctx_supports_image_generation(const sd_ctx_t* sd_ctx);
+SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx);
 
-SD_API bool generate_image(sd_ctx_t* ctx, const sd_img_gen_params_t* params,
-                           sd_image_t** images_out, int* num_images_out);
+SD_API bool sd_ctx_load_control_net(sd_ctx_t* sd_ctx, const char* path);
+SD_API bool sd_ctx_unload_control_net(sd_ctx_t* sd_ctx);
+SD_API bool sd_ctx_has_control_net(const sd_ctx_t* sd_ctx);
 
-SD_API bool generate_video(sd_ctx_t* ctx, const sd_vid_gen_params_t* params,
-                           sd_image_t** frames_out, int* num_frames_out,
-                           sd_audio_t** audio_out);
+SD_API const char* sd_type_name(enum sd_type_t type);
+SD_API enum sd_type_t str_to_sd_type(const char* str);
+SD_API const char* sd_rng_type_name(enum rng_type_t rng_type);
+SD_API enum rng_type_t str_to_rng_type(const char* str);
+SD_API const char* sd_sample_method_name(enum sample_method_t sample_method);
+SD_API enum sample_method_t str_to_sample_method(const char* str);
+SD_API const char* sd_scheduler_name(enum scheduler_t scheduler);
+SD_API enum scheduler_t str_to_scheduler(const char* str);
+SD_API const char* sd_prediction_name(enum prediction_t prediction);
+SD_API enum prediction_t str_to_prediction(const char* str);
+SD_API const char* sd_preview_name(enum preview_t preview);
+SD_API enum preview_t str_to_preview(const char* str);
+SD_API const char* sd_lora_apply_mode_name(enum lora_apply_mode_t mode);
+SD_API enum lora_apply_mode_t str_to_lora_apply_mode(const char* str);
+SD_API const char* sd_hires_upscaler_name(enum sd_hires_upscaler_t upscaler);
+SD_API enum sd_hires_upscaler_t str_to_sd_hires_upscaler(const char* str);
 
-SD_API void free_sd_images(sd_image_t* images);
+SD_API void sd_cache_params_init(sd_cache_params_t* cache_params);
+SD_API void sd_hires_params_init(sd_hires_params_t* hires_params);
+
+SD_API void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params);
+SD_API char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params);
+
+SD_API sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
+SD_API void free_sd_ctx(sd_ctx_t* sd_ctx);
 SD_API void free_sd_audio(sd_audio_t* audio);
 
-SD_API void sd_set_progress_callback(sd_progress_cb_t cb, void* data);
-SD_API void sd_set_preview_callback(sd_preview_cb_t cb, preview_t mode,
-                                    int interval, bool denoised, bool noisy, void* data);
-SD_API void sd_set_log_callback(sd_log_cb_t cb, void* data);
-SD_API void sd_cancel_generation(sd_ctx_t* ctx, sd_cancel_mode_t mode);
+SD_API void sd_sample_params_init(sd_sample_params_t* sample_params);
+SD_API char* sd_sample_params_to_str(const sd_sample_params_t* sample_params);
 
-SD_API const char* sd_get_system_info();
-SD_API int sd_list_devices(int* count);
+SD_API enum sample_method_t sd_get_default_sample_method(const sd_ctx_t* sd_ctx);
+SD_API enum scheduler_t sd_get_default_scheduler(const sd_ctx_t* sd_ctx, enum sample_method_t sample_method);
 
-SD_API bool convert(const char* input_path, const char* output_path,
-                    sd_type_t output_type, int unet_variant);
-SD_API bool convert_with_components(const char* input_path, const char* output_dir,
-                                    sd_type_t output_type);
+SD_API void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params);
+SD_API char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params);
+SD_API bool generate_image(sd_ctx_t* sd_ctx,
+                           const sd_img_gen_params_t* sd_img_gen_params,
+                           sd_image_t** images_out,
+                           int* num_images_out);
 
-SD_API const char* sd_type_name(sd_type_t type);
-SD_API const char* sd_sample_method_name(sd_sample_method_t method);
-SD_API const char* sd_schedule_name(sd_schedule_t schedule);
+enum sd_cancel_mode_t {
+    SD_CANCEL_ALL,
+    SD_CANCEL_NEW_LATENTS,
+    SD_CANCEL_RESET
+};
+
+SD_API void sd_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode);
+
+SD_API void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params);
+SD_API bool generate_video(sd_ctx_t* sd_ctx,
+                           const sd_vid_gen_params_t* sd_vid_gen_params,
+                           sd_image_t** frames_out,
+                           int* num_frames_out,
+                           sd_audio_t** audio_out);
+
+typedef struct upscaler_ctx_t upscaler_ctx_t;
+
+SD_API upscaler_ctx_t* new_upscaler_ctx(const char* esrgan_path,
+                                        bool direct,
+                                        int n_threads,
+                                        int tile_size,
+                                        const char* backend,
+                                        const char* params_backend);
+SD_API void free_upscaler_ctx(upscaler_ctx_t* upscaler_ctx);
+
+SD_API bool upscale(upscaler_ctx_t* upscaler_ctx,
+                    sd_image_t input_image,
+                    uint32_t upscale_factor,
+                    sd_image_t** images_out,
+                    int* num_images_out);
+
+SD_API int get_upscale_factor(upscaler_ctx_t* upscaler_ctx);
+
+typedef struct adetailer_ctx_t adetailer_ctx_t;
+
+typedef struct {
+    const char* prompt;
+    const char* negative_prompt;
+    const char* extra_ad_args;
+} sd_adetailer_params_t;
+
+SD_API adetailer_ctx_t* new_adetailer_ctx(const char* detector_path,
+                                          int n_threads,
+                                          const char* backend,
+                                          const char* params_backend);
+SD_API void free_adetailer_ctx(adetailer_ctx_t* adetailer_ctx);
+SD_API bool adetail_image(adetailer_ctx_t* adetailer_ctx,
+                          sd_ctx_t* sd_ctx,
+                          sd_image_t input_image,
+                          const sd_adetailer_params_t* adetailer_params,
+                          const sd_img_gen_params_t* inpaint_params,
+                          sd_image_t** images_out,
+                          int* num_images_out);
+
+SD_API bool convert(const char* input_path,
+                    const char* vae_path,
+                    const char* output_path,
+                    enum sd_type_t output_type,
+                    const char* tensor_type_rules,
+                    bool convert_name);
+
+SD_API bool convert_with_components(const char* model_path,
+                                    const char* clip_l_path,
+                                    const char* clip_g_path,
+                                    const char* t5xxl_path,
+                                    const char* diffusion_model_path,
+                                    const char* vae_path,
+                                    const char* output_path,
+                                    enum sd_type_t output_type,
+                                    const char* tensor_type_rules,
+                                    bool convert_name,
+                                    int n_threads);
+
+SD_API bool preprocess_canny(sd_image_t image,
+                             float high_threshold,
+                             float low_threshold,
+                             float weak,
+                             float strong,
+                             bool inverse);
+
+SD_API bool load_imatrix(const char* imatrix_path);
+SD_API void save_imatrix(const char* imatrix_path);
+SD_API void enable_imatrix_collection(void);
+SD_API void disable_imatrix_collection(void);
+
+SD_API const char* sd_commit(void);
+SD_API const char* sd_version(void);
+
+// List available ggml backend devices, one `name<TAB>description` per line.
+// Returns the number of bytes required, excluding the null terminator.
+// Passing nullptr or buffer_size 0 only queries the required size.
+SD_API size_t sd_list_devices(char* buffer, size_t buffer_size);
+
+// for C API, caller needs to call free_sd_images to free the memory after use
+SD_API void free_sd_images(sd_image_t* result_images, int num_images);
 
 #ifdef __cplusplus
 }
 #endif
+
+#endif  // __STABLE_DIFFUSION_H__

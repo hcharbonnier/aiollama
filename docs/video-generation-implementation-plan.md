@@ -1574,7 +1574,7 @@ production quality.
   the ffmpeg-dependent tests (they require ffmpeg installed on the runner);
   tracked alongside 12.4.
 
-#### 12.6 End-to-end testing with real models — PARTIAL (test harness done; real-model E2E pending)
+#### 12.6 End-to-end testing with real models — IMAGE E2E DONE (video E2E pending model download)
 
 - The E2E test harness is implemented. The integration test scaffold
   (`TestDiffgenImageGeneration`, `TestDiffgenVideoGeneration`,
@@ -1588,8 +1588,9 @@ production quality.
     component files as blobs, creates the model, verifies it appears in
     `/api/tags` and `Show` returns a valid manifest). Does not require a GPU or
     real model — only tests the import/manifest path.
-  - Helpers: `importDiffModelFromDir` (uploads blobs + `Create`), `ensureDiffModel`
-    (import-or-pull dispatch), `sha256Digest`.
+  - Helpers: `importDiffModelFromDir` (uploads blobs + `Create`, now
+    recursive for subdirectory layouts like WAN 2.2's `LowNoise/`/`HighNoise/`),
+    `ensureDiffModel` (import-or-pull dispatch), `sha256Digest`.
 - The `ollama create` path for SD.cpp models (`convertFromSDCpp`) now has full
   unit test coverage in `server/routes_create_test.go`:
   - `TestConvertFromSDCpp` (7 subtests): image model with components map,
@@ -1605,12 +1606,36 @@ production quality.
   - `TestDetectModelTypeFromFiles` extended: sdcpp detection from
     `model_index.json` (path-agnostic via `filepath.Base`), and precedence over
     `.safetensors`.
-- **Remaining (real-model E2E):** Running the integration tests against actual
-  SD.cpp model weights still requires:
-  1. A built `ollama` binary with the `sdcpp` tag and a linked
-     `libstable-diffusion`.
-  2. A model set via `OLLAMA_TEST_DIFF_MODEL` (+ `OLLAMA_TEST_DIFF_MODEL_DIR`
-     for local import, or a registry pull).
+- **Image E2E with real model — DONE.** `TestDiffgenImageGeneration` and
+  `TestDiffgenImageGenerationProgress` pass against a real FLUX.2-Klein-4B
+  model (Q4_0 diffusion + Q2_K text encoder + VAE) on CPU. The model loads
+  via SD.cpp, text encoding completes (~32s), 4-step turbo sampling runs
+  (~10 min on CPU), and the final image (~500-700 KB PNG) is returned with
+  streaming progress events (26 events observed). Test timeouts raised to
+  30 min for CPU. Run with:
+  ```
+  export OLLAMA_TEST_DIFF_MODEL=flux2-klein-4b
+  export OLLAMA_TEST_DIFF_MODEL_DIR=/path/to/flux2-klein-4b
+  export OLLAMA_TEST_EXISTING=1  # use a pre-started server
+  go test -tags=integration -run TestDiffgenImageGeneration ./integration/ -v -timeout 40m
+  ```
+- **Import-path E2E with dummy fixture — DONE.** `TestDiffgenImportFromDirectory`
+  passes against `integration/testdata/diffgen/flux2-dummy/` (dummy GGUF +
+  safetensors files with valid magic bytes), validating the full import →
+  manifest → Show path without a real model download. Run with:
+  ```
+  export OLLAMA_TEST_DIFF_IMPORT_DIR=integration/testdata/diffgen/flux2-dummy
+  go test -tags=integration -run TestDiffgenImportFromDirectory ./integration/ -v
+  ```
+- **Remaining (video E2E):** Video E2E (`TestDiffgenVideoGeneration`,
+  `TestDiffgenVideoAPI`) requires the WAN 2.2 T2V A14B model (~10 GB download,
+  dual LowNoise+HighNoise + VAE + t5xxl). The runner wiring for dual-stage
+  models (`high_noise_diffusion_model_path`) is implemented and the
+  `model_index.json` fixture is in place, but the real-model run has not been
+  performed due to the large download and expected CPU runtime (~hours for
+  9 frames on a 14B model). On CPU, video generation is impractically slow for
+  CI (minutes per frame); a GPU-backed CI runner is needed for practical
+  video E2E.
 
 ##### Test models (CPU-only, 2-bit quantized where available)
 
@@ -1623,28 +1648,34 @@ minimal. Reference docs: [flux2.md](https://github.com/leejet/stable-diffusion.c
 
 | Component | File | Source |
 |-----------|------|--------|
-| diffusion_model | `flux-2-klein-4b-Q2_K.gguf` | [leejet/FLUX.2-klein-4B-GGUF](https://huggingface.co/leejet/FLUX.2-klein-4B-GGUF/tree/main) |
-| vae | `flux2_ae.safetensors` | [black-forest-labs/FLUX.2-dev](https://huggingface.co/black-forest-labs/FLUX.2-dev/tree/main) |
-| text encoder (llm) | `qwen-3-4b-Q2_K.gguf` | [unsloth/Qwen3-4B-GGUF](https://huggingface.co/unsloth/Qwen3-4B-GGUF/tree/main) |
+| diffusion_model | `flux-2-klein-4b-Q4_0.gguf` | [leejet/FLUX.2-klein-4B-GGUF](https://huggingface.co/leejet/FLUX.2-klein-4B-GGUF/tree/main) |
+| vae | `flux2-vae.safetensors` | [Comfy-Org/vae-text-encorder-for-flux-klein-4b](https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-4b/tree/main/split_files/vae) |
+| llm (text encoder) | `Qwen3-4B-Q2_K.gguf` | [unsloth/Qwen3-4B-GGUF](https://huggingface.co/unsloth/Qwen3-4B-GGUF/tree/main) |
 
 Test params: `--width 512 --height 512 --steps 4 --cfg-scale 1.0`. The Klein-4B
-model is a 4-step turbo model — fast enough for CPU CI. If Q2_K is not available
-in the GGUF repo, fall back to Q4_K_S (next smallest).
+model is a 4-step turbo model — fast enough for CPU CI. The GGUF repo only has
+Q4_0 and Q8_0 (no Q2_K); Q4_0 is the smallest available (~2.5 GB). The text
+encoder is Qwen3-4B (loaded via `--llm`, not `--clip_l`). The VAE from the
+non-gated Comfy-Org repo is used to avoid the gated `black-forest-labs/FLUX.2-dev`
+repo (which has `ae.safetensors`).
 
 **Video — WAN 2.2 T2V A14B** (dual-model, MoE active ~2B):
 
 | Component | File | Source |
 |-----------|------|--------|
-| diffusion_model (low noise) | `Wan2.2-T2V-A14B-LowNoise-Q2_K.gguf` | [QuantStack/Wan2.2-T2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF/tree/main) |
-| high_noise_diffusion_model | `Wan2.2-T2V-A14B-HighNoise-Q2_K.gguf` | [QuantStack/Wan2.2-T2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF/tree/main) |
-| vae | `wan_2.1_vae.safetensors` | [Comfy-Org/Wan_2.1_ComfyUI_repackaged](https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors) |
-| t5xxl | `umt5-xxl-encoder-Q2_K.gguf` | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf/tree/main) |
+| diffusion_model (low noise) | `Wan2.2-T2V-A14B-LowNoise-Q2_K.gguf` | [QuantStack/Wan2.2-T2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF/tree/main/LowNoise) |
+| high_noise_diffusion_model | `Wan2.2-T2V-A14B-HighNoise-Q2_K.gguf` | [QuantStack/Wan2.2-T2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF/tree/main/HighNoise) |
+| vae | `Wan2.1_VAE.safetensors` | [QuantStack/Wan2.2-T2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF/tree/main/VAE) |
+| t5xxl | `umt5-xxl-encoder-Q3_K_S.gguf` | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf/tree/main) |
 
 Test params: `--width 832 --height 480 --steps 10 --cfg-scale 3.5 --flow-shift
 3.0 --video-frames 9 --fps 16` (reduced to 9 frames for CI speed; the SD.cpp
 example uses 33). WAN 2.2 T2V A14B is a dual-stage model (LowNoise +
 HighNoise) — both diffusion models must be present in the manifest. The VAE
-runs on CPU (CUDA/CPU only, per Section 8.3).
+runs on CPU (CUDA/CPU only, per Section 8.3). The t5xxl repo has no Q2_K; Q3_K_S
+is the smallest available (~4.5 GB). The WAN repo stores files in `LowNoise/`,
+`HighNoise/`, and `VAE/` subdirectories — flatten them into a single directory
+for import (or use the recursive import helper).
 
 > **Note on WAN 2.2 TI2V 5B:** This is a single-model variant (no dual-stage)
 > with a separate VAE (`wan2.2_vae`), but only fp16 safetensors are available
@@ -1660,9 +1691,9 @@ runs on CPU (CUDA/CPU only, per Section 8.3).
 ollama create flux2-klein-4b -f Modelfile.flux2-klein
 # Modelfile points to a directory with:
 #   model_index.json  (architecture: "FluxPipeline", capabilities: ["image"], model_format: "sdcpp")
-#   flux-2-klein-4b-Q2_K.gguf
-#   flux2_ae.safetensors
-#   qwen-3-4b-Q2_K.gguf
+#   flux-2-klein-4b-Q4_0.gguf          (component: "diffusion_model")
+#   flux2-vae.safetensors               (component: "vae")
+#   Qwen3-4B-Q2_K.gguf                  (component: "llm")
 
 # Video: WAN 2.2 T2V A14B
 ollama create wan2.2-t2v-a14b -f Modelfile.wan22
@@ -1670,8 +1701,8 @@ ollama create wan2.2-t2v-a14b -f Modelfile.wan22
 #   model_index.json  (architecture: "WanVideoPipeline", capabilities: ["video"], model_format: "sdcpp")
 #   Wan2.2-T2V-A14B-LowNoise-Q2_K.gguf   (component: "diffusion_model")
 #   Wan2.2-T2V-A14B-HighNoise-Q2_K.gguf  (component: "high_noise_diffusion_model")
-#   wan_2.1_vae.safetensors               (component: "vae")
-#   umt5-xxl-encoder-Q2_K.gguf            (component: "t5xxl")
+#   Wan2.1_VAE.safetensors                (component: "vae")
+#   umt5-xxl-encoder-Q3_K_S.gguf          (component: "t5xxl")
 ```
 
 Then run the integration tests:
@@ -1703,6 +1734,6 @@ OLLAMA_TEST_DIFF_MODEL=wan2.2-t2v-a14b go test -tags=integration -run TestDiffge
 | Dockerfile SD.cpp deps | Medium | 0.5 day | Containerized CI | **DONE** (sdcpp-* build/publish stages added, reusing existing toolchain stages; opt-in `build-sdcpp`/`publish-go-sdcpp` Go target; not wired into default image) |
 | CI multi-backend matrix | Low | 1–2 days | Regression prevention | **DEFERRED** (non-priority; revisit after 12.6 E2E harness and GPU CI runners) |
 | Video container encoding (WebM) | Low | 3–5 days | Non-blocking (PNG stream works) | **DONE** (ffmpeg-based `EncodeWebM`, opt-in via `output_format: "webm"` everywhere including the HTTP video API — no implicit default; size-capped output buffer; `VideoWriter` container-priority bug fixed; fallback surfaced via response `Warning`) |
-| E2E tests with real models (FLUX.2-Klein-4B + WAN 2.2, CPU, Q2_K) | Medium | 1 day | Requires native build | **PARTIAL** (test harness done: local-dir import via `OLLAMA_TEST_DIFF_MODEL_DIR`, progress-streaming + import tests added; real-model run pending sdcpp-tagged binary + model weights) |
+| E2E tests with real models (FLUX.2-Klein-4B + WAN 2.2, CPU, Q2_K) | Medium | 1 day | Requires native build | **IMAGE DONE / VIDEO PENDING** (image: `TestDiffgenImageGeneration` + `TestDiffgenImageGenerationProgress` pass with real FLUX.2-Klein-4B Q4_0 on CPU, ~11 min/run, 26 progress events; import: `TestDiffgenImportFromDirectory` passes with dummy fixture; video: harness + dual-stage wiring ready, pending WAN 2.2 ~10 GB download + GPU runner for practical runtime) |
 | `convertFromSDCpp` test fixture | Low | 0.5 day | Import path coverage | **DONE** (`TestConvertFromSDCpp` 7 subtests + `TestCreateModelFromSDCppFilesSetsConfig` + `TestCreateModelFromSDCppFilesImageDefaultsToImageCapability` + `TestDetectModelTypeFromFiles` sdcpp cases) |
 | Memory estimation overhead factor | Low | 0.5 day | Pre-flight accuracy | Pending |

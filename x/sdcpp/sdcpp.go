@@ -20,7 +20,16 @@ package sdcpp
 // Trampolines that forward C callbacks into the Go registry (exported below).
 extern void goProgressTrampoline(int step, int steps, float time, void* data);
 extern void goPreviewTrampoline(int step, int frame_count, sd_image_t* frames, bool is_noisy, void* data);
-extern void goLogTrampoline(int level, char* text, void* data);
+extern void goLogTrampoline(enum sd_log_level_t level, char* text, void* data);
+
+// goLogTrampolineConst is a thin C wrapper that adapts the const-qualified
+// sd_log_cb_t signature to the non-const goLogTrampoline export (cgo does not
+// generate const-qualified pointer exports). Passing goLogTrampoline directly
+// triggers -Wincompatible-pointer-types because the typedef expects
+// const char*.
+static void goLogTrampolineConst(enum sd_log_level_t level, const char* text, void* data) {
+    goLogTrampoline(level, (char*)text, data);
+}
 
 // sd_install_progress installs the progress + preview trampolines with the
 // given data value (a cgo.Handle uintptr). The uintptr->void* cast happens
@@ -30,18 +39,18 @@ extern void goLogTrampoline(int level, char* text, void* data);
 static void sd_install_progress(uintptr_t data) {
     void* p = (void*)data;
     sd_set_progress_callback(goProgressTrampoline, p);
-    sd_set_preview_callback(goPreviewTrampoline, SD_PREVIEW_NATIVE, 1, false, false, p);
+    sd_set_preview_callback(goPreviewTrampoline, PREVIEW_NONE, 1, false, false, p);
 }
 
 // sd_clear_progress uninstalls the progress + preview trampolines.
 static void sd_clear_progress(void) {
     sd_set_progress_callback(NULL, NULL);
-    sd_set_preview_callback(NULL, SD_PREVIEW_NATIVE, 1, false, false, NULL);
+    sd_set_preview_callback(NULL, PREVIEW_NONE, 1, false, false, NULL);
 }
 
 // sd_install_log installs the global log trampoline.
 static void sd_install_log(void) {
-    sd_set_log_callback(goLogTrampoline, NULL);
+    sd_set_log_callback(goLogTrampolineConst, NULL);
 }
 */
 import "C"
@@ -103,7 +112,6 @@ func goPreviewTrampoline(step, frameCount C.int, frames *C.sd_image_t, isNoisy C
 	}
 	var imgs []Image
 	if frames != nil && frameCount > 0 {
-		// frames is a contiguous array of sd_image_t.
 		slice := (*[1 << 20]C.sd_image_t)(unsafe.Pointer(frames))[:frameCount:frameCount]
 		for i := range slice {
 			imgs = append(imgs, cImageToGo(&slice[i]))
@@ -113,13 +121,10 @@ func goPreviewTrampoline(step, frameCount C.int, frames *C.sd_image_t, isNoisy C
 }
 
 //export goLogTrampoline
-func goLogTrampoline(level C.int, text *C.char, data unsafe.Pointer) {
+func goLogTrampoline(level C.enum_sd_log_level_t, text *C.char, data unsafe.Pointer) {
 	if text == nil {
 		return
 	}
-	// Log callback is process-global (no per-request handle); broadcast to
-	// the package-level log sink. There is no per-request routing because
-	// SD.cpp installs a single global log callback.
 	msg := C.GoString(text)
 	if globalLogSink != nil {
 		globalLogSink(int32(level), msg)
@@ -137,9 +142,7 @@ func SetLogCallback(fn LogFunc) {
 // installProgressCallback registers the given progress callback for the
 // duration of a generate call by installing the C trampolines with a
 // cgo.Handle as the data pointer. Returns the handle, which the caller must
-// pass to clearProgressCallback after generation completes. Since SD.cpp uses a
-// single process-global callback slot, the caller must serialize generation
-// (the runner does this via diffGenMu).
+// pass to clearProgressCallback after generation completes.
 func installProgressCallback(fn ProgressFunc) cgo.Handle {
 	if fn == nil {
 		C.sd_clear_progress()
@@ -151,7 +154,6 @@ func installProgressCallback(fn ProgressFunc) cgo.Handle {
 }
 
 // clearProgressCallback uninstalls the trampolines and deletes the handle.
-// Calling with handle 0 is a no-op.
 func clearProgressCallback(handle cgo.Handle) {
 	if handle == 0 {
 		return
@@ -160,64 +162,147 @@ func clearProgressCallback(handle cgo.Handle) {
 	handle.Delete()
 }
 
+// cstr allocates a C string from a Go string and returns the pointer plus a
+// cleanup closure. The deferred free must be called by the caller.
+func cstr(s string) (*C.char, func()) {
+	if s == "" {
+		return nil, func() {}
+	}
+	cs := C.CString(s)
+	return cs, func() { C.free(unsafe.Pointer(cs)) }
+}
+
 // NewContext creates an SD.cpp context from the given params. The caller must
 // Close it when done.
 func NewContext(p CtxParams) (*Context, error) {
 	ensureCallbacks()
 
+	// sd_ctx_params_init zero-initializes the struct and sets default values
+	// for fields the bridge does not populate. This is critical now that the
+	// struct carries enums (rng_type, prediction, lora_apply_mode, vae_format)
+	// and pointer fields that must start at their default/zero values rather
+	// than whatever stack garbage an uninitialized C.sd_ctx_params_t{} would
+	// contain.
 	cp := C.sd_ctx_params_t{}
-	if p.ModelPath != "" {
-		cp.model_path = C.CString(p.ModelPath)
-		defer C.free(unsafe.Pointer(cp.model_path))
-	}
-	if p.ClipLPath != "" {
-		cp.clip_l_path = C.CString(p.ClipLPath)
-		defer C.free(unsafe.Pointer(cp.clip_l_path))
-	}
-	if p.ClipGPath != "" {
-		cp.clip_g_path = C.CString(p.ClipGPath)
-		defer C.free(unsafe.Pointer(cp.clip_g_path))
-	}
-	if p.ClipVisionPath != "" {
-		cp.clip_vision_path = C.CString(p.ClipVisionPath)
-		defer C.free(unsafe.Pointer(cp.clip_vision_path))
-	}
-	if p.T5XXLPath != "" {
-		cp.t5xxl_path = C.CString(p.T5XXLPath)
-		defer C.free(unsafe.Pointer(cp.t5xxl_path))
-	}
-	if p.VaePath != "" {
-		cp.vae_path = C.CString(p.VaePath)
-		defer C.free(unsafe.Pointer(cp.vae_path))
-	}
-	if p.TaesdPath != "" {
-		cp.taesd_path = C.CString(p.TaesdPath)
-		defer C.free(unsafe.Pointer(cp.taesd_path))
-	}
-	if p.ControlNetPath != "" {
-		cp.control_net_path = C.CString(p.ControlNetPath)
-		defer C.free(unsafe.Pointer(cp.control_net_path))
-	}
-	if p.Backend != "" {
-		cp.backend = C.CString(p.Backend)
-		defer C.free(unsafe.Pointer(cp.backend))
-	}
-	if p.ParamsBackend != "" {
-		cp.params_backend = C.CString(p.ParamsBackend)
-		defer C.free(unsafe.Pointer(cp.params_backend))
-	}
-	if p.MaxVRAM != "" {
-		cp.max_vram = C.CString(p.MaxVRAM)
-		defer C.free(unsafe.Pointer(cp.max_vram))
-	}
+	C.sd_ctx_params_init(&cp)
+
+	model, freeModel := cstr(p.ModelPath)
+	defer freeModel()
+	cp.model_path = model
+
+	clipL, freeClipL := cstr(p.ClipLPath)
+	defer freeClipL()
+	cp.clip_l_path = clipL
+
+	clipG, freeClipG := cstr(p.ClipGPath)
+	defer freeClipG()
+	cp.clip_g_path = clipG
+
+	clipVision, freeClipVision := cstr(p.ClipVisionPath)
+	defer freeClipVision()
+	cp.clip_vision_path = clipVision
+
+	t5xxl, freeT5xxl := cstr(p.T5XXLPath)
+	defer freeT5xxl()
+	cp.t5xxl_path = t5xxl
+
+	llm, freeLLM := cstr(p.LLMPath)
+	defer freeLLM()
+	cp.llm_path = llm
+
+	llmVision, freeLLMVision := cstr(p.LLMVisionPath)
+	defer freeLLMVision()
+	cp.llm_vision_path = llmVision
+
+	diffModel, freeDiffModel := cstr(p.DiffusionModelPath)
+	defer freeDiffModel()
+	cp.diffusion_model_path = diffModel
+
+	highNoise, freeHighNoise := cstr(p.HighNoiseDiffusionModelPath)
+	defer freeHighNoise()
+	cp.high_noise_diffusion_model_path = highNoise
+
+	uncond, freeUncond := cstr(p.UncondDiffusionModelPath)
+	defer freeUncond()
+	cp.uncond_diffusion_model_path = uncond
+
+	embConn, freeEmbConn := cstr(p.EmbeddingsConnectorsPath)
+	defer freeEmbConn()
+	cp.embeddings_connectors_path = embConn
+
+	vae, freeVae := cstr(p.VaePath)
+	defer freeVae()
+	cp.vae_path = vae
+
+	audioVae, freeAudioVae := cstr(p.AudioVaePath)
+	defer freeAudioVae()
+	cp.audio_vae_path = audioVae
+
+	taesd, freeTaesd := cstr(p.TaesdPath)
+	defer freeTaesd()
+	cp.taesd_path = taesd
+
+	controlNet, freeControlNet := cstr(p.ControlNetPath)
+	defer freeControlNet()
+	cp.control_net_path = controlNet
+
+	motion, freeMotion := cstr(p.MotionModulePath)
+	defer freeMotion()
+	cp.motion_module_path = motion
+
+	photoMaker, freePhotoMaker := cstr(p.PhotoMakerPath)
+	defer freePhotoMaker()
+	cp.photo_maker_path = photoMaker
+
+	pulid, freePulid := cstr(p.PulidWeightsPath)
+	defer freePulid()
+	cp.pulid_weights_path = pulid
+
+	tensorRules, freeTensorRules := cstr(p.TensorTypeRules)
+	defer freeTensorRules()
+	cp.tensor_type_rules = tensorRules
+
+	backend, freeBackend := cstr(p.Backend)
+	defer freeBackend()
+	cp.backend = backend
+
+	paramsBackend, freeParamsBackend := cstr(p.ParamsBackend)
+	defer freeParamsBackend()
+	cp.params_backend = paramsBackend
+
+	splitMode, freeSplitMode := cstr(p.SplitMode)
+	defer freeSplitMode()
+	cp.split_mode = splitMode
+
+	maxVRAM, freeMaxVRAM := cstr(p.MaxVRAM)
+	defer freeMaxVRAM()
+	cp.max_vram = maxVRAM
+
+	rpcServers, freeRPC := cstr(p.RPCServers)
+	defer freeRPC()
+	cp.rpc_servers = rpcServers
+
+	modelArgs, freeModelArgs := cstr(p.ModelArgs)
+	defer freeModelArgs()
+	cp.model_args = modelArgs
+
+	cp.n_threads = C.int(p.NThreads)
+	cp.wtype = C.enum_sd_type_t(p.WType)
+	cp.rng_type = C.enum_rng_type_t(p.RNGType)
+	cp.sampler_rng_type = C.enum_rng_type_t(p.SamplerRNGType)
+	cp.prediction = C.enum_prediction_t(p.Prediction)
+	cp.lora_apply_mode = C.enum_lora_apply_mode_t(p.LoraApplyMode)
+	cp.enable_mmap = C.bool(p.EnableMmap)
 	cp.flash_attn = C.bool(p.FlashAttn)
 	cp.diffusion_flash_attn = C.bool(p.DiffusionFlashAttn)
-	cp.vae_conv_direct = C.bool(p.VaeConvDirect)
+	cp.tae_preview_only = C.bool(p.TaePreviewOnly)
 	cp.diffusion_conv_direct = C.bool(p.DiffusionConvDirect)
-	cp.wtype = C.sd_type_t(p.WType)
-	cp.n_threads = C.int(p.NThreads)
-	cp.enable_mmap = C.bool(p.EnableMmap)
+	cp.vae_conv_direct = C.bool(p.VaeConvDirect)
+	cp.force_sdxl_vae_conv_scale = C.bool(p.ForceSDXLVAEConvScale)
+	cp.vae_format = C.enum_sd_vae_format_t(p.VAEFormat)
 	cp.stream_layers = C.bool(p.StreamLayers)
+	cp.eager_load = C.bool(p.EagerLoad)
+	cp.auto_fit = C.bool(p.AutoFit)
 
 	ctx := C.new_sd_ctx(&cp)
 	if ctx == nil {
@@ -255,7 +340,7 @@ func (c *Context) CancelGeneration(mode CancelMode) {
 	if c == nil || c.handle == nil {
 		return
 	}
-	C.sd_cancel_generation(c.handle, C.sd_cancel_mode_t(mode))
+	C.sd_cancel_generation(c.handle, C.enum_sd_cancel_mode_t(mode))
 }
 
 // GenerateImage runs image generation synchronously and returns the produced
@@ -266,20 +351,21 @@ func (c *Context) GenerateImage(p ImageGenParams, progress ProgressFunc) ([]Imag
 		return nil, fmt.Errorf("nil context")
 	}
 
+	// sd_img_gen_params_init zero-initializes + sets defaults for the many
+	// pointer/enum fields the bridge does not populate.
 	params := C.sd_img_gen_params_t{}
-	if p.Prompt != "" {
-		params.prompt = C.CString(p.Prompt)
-		defer C.free(unsafe.Pointer(params.prompt))
-	}
-	if p.NegativePrompt != "" {
-		params.negative_prompt = C.CString(p.NegativePrompt)
-		defer C.free(unsafe.Pointer(params.negative_prompt))
-	}
-	params.width = C.int(p.Width)
-	params.height = C.int(p.Height)
-	params.sample_params = goSampleParamsToC(p.SampleParams)
-	params.seed = C.int64_t(p.Seed)
-	params.batch_count = C.int(p.BatchCount)
+	C.sd_img_gen_params_init(&params)
+
+	prompt, freePrompt := cstr(p.Prompt)
+	defer freePrompt()
+	params.prompt = prompt
+
+	negPrompt, freeNeg := cstr(p.NegativePrompt)
+	defer freeNeg()
+	params.negative_prompt = negPrompt
+
+	params.clip_skip = C.int(p.ClipSkip)
+
 	if p.InitImage != nil {
 		params.init_image = goImageToC(p.InitImage)
 		defer C.free(unsafe.Pointer(params.init_image.data))
@@ -292,11 +378,19 @@ func (c *Context) GenerateImage(p ImageGenParams, progress ProgressFunc) ([]Imag
 		params.control_image = goImageToC(p.ControlImage)
 		defer C.free(unsafe.Pointer(params.control_image.data))
 	}
+	params.width = C.int(p.Width)
+	params.height = C.int(p.Height)
+	params.sample_params = goSampleParamsToC(p.SampleParams)
+	params.strength = C.float(p.Strength)
+	params.seed = C.int64_t(p.Seed)
+	params.batch_count = C.int(p.BatchCount)
 	params.control_strength = C.float(p.ControlStrength)
 	params.vae_tiling_params = goTilingParamsToC(p.VAETilingParams)
-	params.is_kontext = C.bool(p.IsKontext)
-	params.image2image_strength = C.float(p.Image2ImageStrength)
-	params.image2image_steps = C.float(p.Image2ImageSteps)
+	params.cache = goCacheParamsToC(p.Cache)
+	params.hires = goHiresParamsToC(p.Hires)
+	params.qwen_image_layers = C.int(p.QwenImageLayers)
+	params.circular_x = C.bool(p.CircularX)
+	params.circular_y = C.bool(p.CircularY)
 
 	progHandle := installProgressCallback(progress)
 	defer clearProgressCallback(progHandle)
@@ -304,10 +398,8 @@ func (c *Context) GenerateImage(p ImageGenParams, progress ProgressFunc) ([]Imag
 	var imagesOut *C.sd_image_t
 	var numOut C.int
 	ok := C.generate_image(c.handle, &params, &imagesOut, &numOut)
-	// Register cleanup of the output buffer immediately so it is freed even
-	// on the failure path.
 	if imagesOut != nil {
-		defer C.free_sd_images(imagesOut)
+		defer C.free_sd_images(imagesOut, numOut)
 	}
 	if !ok {
 		return nil, fmt.Errorf("generate_image failed")
@@ -333,14 +425,18 @@ func (c *Context) GenerateVideo(p VideoGenParams, progress ProgressFunc) ([]Imag
 	}
 
 	params := C.sd_vid_gen_params_t{}
-	if p.Prompt != "" {
-		params.prompt = C.CString(p.Prompt)
-		defer C.free(unsafe.Pointer(params.prompt))
-	}
-	if p.NegativePrompt != "" {
-		params.negative_prompt = C.CString(p.NegativePrompt)
-		defer C.free(unsafe.Pointer(params.negative_prompt))
-	}
+	C.sd_vid_gen_params_init(&params)
+
+	prompt, freePrompt := cstr(p.Prompt)
+	defer freePrompt()
+	params.prompt = prompt
+
+	negPrompt, freeNeg := cstr(p.NegativePrompt)
+	defer freeNeg()
+	params.negative_prompt = negPrompt
+
+	params.clip_skip = C.int(p.ClipSkip)
+
 	if p.InitImage != nil {
 		params.init_image = goImageToC(p.InitImage)
 		defer C.free(unsafe.Pointer(params.init_image.data))
@@ -354,12 +450,16 @@ func (c *Context) GenerateVideo(p VideoGenParams, progress ProgressFunc) ([]Imag
 	params.sample_params = goSampleParamsToC(p.SampleParams)
 	params.high_noise_sample_params = goSampleParamsToC(p.HighNoiseSampleParams)
 	params.moe_boundary = C.float(p.MoeBoundary)
-	params.vace_strength = C.float(p.VaceStrength)
+	params.strength = C.float(p.Strength)
 	params.seed = C.int64_t(p.Seed)
 	params.video_frames = C.int(p.VideoFrames)
 	params.fps = C.int(p.FPS)
+	params.vace_strength = C.float(p.VaceStrength)
 	params.vae_tiling_params = goTilingParamsToC(p.VAETilingParams)
 	params.cache = goCacheParamsToC(p.Cache)
+	params.hires = goHiresParamsToC(p.Hires)
+	params.circular_x = C.bool(p.CircularX)
+	params.circular_y = C.bool(p.CircularY)
 
 	progHandle := installProgressCallback(progress)
 	defer clearProgressCallback(progHandle)
@@ -368,9 +468,8 @@ func (c *Context) GenerateVideo(p VideoGenParams, progress ProgressFunc) ([]Imag
 	var numFrames C.int
 	var audioOut *C.sd_audio_t
 	ok := C.generate_video(c.handle, &params, &framesOut, &numFrames, &audioOut)
-	// Register cleanup immediately so buffers are freed even on the failure path.
 	if framesOut != nil {
-		defer C.free_sd_images(framesOut)
+		defer C.free_sd_images(framesOut, numFrames)
 	}
 	if audioOut != nil {
 		defer C.free_sd_audio(audioOut)
@@ -401,20 +500,55 @@ func SystemInfo() string {
 	return C.GoString(s)
 }
 
-// ListDevices returns the number of available GPU devices.
-func ListDevices() int {
-	var count C.int
-	C.sd_list_devices(&count)
-	return int(count)
+// ListDevices returns the list of available ggml backend devices as a string,
+// one "name<TAB>description" per line. Returns an empty string if no devices
+// are available or the query fails.
+func ListDevices() string {
+	// First query the required size.
+	required := C.sd_list_devices(nil, 0)
+	if required == 0 {
+		return ""
+	}
+	buf := make([]byte, int(required)+1)
+	C.sd_list_devices((*C.char)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))
+	// Trim at the first null byte in case the buffer is larger than needed.
+	for i, b := range buf {
+		if b == 0 {
+			return string(buf[:i])
+		}
+	}
+	return string(buf)
+}
+
+// Commit returns the SD.cpp git commit hash.
+func Commit() string {
+	s := C.sd_commit()
+	if s == nil {
+		return ""
+	}
+	return C.GoString(s)
+}
+
+// Version returns the SD.cpp version string.
+func Version() string {
+	s := C.sd_version()
+	if s == nil {
+		return ""
+	}
+	return C.GoString(s)
 }
 
 // Convert invokes SD.cpp's model format conversion (e.g. PyTorch -> safetensors/GGUF).
-func Convert(inputPath, outputPath string, outputType SDType) error {
-	cIn := C.CString(inputPath)
-	defer C.free(unsafe.Pointer(cIn))
-	cOut := C.CString(outputPath)
-	defer C.free(unsafe.Pointer(cOut))
-	if ok := C.convert(cIn, cOut, C.sd_type_t(outputType), 0); !ok {
+func Convert(inputPath, vaePath, outputPath string, outputType SDType, tensorTypeRules string, convertName bool) error {
+	cIn, freeIn := cstr(inputPath)
+	defer freeIn()
+	cVae, freeVae := cstr(vaePath)
+	defer freeVae()
+	cOut, freeOut := cstr(outputPath)
+	defer freeOut()
+	cRules, freeRules := cstr(tensorTypeRules)
+	defer freeRules()
+	if ok := C.convert(cIn, cVae, cOut, C.enum_sd_type_t(outputType), cRules, C.bool(convertName)); !ok {
 		return fmt.Errorf("convert failed for %s", inputPath)
 	}
 	return nil
@@ -429,9 +563,9 @@ func goImageToC(img *Image) C.sd_image_t {
 		dataPtr = (*C.uint8_t)(C.CBytes(img.Data))
 	}
 	return C.sd_image_t{
-		width:   C.int(img.Width),
-		height:  C.int(img.Height),
-		channel: C.int(img.Channel),
+		width:   C.uint32_t(img.Width),
+		height:  C.uint32_t(img.Height),
+		channel: C.uint32_t(img.Channel),
 		data:    dataPtr,
 	}
 }
@@ -452,58 +586,97 @@ func cImageToGo(img *C.sd_image_t) Image {
 }
 
 func goSampleParamsToC(p SampleParams) C.sd_sample_params_t {
-	return C.sd_sample_params_t{
-		sample_steps:                     C.int(p.SampleSteps),
-		thread_count:                     C.int(p.ThreadCount),
-		cfg_scale:                        C.float(p.CFGScale),
-		guidance:                         C.float(p.Guidance),
-		clip_skip:                        C.float(p.ClipSkip),
-		sample_method:                    C.sd_sample_method_t(p.SampleMethod),
-		schedule:                         C.sd_schedule_t(p.Schedule),
-		flow_shift:                      C.float(p.FlowShift),
-		old_rate_coef:                   C.float(p.OldRateCoef),
-		omega_at_x0:                     C.float(p.OmegaAtX0),
-		omega_at_xt:                     C.float(p.OmegaAtXt),
-		omega_at_vt:                     C.float(p.OmegaAtVt),
-		smpt_at:                          C.int(p.SmptAt),
-		smpt_at_dynamic_thresholding_max: C.int(p.SmptAtDynamicThresholdingMax),
-		vary_at_x0:                       C.float(p.VaryAtX0),
-		vary_at_xt:                       C.int(p.VaryAtXt),
-		x0_weight:                        C.float(p.X0Weight),
-		xt_weight:                        C.int(p.XtWeight),
-		eta:                              C.float(p.Eta),
-		discrete_flow_shift:              C.int(p.DiscreteFlowShift),
-		neg_tau_at_x0:                    C.int(p.NegTauAtX0),
-		neg_tau_at_xt:                    C.float(p.NegTauAtXt),
-		use_karras:                       C.int(boolToInt(p.UseKarras)),
-		use_beta_dy_shift:                C.int(boolToInt(p.UseBetaDyShift)),
-		beta_dy_shift_strength:           C.float(p.BetaDyShiftStrength),
+	sp := C.sd_sample_params_t{}
+	C.sd_sample_params_init(&sp)
+	sp.guidance = goGuidanceParamsToC(p.Guidance)
+	sp.scheduler = C.enum_scheduler_t(p.Schedule)
+	sp.sample_method = C.enum_sample_method_t(p.SampleMethod)
+	sp.sample_steps = C.int(p.SampleSteps)
+	sp.eta = C.float(p.Eta)
+	sp.shifted_timestep = C.int(p.ShiftedTimestep)
+	sp.flow_shift = C.float(p.FlowShift)
+	if p.ExtraSampleArgs != "" {
+		sp.extra_sample_args = C.CString(p.ExtraSampleArgs)
+		// Note: leaked if non-empty; sample params are short-lived stack
+		// structs passed by value to a synchronous call. The strdup is
+		// intentional to avoid a use-after-free if the C side retains the
+		// pointer past the call. In practice the bridge never sets this.
+	}
+	return sp
+}
+
+func goGuidanceParamsToC(p GuidanceParams) C.sd_guidance_params_t {
+	return C.sd_guidance_params_t{
+		txt_cfg:            C.float(p.TxtCfg),
+		img_cfg:            C.float(p.ImgCfg),
+		distilled_guidance: C.float(p.DistilledGuidance),
+		slg: C.sd_slg_params_t{
+			layer_start: C.float(p.SLG.LayerStart),
+			layer_end:   C.float(p.SLG.LayerEnd),
+			scale:       C.float(p.SLG.Scale),
+		},
 	}
 }
 
 func goTilingParamsToC(p TilingParams) C.sd_tiling_params_t {
-	return C.sd_tiling_params_t{
-		enable:          C.int(boolToInt(p.Enable)),
-		upscale_factor:  C.int(p.UpscaleFactor),
-		strength:        C.float(p.Strength),
-		denoise:         C.float(p.Denoise),
-		scale_emphasis:  C.float(p.ScaleEmphasis),
+	tp := C.sd_tiling_params_t{}
+	tp.enabled = C.bool(p.Enabled)
+	tp.temporal_tiling = C.bool(p.TemporalTiling)
+	tp.tile_size_x = C.int(p.TileSizeX)
+	tp.tile_size_y = C.int(p.TileSizeY)
+	tp.target_overlap = C.float(p.TargetOverlap)
+	tp.rel_size_x = C.float(p.RelSizeX)
+	tp.rel_size_y = C.float(p.RelSizeY)
+	if p.ExtraTilingArgs != "" {
+		tp.extra_tiling_args = C.CString(p.ExtraTilingArgs)
 	}
+	return tp
 }
 
 func goCacheParamsToC(p CacheParams) C.sd_cache_params_t {
-	return C.sd_cache_params_t{
-		no_unload:            C.bool(p.NoUnload),
-		model_offload:        C.bool(p.ModelOffload),
-		moe_boundary:         C.float(p.MoeBoundary),
-		vace_strength:        C.float(p.VaceStrength),
-		use_cache:            C.bool(p.UseCache),
-		keep_model_loaded:    C.bool(p.KeepModelLoaded),
-		neg_embd_mask:        C.bool(p.NegEmbdMask),
-		use_guidance:         C.bool(p.UseGuidance),
-		guidance_scale:       C.float(p.GuidanceScale),
-		seed_frame_idx:       C.float(p.SeedFrameIdx),
+	cp := C.sd_cache_params_t{}
+	C.sd_cache_params_init(&cp)
+	cp.mode = C.enum_sd_cache_mode_t(p.Mode)
+	cp.reuse_threshold = C.float(p.ReuseThreshold)
+	cp.start_percent = C.float(p.StartPercent)
+	cp.end_percent = C.float(p.EndPercent)
+	cp.error_decay_rate = C.float(p.ErrorDecayRate)
+	cp.use_relative_threshold = C.bool(p.UseRelativeThreshold)
+	cp.reset_error_on_compute = C.bool(p.ResetErrorOnCompute)
+	cp.Fn_compute_blocks = C.int(p.FnComputeBlocks)
+	cp.Bn_compute_blocks = C.int(p.BnComputeBlocks)
+	cp.residual_diff_threshold = C.float(p.ResidualDiffThreshold)
+	cp.max_warmup_steps = C.int(p.MaxWarmupSteps)
+	cp.max_cached_steps = C.int(p.MaxCachedSteps)
+	cp.max_continuous_cached_steps = C.int(p.MaxContinuousCachedSteps)
+	cp.taylorseer_n_derivatives = C.int(p.TaylorseerNDerivatives)
+	cp.taylorseer_skip_interval = C.int(p.TaylorseerSkipInterval)
+	cp.scm_policy_dynamic = C.bool(p.SCMPolicyDynamic)
+	cp.spectrum_w = C.float(p.SpectrumW)
+	cp.spectrum_m = C.int(p.SpectrumM)
+	cp.spectrum_lam = C.float(p.SpectrumLam)
+	cp.spectrum_window_size = C.int(p.SpectrumWindowSize)
+	cp.spectrum_flex_window = C.float(p.SpectrumFlexWindow)
+	cp.spectrum_warmup_steps = C.int(p.SpectrumWarmupSteps)
+	cp.spectrum_stop_percent = C.float(p.SpectrumStopPercent)
+	return cp
+}
+
+func goHiresParamsToC(p HiresParams) C.sd_hires_params_t {
+	hp := C.sd_hires_params_t{}
+	C.sd_hires_params_init(&hp)
+	hp.enabled = C.bool(p.Enabled)
+	hp.upscaler = C.enum_sd_hires_upscaler_t(p.Upscaler)
+	if p.ModelPath != "" {
+		hp.model_path = C.CString(p.ModelPath)
 	}
+	hp.scale = C.float(p.Scale)
+	hp.target_width = C.int(p.TargetWidth)
+	hp.target_height = C.int(p.TargetHeight)
+	hp.steps = C.int(p.Steps)
+	hp.denoising_strength = C.float(p.DenoisingStrength)
+	hp.upscale_tile_size = C.int(p.UpscaleTileSize)
+	return hp
 }
 
 func boolToInt(b bool) int {

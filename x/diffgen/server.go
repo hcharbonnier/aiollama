@@ -76,7 +76,10 @@ func (s *Server) Load(ctx context.Context, _ ml.SystemInfo, gpus []ml.DeviceInfo
 
 	backend := ResolveBackend(gpus)
 	vramBudget := EstimateVRAMBudget(gpus, backend)
-	if s.vramSize > vramBudget {
+	// On CPU (no GPU budget), skip the pre-flight VRAM check: SD.cpp runs
+	// entirely in system RAM and the OS swap handles oversubscription. The
+	// check is only meaningful for GPU backends where OOM is a hard failure.
+	if backend != "cpu" && s.vramSize > vramBudget {
 		if requireFull {
 			return nil, llm.ErrLoadRequiredFull
 		}

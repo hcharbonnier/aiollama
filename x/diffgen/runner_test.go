@@ -626,8 +626,8 @@ func TestHandlerImageParamsForwarded(t *testing.T) {
 	if p.SampleParams.SampleSteps != 20 {
 		t.Errorf("steps = %d, want 20", p.SampleParams.SampleSteps)
 	}
-	if p.SampleParams.CFGScale != 7.5 {
-		t.Errorf("cfg = %f, want 7.5", p.SampleParams.CFGScale)
+	if p.SampleParams.Guidance.TxtCfg != 7.5 {
+		t.Errorf("cfg = %f, want 7.5", p.SampleParams.Guidance.TxtCfg)
 	}
 }
 

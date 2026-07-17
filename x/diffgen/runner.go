@@ -258,7 +258,9 @@ func (s *runnerServer) handleImageCompletion(w http.ResponseWriter, r *http.Requ
 		ControlStrength: req.ControlStrength,
 		SampleParams: sdcpp.SampleParams{
 			SampleSteps: int32(req.Steps),
-			CFGScale:    req.CFGScale,
+			Guidance: sdcpp.GuidanceParams{
+				TxtCfg: req.CFGScale,
+			},
 		},
 	}
 
@@ -336,8 +338,10 @@ func (s *runnerServer) handleVideoCompletion(w http.ResponseWriter, r *http.Requ
 		FPS:            int32(req.FPS),
 		SampleParams: sdcpp.SampleParams{
 			SampleSteps: int32(req.Steps),
-			CFGScale:    req.CFGScale,
-			FlowShift:   req.FlowShift,
+			Guidance: sdcpp.GuidanceParams{
+				TxtCfg: req.CFGScale,
+			},
+			FlowShift: req.FlowShift,
 		},
 	}
 
@@ -438,12 +442,26 @@ func createSDContext(m *manifest.ModelManifest, backend, maxVRAMGiB string, stre
 		StreamLayers: streamLayers,
 	}
 
+	// SD.cpp distinguishes model_path (a full pipeline checkpoint, e.g. an
+	// SD1.5 .ckpt) from diffusion_model_path (an isolated DiT/diffusion U-Net
+	// weight, e.g. a FLUX.2 or WAN .gguf/.safetensors). Modern SD.cpp model
+	// repos ship isolated diffusion weights, so prefer diffusion_model_path
+	// when a "diffusion_model" component is present. Fall back to model_path
+	// via the legacy "unet" component name for older SD1.x/SDXL checkpoints.
 	if path, err := m.ComponentPath("diffusion_model"); err == nil {
-		c.ModelPath = path
+		c.DiffusionModelPath = path
 	} else if path, err := m.ComponentPath("unet"); err == nil {
 		c.ModelPath = path
 	} else {
 		return nil, fmt.Errorf("no diffusion_model or unet component found")
+	}
+
+	// WAN 2.2 T2V/I2V A14B is a dual-stage model: a LowNoise diffusion model
+	// (loaded above as the primary diffusion_model) plus a separate
+	// HighNoise diffusion model. Without this, dual-stage generation produces
+	// a black/incorrect video. Optional: absent for single-stage models.
+	if path, err := m.ComponentPath("high_noise_diffusion_model"); err == nil {
+		c.HighNoiseDiffusionModelPath = path
 	}
 
 	if path, err := m.ComponentPath("vae"); err == nil {
@@ -463,6 +481,12 @@ func createSDContext(m *manifest.ModelManifest, backend, maxVRAMGiB string, stre
 	}
 	if path, err := m.ComponentPath("taesd"); err == nil {
 		c.TaesdPath = path
+	}
+	if path, err := m.ComponentPath("llm"); err == nil {
+		c.LLMPath = path
+	}
+	if path, err := m.ComponentPath("audio_vae"); err == nil {
+		c.AudioVaePath = path
 	}
 
 	return sdcpp.NewContext(c)

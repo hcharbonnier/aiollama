@@ -1,0 +1,10 @@
+{
+  "architecture": "FluxPipeline",
+  "capabilities": ["image"],
+  "model_format": "sdcpp",
+  "components": {
+    "diffusion_model": "diffusion_model.gguf",
+    "vae": "vae.safetensors",
+    "llm": "llm.gguf"
+  }
+}

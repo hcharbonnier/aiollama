@@ -60,35 +60,47 @@ func importDiffModelFromDir(ctx context.Context, t *testing.T, client *api.Clien
 		return
 	}
 
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read model dir %s: %v", dir, err)
-	}
-
-	files := make(map[string]string, len(entries))
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		full := filepath.Join(dir, e.Name())
-		digest, err := sha256Digest(full)
+	files := make(map[string]string)
+	// Walk recursively so repos with subdirectory layouts (e.g. WAN 2.2's
+	// LowNoise/, HighNoise/, VAE/) can be imported from their original
+	// directory structure without manual flattening. model_index.json and
+	// component files at any depth are included; the path key uses
+	// forward slashes to match the CLI's createRequestFileNames convention.
+	var walk func(d string)
+	walk = func(d string) {
+		sub, err := os.ReadDir(d)
 		if err != nil {
-			t.Fatalf("digest %s: %v", full, err)
+			t.Fatalf("read subdir %s: %v", d, err)
 		}
-
-		// Upload the blob.
-		f, err := os.Open(full)
-		if err != nil {
-			t.Fatalf("open %s: %v", full, err)
-		}
-		if err := client.CreateBlob(ctx, digest, f); err != nil {
+		for _, e := range sub {
+			full := filepath.Join(d, e.Name())
+			if e.IsDir() {
+				walk(full)
+				continue
+			}
+			rel, err := filepath.Rel(dir, full)
+			if err != nil {
+				t.Fatalf("rel path %s: %v", full, err)
+			}
+			rel = filepath.ToSlash(rel)
+			digest, err := sha256Digest(full)
+			if err != nil {
+				t.Fatalf("digest %s: %v", full, err)
+			}
+			f, err := os.Open(full)
+			if err != nil {
+				t.Fatalf("open %s: %v", full, err)
+			}
+			if err := client.CreateBlob(ctx, digest, f); err != nil {
+				f.Close()
+				t.Fatalf("upload blob %s (%s): %v", rel, digest, err)
+			}
 			f.Close()
-			t.Fatalf("upload blob %s (%s): %v", e.Name(), digest, err)
+			files[rel] = digest
+			t.Logf("uploaded %s -> %s", rel, digest)
 		}
-		f.Close()
-		files[e.Name()] = digest
-		t.Logf("uploaded %s -> %s", e.Name(), digest)
 	}
+	walk(dir)
 
 	stream := false
 	if err := client.Create(ctx, &api.CreateRequest{
@@ -116,7 +128,7 @@ func TestDiffgenImageGeneration(t *testing.T) {
 		t.Skip("OLLAMA_TEST_DIFF_MODEL not set; skipping diffgen image integration test")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
 	client, _, cleanup := InitServerConnection(ctx, t)
@@ -133,7 +145,7 @@ func TestDiffgenImageGeneration(t *testing.T) {
 		Prompt: prompt,
 		Width:  512,
 		Height: 512,
-		Steps:  10,
+		Steps:  4,
 	}, func(resp api.GenerateResponse) error {
 		if resp.Image != "" {
 			imageBase64 = resp.Image
@@ -271,7 +283,7 @@ func TestDiffgenImageGenerationProgress(t *testing.T) {
 		t.Skip("OLLAMA_TEST_DIFF_MODEL not set; skipping diffgen image progress test")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
 	client, _, cleanup := InitServerConnection(ctx, t)

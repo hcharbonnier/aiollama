@@ -1,0 +1,16 @@
+{
+  "architecture": "FluxPipeline",
+  "capabilities": ["image"],
+  "model_format": "sdcpp",
+  "components": {
+    "diffusion_model": "flux-2-klein-4b-Q4_0.gguf",
+    "vae": "flux2-vae.safetensors",
+    "llm": "Qwen3-4B-Q2_K.gguf"
+  },
+  "defaults": {
+    "width": 512,
+    "height": 512,
+    "steps": 4,
+    "cfg_scale": 1.0
+  }
+}
