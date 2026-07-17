@@ -340,3 +340,4 @@ func TestSupportsLosslessVP9IsCached(t *testing.T) {
 		t.Errorf("SupportsLosslessVP9 should be stable across calls: %v vs %v", first, second)
 	}
 }
+

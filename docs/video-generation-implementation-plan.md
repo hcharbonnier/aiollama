@@ -821,8 +821,17 @@ streaming `Step`/`Total` fields (already present) carry progress.
 not need to know which backend is selected. `ImageWriter` works as-is.
 
 #### 4.3 Video endpoints (new)
-OpenAI has no standardized video generation API as of 2026. Define an
-Ollama-native surface:
+> **Status: SUPERSEDED.** This section described a non-spec-compliant
+> `/v1/video/generations` surface that predates the official OpenAI Videos
+> API. The OpenAI Videos API (Sora) **does** exist and is fully specified.
+> The conformant implementation is documented in
+> `docs/openai-videos-api-migration.md` and implemented as
+> `POST/GET/DELETE /v1/videos`, `GET /v1/videos/{id}/content` (async job
+> model with MP4 download). The text below is retained for historical
+> reference only.
+>
+> OpenAI has no standardized video generation API as of 2026. Define an
+> Ollama-native surface:
 
 ```
 POST /v1/video/generations      # text-to-video

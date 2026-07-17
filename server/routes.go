@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -52,6 +53,7 @@ import (
 	"github.com/ollama/ollama/version"
 	imagegenmanifest "github.com/ollama/ollama/x/imagegen/manifest"
 	xserver "github.com/ollama/ollama/x/server"
+	"github.com/ollama/ollama/server/videojobs"
 )
 
 const signinURLStr = "https://ollama.com/connect?name=%s&key=%s"
@@ -101,6 +103,20 @@ type Server struct {
 	defaultNumCtx int
 	requestLogger *inferenceRequestLogger
 	modelCaches   *modelCaches
+	videoJobs     videojobs.JobStore
+}
+
+// videoJobConcurrency returns the max concurrent video generation jobs,
+// configurable via the OLLAMA_VIDEO_MAX_CONCURRENT_JOBS env var. Defaults to
+// videojobs.MaxConcurrentJobs (1) when unset or invalid.
+func videoJobConcurrency() int {
+	if v := os.Getenv("OLLAMA_VIDEO_MAX_CONCURRENT_JOBS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+		slog.Warn("invalid OLLAMA_VIDEO_MAX_CONCURRENT_JOBS, using default", "value", v, "default", videojobs.MaxConcurrentJobs)
+	}
+	return videojobs.MaxConcurrentJobs
 }
 
 func init() {
@@ -1915,9 +1931,23 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	// OpenAI-compatible image generation endpoints
 	r.POST("/v1/images/generations", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ImageGenerationsMiddleware(), s.GenerateHandler)
 	r.POST("/v1/images/edits", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ImageEditsMiddleware(), s.GenerateHandler)
-	// Ollama-native video generation endpoints (no OpenAI standard yet)
-	r.POST("/v1/video/generations", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.VideoGenerationsMiddleware(), s.GenerateHandler)
-	r.POST("/v1/video/edits", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.VideoEditsMiddleware(), s.GenerateHandler)
+	// OpenAI-compatible video generation endpoints (async job model).
+	// Conformant with the official OpenAI Videos API (Sora):
+	// https://developers.openai.com/api/reference/resources/videos/
+	r.POST("/v1/videos", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoCreateHandler)
+	r.GET("/v1/videos", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoListHandler)
+	r.GET("/v1/videos/:video_id", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoRetrieveHandler)
+	r.DELETE("/v1/videos/:video_id", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoDeleteHandler)
+	r.GET("/v1/videos/:video_id/content", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoContentHandler)
+	// Deprecated video endpoints (replaced by the conformant /v1/videos
+	// surface above). Return 410 Gone for one release so existing clients
+	// see a clear deprecation signal instead of an opaque 404.
+	r.POST("/v1/video/generations", func(c *gin.Context) {
+		c.JSON(http.StatusGone, gin.H{"error": "this endpoint has been replaced by POST /v1/videos (OpenAI Videos API). See docs/openai-videos-api-migration.md"})
+	})
+	r.POST("/v1/video/edits", func(c *gin.Context) {
+		c.JSON(http.StatusGone, gin.H{"error": "this endpoint has been replaced by POST /v1/videos (OpenAI Videos API). See docs/openai-videos-api-migration.md"})
+	})
 	// OpenAI-compatible audio endpoint
 	r.POST("/v1/audio/transcriptions", middleware.TranscriptionMiddleware(), s.ChatHandler)
 
@@ -1982,6 +2012,7 @@ func Serve(ln net.Listener) error {
 	s := &Server{
 		addr:        ln.Addr(),
 		modelCaches: newModelCaches(),
+		videoJobs:   videojobs.NewJobStoreWithConcurrency(videojobs.NewDefaultTranscoder(), videoJobConcurrency()),
 	}
 	if err := s.initRequestLogging(); err != nil {
 		return err
@@ -2025,6 +2056,9 @@ func Serve(ln net.Listener) error {
 		srvr.Close()
 		schedDone()
 		sched.unloadAllRunners()
+		if s.videoJobs != nil {
+			s.videoJobs.Close()
+		}
 		done()
 	}()
 

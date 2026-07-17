@@ -709,6 +709,13 @@ func decodeImageURL(url string) (api.ImageData, error) {
 	return img, nil
 }
 
+// DecodeImageDataURL is the exported form of decodeImageURL, for use by
+// other packages (e.g. server video handlers) that need to resolve an
+// input_reference.image_url data URL to raw image bytes.
+func DecodeImageDataURL(url string) (api.ImageData, error) {
+	return decodeImageURL(url)
+}
+
 // FromCompletionToolCall converts OpenAI ToolCall format to api.ToolCall
 func FromCompletionToolCall(toolCalls []ToolCall) ([]api.ToolCall, error) {
 	apiToolCalls := make([]api.ToolCall, len(toolCalls))
@@ -928,169 +935,90 @@ func FromImageEditRequest(r ImageEditRequest) (api.GenerateRequest, error) {
 	return req, nil
 }
 
-// VideoGenerationRequest is an OpenAI-style video generation request.
-// OpenAI has no standardized video API as of 2026; this is an Ollama-native
-// surface mirroring the image API conventions.
-type VideoGenerationRequest struct {
-	Model          string  `json:"model"`
-	Prompt         string  `json:"prompt"`
-	NegativePrompt string  `json:"negative_prompt,omitempty"`
-	Size           string  `json:"size,omitempty"`
-	VideoFrames    int32   `json:"video_frames,omitempty"`
-	FPS            int32   `json:"fps,omitempty"`
-	Steps          int32   `json:"steps,omitempty"`
-	CFGScale       float32 `json:"cfg_scale,omitempty"`
-	FlowShift      float32 `json:"flow_shift,omitempty"`
-	Sampler        string  `json:"sampler,omitempty"`
-	OutputFormat   string  `json:"output_format,omitempty"`
-	Seed           *int64  `json:"seed,omitempty"`
-	Stream         *bool   `json:"stream,omitempty"`
-}
-
-// VideoGenerationResponse is an OpenAI-style video generation response.
-type VideoGenerationResponse struct {
-	Created int64            `json:"created"`
-	Data    []VideoURLOrData `json:"data"`
-}
-
-// VideoURLOrData contains either a URL or base64-encoded video data.
-type VideoURLOrData struct {
-	URL     string `json:"url,omitempty"`
-	B64JSON string `json:"b64_json,omitempty"`
-	Format  string `json:"format,omitempty"`
-}
-
-// FromVideoGenerationRequest converts a video generation request to an Ollama GenerateRequest.
+// Video is the OpenAI Videos API Video object, returned by POST /v1/videos,
+// GET /v1/videos/{id}, GET /v1/videos, POST /v1/videos/edits, and
+// POST /v1/videos/extensions. It describes an asynchronous video generation
+// job. The binary MP4 content is fetched separately via
+// GET /v1/videos/{id}/content.
 //
-// OutputFormat is passed through as given, with no implicit default. Video
-// container encoding (e.g. "webm") depends on an optional runtime dependency
-// (ffmpeg on PATH; see x/diffgen/video.go), so defaulting to it here would
-// make the response shape depend on the server's incidental environment
-// rather than on an explicit, deployment-controlled choice. Callers that want
-// a single video file must request output_format="webm" explicitly.
-func FromVideoGenerationRequest(r VideoGenerationRequest) api.GenerateRequest {
-	req := api.GenerateRequest{
-		Model:          r.Model,
-		Prompt:         r.Prompt,
-		NegativePrompt: r.NegativePrompt,
-		VideoFrames:    r.VideoFrames,
-		FPS:            r.FPS,
-		Steps:          r.Steps,
-		CFGScale:       r.CFGScale,
-		FlowShift:      r.FlowShift,
-		Sampler:        r.Sampler,
-		OutputFormat:   r.OutputFormat,
-	}
-	if r.Size != "" {
-		var w, h int32
-		if _, err := fmt.Sscanf(r.Size, "%dx%d", &w, &h); err == nil {
-			req.Width = w
-			req.Height = h
-		}
-	}
-	if r.Seed != nil {
-		if req.Options == nil {
-			req.Options = map[string]any{}
-		}
-		req.Options["seed"] = *r.Seed
-	}
-	if r.Stream != nil {
-		req.Stream = r.Stream
-	}
-	return req
+// Spec: https://developers.openai.com/api/reference/resources/videos
+type Video struct {
+	ID                 string      `json:"id"`
+	Object             string      `json:"object"`
+	CreatedAt          int64       `json:"created_at"`
+	CompletedAt        int64       `json:"completed_at,omitempty"`
+	ExpiresAt          int64       `json:"expires_at,omitempty"`
+	Model              string      `json:"model"`
+	Status             string      `json:"status"`
+	Progress           int         `json:"progress"`
+	Prompt             string      `json:"prompt,omitempty"`
+	Seconds            string      `json:"seconds"`
+	Size               string      `json:"size"`
+	RemixedFromVideoID string      `json:"remixed_from_video_id,omitempty"`
+	Error              *VideoError `json:"error,omitempty"`
 }
 
-// ToVideoGenerationResponse converts an Ollama GenerateResponse to a VideoGenerationResponse.
-//
-// A populated Video field is reported as Format "webm" regardless of the
-// underlying codec: both VP8 ("webm") and VP9 lossless ("webm-lossless")
-// produce WebM containers (see x/diffgen/video.go). A codec downgrade from
-// lossless VP9 to lossy VP8 is surfaced via the runner's Warning, not the
-// response Format.
-func ToVideoGenerationResponse(resp api.GenerateResponse) VideoGenerationResponse {
-	var data []VideoURLOrData
-	if resp.Image != "" {
-		// No container was produced (e.g. ffmpeg unavailable); this is the
-		// last streamed frame as a fallback, encoded as PNG.
-		data = []VideoURLOrData{{B64JSON: resp.Image, Format: "png"}}
-	}
-	if resp.Video != "" {
-		data = []VideoURLOrData{{B64JSON: resp.Video, Format: "webm"}}
-	}
-	return VideoGenerationResponse{
-		Created: resp.CreatedAt.Unix(),
-		Data:    data,
-	}
+// VideoError is the error payload on a failed Video job.
+type VideoError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
-// VideoEditRequest is an OpenAI-style video edit (image-to-video) request.
-type VideoEditRequest struct {
-	Model          string  `json:"model"`
-	Prompt         string  `json:"prompt"`
-	Image          string  `json:"image"`
-	EndImage       string  `json:"end_image,omitempty"`
-	NegativePrompt string  `json:"negative_prompt,omitempty"`
-	Size           string  `json:"size,omitempty"`
-	VideoFrames    int32   `json:"video_frames,omitempty"`
-	FPS            int32   `json:"fps,omitempty"`
-	Steps          int32   `json:"steps,omitempty"`
-	CFGScale       float32 `json:"cfg_scale,omitempty"`
-	FlowShift      float32 `json:"flow_shift,omitempty"`
-	Sampler        string  `json:"sampler,omitempty"`
-	OutputFormat   string  `json:"output_format,omitempty"`
-	Seed           *int64  `json:"seed,omitempty"`
-	Stream         *bool   `json:"stream,omitempty"`
+// VideoDeleteResponse is returned by DELETE /v1/videos/{id}.
+type VideoDeleteResponse struct {
+	ID      string `json:"id"`
+	Deleted bool   `json:"deleted"`
+	Object  string `json:"object"`
 }
 
-// FromVideoEditRequest converts a video edit request to an Ollama GenerateRequest.
-// See FromVideoGenerationRequest for why OutputFormat has no implicit default.
-func FromVideoEditRequest(r VideoEditRequest) (api.GenerateRequest, error) {
-	req := api.GenerateRequest{
-		Model:          r.Model,
-		Prompt:         r.Prompt,
-		NegativePrompt: r.NegativePrompt,
-		VideoFrames:    r.VideoFrames,
-		FPS:            r.FPS,
-		Steps:          r.Steps,
-		CFGScale:       r.CFGScale,
-		FlowShift:      r.FlowShift,
-		Sampler:        r.Sampler,
-		OutputFormat:   r.OutputFormat,
-	}
-
-	if r.Image != "" {
-		imgData, err := decodeImageURL(r.Image)
-		if err != nil {
-			return api.GenerateRequest{}, fmt.Errorf("invalid image: %w", err)
-		}
-		req.Images = append(req.Images, imgData)
-	}
-
-	if r.EndImage != "" {
-		endData, err := decodeImageURL(r.EndImage)
-		if err != nil {
-			return api.GenerateRequest{}, fmt.Errorf("invalid end_image: %w", err)
-		}
-		req.EndImage = endData
-	}
-
-	if r.Size != "" {
-		var w, h int32
-		if _, err := fmt.Sscanf(r.Size, "%dx%d", &w, &h); err == nil {
-			req.Width = w
-			req.Height = h
-		}
-	}
-
-	if r.Seed != nil {
-		if req.Options == nil {
-			req.Options = map[string]any{}
-		}
-		req.Options["seed"] = *r.Seed
-	}
-	if r.Stream != nil {
-		req.Stream = r.Stream
-	}
-
-	return req, nil
+// VideoListResponse is the cursor-paginated response of GET /v1/videos.
+type VideoListResponse struct {
+	Object  string  `json:"object"`
+	Data    []Video `json:"data"`
+	FirstID string  `json:"first_id"`
+	HasMore bool    `json:"has_more"`
+	LastID  string  `json:"last_id"`
 }
+
+// ImageInputReferenceParam is the input_reference object shape on
+// POST /v1/videos. Exactly one of FileID or ImageURL should be provided.
+// FileID requires a Files API upload store (not implemented in v1); ImageURL
+// accepts a fully qualified URL or a base64-encoded data URL.
+type ImageInputReferenceParam struct {
+	FileID   string `json:"file_id,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+}
+
+// Video object/type literals defined by the OpenAI Videos API.
+const (
+	VideoObject      = "video"
+	VideoObjectDeleted = "video.deleted"
+	VideoObjectList  = "list"
+
+	VideoStatusQueued    = "queued"
+	VideoStatusInProgress = "in_progress"
+	VideoStatusCompleted = "completed"
+	VideoStatusFailed    = "failed"
+
+	// Default values per the spec. Note: model is NOT defaulted — it is
+	// required (the local scheduler needs a real Ollama model name, not the
+	// spec's "sora-2" cloud model). See server/videoapi.go.
+	VideoDefaultSeconds = "4"
+	VideoDefaultSize    = "720x1280"
+)
+
+// VideoSecondsValues are the allowed values for the seconds request field on
+// POST /v1/videos (create).
+var VideoSecondsValues = map[string]bool{"4": true, "8": true, "12": true}
+
+// VideoSizeValues are the allowed values for the size request field.
+var VideoSizeValues = map[string]bool{
+	"720x1280":  true,
+	"1280x720":  true,
+	"1024x1792": true,
+	"1792x1024": true,
+}
+
+// ErrVideoFileIDNotSupported is returned when input_reference.file_id is used
+// on POST /v1/videos. The Files API upload store is not implemented in v1.
+var ErrVideoFileIDNotSupported = errors.New("input_reference.file_id is not supported; use input_reference.image_url with a data URL instead")

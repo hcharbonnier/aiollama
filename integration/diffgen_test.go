@@ -3,11 +3,14 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -322,41 +325,146 @@ func TestDiffgenVideoAPI(t *testing.T) {
 
 	ensureDiffModel(ctx, t, client)
 
-	// Test the /v1/video/generations endpoint directly.
+	// Test the OpenAI Videos API: POST /v1/videos (multipart) → poll
+	// GET /v1/videos/{id} → GET /v1/videos/{id}/content (binary MP4).
 	size := p.Size
 	if size == "" {
 		size = fmt.Sprintf("%dx%d", p.Width, p.Height)
 	}
-	reqBody := fmt.Sprintf(`{
-		"model": %q,
-		"prompt": "a dog running in the park",
-		"size": %q,
-		"video_frames": %d,
-		"fps": %d,
-		"steps": %d,
-		"cfg_scale": %f,
-		"flow_shift": %f,
-		"stream": false
-	}`, diffTestModel, size, p.VideoFrames, p.FPS, p.Steps, p.CFGScale, p.FlowShift)
-	url := fmt.Sprintf("http://%s/v1/video/generations", endpoint)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(reqBody))
+
+	// Build a multipart/form-data body per the OpenAI spec.
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	_ = mw.WriteField("model", diffTestModel)
+	_ = mw.WriteField("prompt", "a dog running in the park")
+	_ = mw.WriteField("size", size)
+	_ = mw.WriteField("seconds", "4")
+	_ = mw.Close()
+
+	createURL := fmt.Sprintf("http://%s/v1/videos", endpoint)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, createURL, &body)
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", mw.FormDataContentType())
 
-	t.Logf("POST %s (size=%s, %d frames, %d steps)", url, size, p.VideoFrames, p.Steps)
+	t.Logf("POST %s (size=%s, %d frames, %d steps)", createURL, size, p.VideoFrames, p.Steps)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("video generations request failed: %v", err)
+		t.Fatalf("video create request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("expected status 200, got %d: %s", resp.StatusCode, string(body))
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected status 200 from POST /v1/videos, got %d: %s", resp.StatusCode, string(b))
 	}
-	t.Logf("Video API returned status %d", resp.StatusCode)
+
+	var video struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&video); err != nil {
+		t.Fatalf("failed to decode video response: %v", err)
+	}
+	if video.ID == "" {
+		t.Fatal("video response missing id")
+	}
+	t.Logf("Video API returned job id=%s status=%s", video.ID, video.Status)
+
+	// Poll GET /v1/videos/{id} until completed or failed. Honor the
+	// server's openai-poll-after-ms header (defaulting to 1000ms per the
+	// SDK contract) so the test mirrors real SDK polling behavior.
+	pollDeadline := time.Now().Add(p.Timeout)
+	var pollMS int
+	for time.Now().Before(pollDeadline) {
+		pollMS = pollIntervalFromHeader(resp, 1000)
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context cancelled while polling: %v", ctx.Err())
+		case <-time.After(time.Duration(pollMS) * time.Millisecond):
+		}
+
+		retrieveURL := fmt.Sprintf("http://%s/v1/videos/%s", endpoint, video.ID)
+		rreq, _ := http.NewRequestWithContext(ctx, http.MethodGet, retrieveURL, nil)
+		rresp, err := http.DefaultClient.Do(rreq)
+		if err != nil {
+			t.Fatalf("retrieve request failed: %v", err)
+		}
+		var v struct {
+			Status   string `json:"status"`
+			Progress int    `json:"progress"`
+			Error    *struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.NewDecoder(rresp.Body).Decode(&v)
+		rresp.Body.Close()
+
+		t.Logf("poll status=%s progress=%d%%", v.Status, v.Progress)
+		if v.Status == "completed" {
+			break
+		}
+		if v.Status == "failed" {
+			msg := "unknown"
+			if v.Error != nil {
+				msg = fmt.Sprintf("%s: %s", v.Error.Code, v.Error.Message)
+			}
+			t.Fatalf("video generation failed: %s", msg)
+		}
+	}
+
+	// Fetch the binary MP4 content.
+	contentURL := fmt.Sprintf("http://%s/v1/videos/%s/content", endpoint, video.ID)
+	creq, _ := http.NewRequestWithContext(ctx, http.MethodGet, contentURL, nil)
+	creq.Header.Set("Accept", "application/binary")
+	cresp, err := http.DefaultClient.Do(creq)
+	if err != nil {
+		t.Fatalf("content request failed: %v", err)
+	}
+	defer cresp.Body.Close()
+
+	if cresp.StatusCode != 200 {
+		b, _ := io.ReadAll(cresp.Body)
+		t.Fatalf("expected status 200 from content endpoint, got %d: %s", cresp.StatusCode, string(b))
+	}
+	ct := cresp.Header.Get("Content-Type")
+	if ct != "video/mp4" {
+		t.Errorf("content type = %q, want video/mp4", ct)
+	}
+	mp4, err := io.ReadAll(cresp.Body)
+	if err != nil {
+		t.Fatalf("failed to read mp4 content: %v", err)
+	}
+	if len(mp4) < 8 {
+		t.Fatalf("mp4 content too short: %d bytes", len(mp4))
+	}
+	// Validate the MP4 ftyp box header.
+	if string(mp4[4:8]) != "ftyp" {
+		t.Fatalf("mp4 content missing ftyp box header: % x", mp4[:8])
+	}
+	t.Logf("Video API returned %d bytes of MP4 content", len(mp4))
+
+	// Clean up: delete the video job.
+	delURL := fmt.Sprintf("http://%s/v1/videos/%s", endpoint, video.ID)
+	dreq, _ := http.NewRequestWithContext(ctx, http.MethodDelete, delURL, nil)
+	dresp, err := http.DefaultClient.Do(dreq)
+	if err == nil {
+		dresp.Body.Close()
+	}
+}
+
+// pollIntervalFromHeader reads the openai-poll-after-ms header from the
+// given response, defaulting to defaultMS if absent or invalid (mirroring the
+// OpenAI SDK's polling contract).
+func pollIntervalFromHeader(resp *http.Response, defaultMS int) int {
+	if v := resp.Header.Get("openai-poll-after-ms"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMS
 }
 
 // TestDiffgenImageGenerationProgress verifies that the streaming response

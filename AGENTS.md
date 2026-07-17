@@ -76,6 +76,9 @@ the full development workflow.
 - `api/` defines the public Go client and API types (`types.go`)
 - `openai/` and `middleware/` provide OpenAI- and Anthropic-compatible API layers
 - `fs/` handles GGML/GGUF file parsing and config; `envconfig/` centralizes `OLLAMA_*` environment configuration
+- `server/videojobs/` implements the OpenAI Videos API (`/v1/videos`) async
+  job store + worker (bridges the SDK's job/poll/download model with the
+  synchronous diffgen runner; transcodes frames to MP4 via ffmpeg)
 - `x/` contains experimental subsystems:
   - `x/imagegen/` — MLX image generation (Z-Image, FLUX.2 on macOS, retained)
   - `x/diffgen/` — SD.cpp image + video generation runner (video + broad image coverage, all platforms)
