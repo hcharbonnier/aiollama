@@ -91,7 +91,23 @@ jobs:
             expected_payload: lib/ollama/llama-server
             install-go: true
           - preset: CUDA
-            container: nvidia/cuda:13.0.0-devel-ubuntu22.04
+            # NOTE: the "87" single-arch override below is intentionally
+            # duplicated (kept in sync by convention, not mechanically) in
+            # the 'MLX CUDA 13' and 'SDCPP CUDA 13' entries further down —
+            # it exists purely to keep this PR-time smoke build fast and is
+            # unrelated to the curated architecture lists pinned in
+            # llama/server/CMakePresets.json / cmake/mlx/CMakePresets.json /
+            # cmake/sdcpp/CMakePresets.json, which the "-configure" targets
+            # below validate separately.
+            #
+            # WARNING: "&cuda13_devel_image" below is a YAML anchor aliased
+            # by the 'MLX CUDA 13' and 'SDCPP CUDA 13' entries further down
+            # (via "*cuda13_devel_image"). YAML anchors must be defined
+            # before their aliases in document order — do NOT remove or
+            # reorder this "CUDA" entry ahead of those two without first
+            # updating (or re-anchoring) their `container:` fields, or the
+            # entire workflow file will fail to parse.
+            container: &cuda13_devel_image nvidia/cuda:13.0.0-devel-ubuntu22.04
             superbuild_target: ollama-llama-server-cuda_v13
             superbuild_dir: build/local-superbuild-cuda_v13
             superbuild_args: '-DOLLAMA_LLAMA_BACKENDS=cuda_v13 -DCMAKE_CUDA_ARCHITECTURES=87'
@@ -114,7 +130,7 @@ jobs:
             superbuild_args: '-DOLLAMA_LLAMA_BACKENDS=vulkan'
             expected_payload: lib/ollama/vulkan/libggml-vulkan.so
           - preset: 'MLX CUDA 13'
-            container: nvidia/cuda:13.0.0-devel-ubuntu22.04
+            container: *cuda13_devel_image
             extra-packages: libcudnn9-dev-cuda-13 libopenblas-dev liblapack-dev liblapacke-dev git curl
             superbuild_target: ollama-mlx-cuda_v13
             superbuild_dir: build/local-superbuild-mlx-cuda_v13
@@ -128,6 +144,20 @@ jobs:
             expected_payload: lib/ollama/sdcpp/cpu/libstable-diffusion.so
             install-go: true
             coexist: true
+          - preset: 'SDCPP CUDA 13'
+            container: *cuda13_devel_image
+            superbuild_target: ollama-sdcpp-cuda_v13
+            superbuild_dir: build/local-superbuild-sdcpp-cuda_v13
+            superbuild_args: '-DOLLAMA_SDCPP_BACKENDS=cuda_v13 -DCMAKE_CUDA_ARCHITECTURES=87'
+            expected_payload: lib/ollama/sdcpp/cuda_v13/libstable-diffusion.so
+            # -DCMAKE_CUDA_ARCHITECTURES=87 above overrides the pinned
+            # sdcpp_cuda_v13_linux preset (cmake/sdcpp/CMakePresets.json) so
+            # the smoke build above stays fast, but that also means it never
+            # actually exercises the curated architecture list. The
+            # configure-only check below (see "Verify pinned CUDA
+            # architecture preset configures cleanly" step) validates that
+            # list separately, in its own build dir, without the override.
+            configure_only_args: '-DOLLAMA_SDCPP_BACKENDS=cuda_v13'
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
     steps:
@@ -169,6 +199,11 @@ jobs:
           cmake -S . -B "${{ matrix.superbuild_dir }}" ${{ matrix.superbuild_args }}
           CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build "${{ matrix.superbuild_dir }}" --target "${{ matrix.superbuild_target }}" -- -l $(nproc)
           test -e "${{ matrix.superbuild_dir }}/${{ matrix.expected_payload }}"
+      - name: Verify pinned CUDA architecture preset configures cleanly
+        if: matrix.configure_only_args
+        run: |
+          cmake -S . -B "${{ matrix.superbuild_dir }}-arch-check" ${{ matrix.configure_only_args }}
+          cmake --build "${{ matrix.superbuild_dir }}-arch-check" --target "${{ matrix.superbuild_target }}-configure"
       - name: SD.cpp / llama.cpp coexistence symbol check
         if: matrix.coexist
         run: |

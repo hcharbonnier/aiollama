@@ -1,0 +1,103 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "default",
+      "binaryDir": "${sourceDir}/../../build/sdcpp",
+      "installDir": "${sourceDir}/../../dist",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "sdcpp_cuda_v12_base",
+      "hidden": true,
+      "inherits": ["default"],
+      "cacheVariables": {
+        "CMAKE_CUDA_FLAGS": "-t 2"
+      }
+    },
+    {
+      "name": "sdcpp_cuda_v12_linux",
+      "inherits": ["sdcpp_cuda_v12_base"],
+      "binaryDir": "${sourceDir}/../../build/sdcpp-cuda_v12",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "50-virtual;52-virtual;60;61;70;75;80;86;89;90;90a;120"
+      }
+    },
+    {
+      "name": "sdcpp_cuda_v12_windows",
+      "inherits": ["sdcpp_cuda_v12_base"],
+      "binaryDir": "${sourceDir}/../../build/sdcpp-cuda_v12",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "50-virtual;52-virtual;60-virtual;61-virtual;70;75;80;86;89;90;90a;120"
+      }
+    },
+    {
+      "name": "sdcpp_cuda_v12_user_arch",
+      "inherits": ["sdcpp_cuda_v12_base"],
+      "binaryDir": "${sourceDir}/../../build/sdcpp-cuda_v12"
+    },
+    {
+      "name": "sdcpp_cuda_v13_base",
+      "hidden": true,
+      "inherits": ["default"],
+      "cacheVariables": {
+        "CMAKE_CUDA_FLAGS": "-t 4"
+      }
+    },
+    {
+      "name": "sdcpp_cuda_v13_linux",
+      "inherits": ["sdcpp_cuda_v13_base"],
+      "binaryDir": "${sourceDir}/../../build/sdcpp-cuda_v13",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "75-virtual;80-virtual;86-virtual;87-virtual;89-virtual;90-virtual;90a-virtual;100-virtual;103-virtual;110-virtual;120-virtual;121-virtual"
+      }
+    },
+    {
+      "name": "sdcpp_cuda_v13_windows",
+      "inherits": ["sdcpp_cuda_v13_base"],
+      "binaryDir": "${sourceDir}/../../build/sdcpp-cuda_v13",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "75-virtual;80-virtual;86-virtual;89-virtual;100-virtual;120-virtual"
+      }
+    },
+    {
+      "name": "sdcpp_cuda_v13_user_arch",
+      "inherits": ["sdcpp_cuda_v13_base"],
+      "binaryDir": "${sourceDir}/../../build/sdcpp-cuda_v13"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "sdcpp_cuda_v12_linux",
+      "configurePreset": "sdcpp_cuda_v12_linux",
+      "targets": ["stable-diffusion"]
+    },
+    {
+      "name": "sdcpp_cuda_v12_windows",
+      "configurePreset": "sdcpp_cuda_v12_windows",
+      "targets": ["stable-diffusion"]
+    },
+    {
+      "name": "sdcpp_cuda_v12_user_arch",
+      "configurePreset": "sdcpp_cuda_v12_user_arch",
+      "targets": ["stable-diffusion"]
+    },
+    {
+      "name": "sdcpp_cuda_v13_linux",
+      "configurePreset": "sdcpp_cuda_v13_linux",
+      "targets": ["stable-diffusion"]
+    },
+    {
+      "name": "sdcpp_cuda_v13_windows",
+      "configurePreset": "sdcpp_cuda_v13_windows",
+      "targets": ["stable-diffusion"]
+    },
+    {
+      "name": "sdcpp_cuda_v13_user_arch",
+      "configurePreset": "sdcpp_cuda_v13_user_arch",
+      "targets": ["stable-diffusion"]
+    }
+  ]
+}

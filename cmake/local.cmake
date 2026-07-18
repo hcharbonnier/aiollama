@@ -364,6 +364,18 @@ function(ollama_mlx_cuda_preset output)
     set(${output} "${_preset}" PARENT_SCOPE)
 endfunction()
 
+function(ollama_sdcpp_cuda_preset backend output)
+    ollama_cache_arg_is_set(CMAKE_CUDA_ARCHITECTURES _has_cuda_arch)
+    if(_has_cuda_arch)
+        set(_preset "sdcpp_${backend}_user_arch")
+    elseif(WIN32)
+        set(_preset "sdcpp_${backend}_windows")
+    else()
+        set(_preset "sdcpp_${backend}_linux")
+    endif()
+    set(${output} "${_preset}" PARENT_SCOPE)
+endfunction()
+
 function(ollama_rocm_preset backend output)
     ollama_cache_arg_is_set(AMDGPU_TARGETS _has_amdgpu_targets)
     ollama_cache_arg_is_set(CMAKE_HIP_ARCHITECTURES _has_hip_arch)
@@ -635,6 +647,11 @@ function(ollama_add_sdcpp_build name)
         DEPENDS ${_sdcpp_source_targets}
         LIST_SEPARATOR |
         BUILD_ALWAYS TRUE
+        # Expose "ollama-sdcpp-<name>-configure" as an independently buildable
+        # target. This lets CI validate a pinned CMAKE_CUDA_ARCHITECTURES
+        # preset (e.g. sdcpp_cuda_v13_linux) actually configures cleanly
+        # without paying the cost of a full multi-architecture compile.
+        STEP_TARGETS configure
         ${OLLAMA_NATIVE_EXTERNAL_OPTIONS}
         USES_TERMINAL_CONFIGURE TRUE
         USES_TERMINAL_BUILD TRUE
@@ -951,11 +968,20 @@ foreach(_backend IN LISTS OLLAMA_SDCPP_BACKENDS)
                 -DGGML_NATIVE=ON)
         list(APPEND _sdcpp_targets ollama-sdcpp-cpu)
     elseif(_backend STREQUAL "cuda_v12" OR _backend STREQUAL "cuda_v13")
+        # Pin CMAKE_CUDA_ARCHITECTURES via a dedicated preset, mirroring
+        # llama.cpp (ollama_llama_cuda_preset) and MLX (ollama_mlx_cuda_preset).
+        # Without this, SD.cpp's vendored ggml-cuda/CMakeLists.txt falls back
+        # to its own default (including the literal "native" architecture),
+        # which is unreliable in a GPU-less CI/Docker build environment and
+        # can produce much larger, less predictable binaries than the
+        # explicitly curated list used by the other two native backends.
+        ollama_sdcpp_cuda_preset(${_backend} _sdcpp_cuda_preset)
         set(_cuda_args)
         ollama_append_cache_arg_if_set(_cuda_args CMAKE_CUDA_ARCHITECTURES)
         ollama_append_cache_arg_if_set(_cuda_args CMAKE_CUDA_FLAGS)
         ollama_append_cuda_toolkit_args(_cuda_args ${_backend})
         ollama_add_sdcpp_build(${_backend}
+            PRESET ${_sdcpp_cuda_preset}
             RUNNER_DIR ${_backend}
             CMAKE_ARGS
                 -DGGML_CUDA=ON
