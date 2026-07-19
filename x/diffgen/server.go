@@ -266,6 +266,7 @@ func (s *Server) Completion(ctx context.Context, req llm.CompletionRequest, fn f
 		FPS:            int(req.FPS),
 		FlowShift:      req.FlowShift,
 		EndImage:       req.EndImage,
+		Mask:           req.Mask,
 	}
 	if req.Options != nil {
 		creq.Options = &RequestOptions{

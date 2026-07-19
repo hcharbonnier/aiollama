@@ -45,6 +45,7 @@ import (
 	"github.com/ollama/ollama/middleware"
 	"github.com/ollama/ollama/model/parsers"
 	"github.com/ollama/ollama/model/renderers"
+	"github.com/ollama/ollama/server/videojobs"
 	"github.com/ollama/ollama/template"
 	"github.com/ollama/ollama/thinking"
 	"github.com/ollama/ollama/tools"
@@ -53,7 +54,6 @@ import (
 	"github.com/ollama/ollama/version"
 	imagegenmanifest "github.com/ollama/ollama/x/imagegen/manifest"
 	xserver "github.com/ollama/ollama/x/server"
-	"github.com/ollama/ollama/server/videojobs"
 )
 
 const signinURLStr = "https://ollama.com/connect?name=%s&key=%s"
@@ -104,6 +104,7 @@ type Server struct {
 	requestLogger *inferenceRequestLogger
 	modelCaches   *modelCaches
 	videoJobs     videojobs.JobStore
+	imageFiles    *imageFileStore
 }
 
 // videoJobConcurrency returns the max concurrent video generation jobs,
@@ -1928,9 +1929,16 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	r.GET("/v1/models", middleware.ListMiddleware(), s.ListHandler)
 	r.GET("/v1/models/:model", cloudModelPathPassthroughMiddleware(cloudErrRemoteModelDetailsUnavailable), middleware.RetrieveMiddleware(), s.ShowHandler)
 	r.POST("/v1/responses", s.withInferenceRequestLogging("/v1/responses", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ResponsesMiddleware(), s.ChatHandler)...)
-	// OpenAI-compatible image generation endpoints
-	r.POST("/v1/images/generations", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ImageGenerationsMiddleware(), s.GenerateHandler)
-	r.POST("/v1/images/edits", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.ImageEditsMiddleware(), s.GenerateHandler)
+	// OpenAI-compatible image generation endpoints.
+	// Conformant with the official OpenAI Images API:
+	// https://developers.openai.com/api/reference/resources/images/
+	// These are dedicated handlers (not middleware into /api/generate)
+	// because the spec requires n>1 images, multipart edits, output
+	// transcoding, usage reporting, and URL delivery.
+	r.POST("/v1/images/generations", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.ImageGenerationsHandler)
+	r.POST("/v1/images/edits", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.ImageEditsHandler)
+	// Download route for response_format=url generated images (TTL-bound).
+	r.GET("/v1/images/files/:image_id", s.ImageFileHandler)
 	// OpenAI-compatible video generation endpoints (async job model).
 	// Conformant with the official OpenAI Videos API (Sora):
 	// https://developers.openai.com/api/reference/resources/videos/
@@ -2019,6 +2027,7 @@ func Serve(ln net.Listener) error {
 		addr:        ln.Addr(),
 		modelCaches: newModelCaches(),
 		videoJobs:   videojobs.NewJobStoreWithConcurrency(videojobs.NewDefaultTranscoder(), videoJobConcurrency()),
+		imageFiles:  newImageFileStore(),
 	}
 	if err := s.initRequestLogging(); err != nil {
 		return err
@@ -3270,6 +3279,7 @@ func (s *Server) handleImageGenerate(c *gin.Context, req api.GenerateRequest, mo
 		Sampler:        req.Sampler,
 		OutputFormat:   req.OutputFormat,
 		EndImage:       req.EndImage,
+		Mask:           req.Mask,
 	}, func(cr llm.CompletionResponse) {
 		streamStarted = true
 		res := api.GenerateResponse{

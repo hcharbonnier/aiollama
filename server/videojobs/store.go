@@ -223,18 +223,22 @@ type JobStore interface {
 	Get(id string) (*Job, error)
 	Delete(id string) (bool, error)
 	List(after string, limit int, order string) ([]*Job, bool)
+	// Transcoder exposes the store's transcoder so HTTP handlers can run
+	// on-demand operations (thumbnail/spritesheet variants, source-duration
+	// probes) without re-resolving ffmpeg.
+	Transcoder() Transcoder
 	Close()
 }
 
 // memStore is the in-memory JobStore. Jobs are keyed by id; a background
 // goroutine evicts expired jobs. A semaphore bounds concurrent generation.
 type memStore struct {
-	mu       sync.Mutex
-	jobs     map[string]*Job
-	order    []string // insertion order, for stable listing
-	seqno    int64    // monotonic creation counter, for stable pagination
-	sem      chan struct{}
-	closed   chan struct{}
+	mu         sync.Mutex
+	jobs       map[string]*Job
+	order      []string // insertion order, for stable listing
+	seqno      int64    // monotonic creation counter, for stable pagination
+	sem        chan struct{}
+	closed     chan struct{}
 	transcoder Transcoder
 }
 
@@ -263,6 +267,14 @@ type Transcoder interface {
 	// stitch the source segment and the generated extension into one clip.
 	// Either input may be nil/empty (the other is returned as-is).
 	ConcatMP4(ctx context.Context, first, second []byte, fps int) ([]byte, error)
+	// ProbeDurationSeconds returns the duration of a video in whole seconds
+	// (rounded to nearest). Used by /v1/videos/extensions to report the
+	// stitched total seconds when the source is an uploaded file (no job
+	// record to read seconds from).
+	ProbeDurationSeconds(ctx context.Context, mp4 []byte) (int, error)
+	// Spritesheet renders a tiled grid of frames sampled across the video
+	// as a single PNG (the spec's variant=spritesheet download).
+	Spritesheet(ctx context.Context, mp4 []byte) ([]byte, error)
 	// Available reports whether transcoding is possible (e.g. ffmpeg on PATH).
 	Available() bool
 }
@@ -685,6 +697,11 @@ func (s *memStore) List(after string, limit int, order string) ([]*Job, bool) {
 		return filtered, false
 	}
 	return filtered[:limit], true
+}
+
+// Transcoder returns the store's transcoder.
+func (s *memStore) Transcoder() Transcoder {
+	return s.transcoder
 }
 
 // Close cancels all in-flight jobs and stops the eviction loop.

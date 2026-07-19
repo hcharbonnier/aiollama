@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/ollama/ollama/openai"
@@ -295,13 +296,24 @@ type nilTranscoder struct{}
 func (nilTranscoder) EncodeMP4(ctx context.Context, framePNGs [][]byte, fps int) ([]byte, error) {
 	return nil, errors.New("no transcoder")
 }
+
 func (nilTranscoder) DecodeFrames(ctx context.Context, mp4 []byte, maxFrames int) ([][]byte, int, error) {
 	return nil, 0, errors.New("no transcoder")
 }
+
 func (nilTranscoder) DecodeLastFrame(ctx context.Context, mp4 []byte) ([]byte, error) {
 	return nil, errors.New("no transcoder")
 }
+
 func (nilTranscoder) ConcatMP4(ctx context.Context, first, second []byte, fps int) ([]byte, error) {
+	return nil, errors.New("no transcoder")
+}
+
+func (nilTranscoder) ProbeDurationSeconds(ctx context.Context, mp4 []byte) (int, error) {
+	return 0, errors.New("no transcoder")
+}
+
+func (nilTranscoder) Spritesheet(ctx context.Context, mp4 []byte) ([]byte, error) {
 	return nil, errors.New("no transcoder")
 }
 func (nilTranscoder) Available() bool { return false }
@@ -335,19 +347,61 @@ func TestVideoListEmpty(t *testing.T) {
 	}
 }
 
-// TestVideoContentVariantNotImplemented verifies that variant=thumbnail
-// returns 501.
-func TestVideoContentVariantNotImplemented(t *testing.T) {
-	store := videojobs.NewJobStore(nil)
+// TestVideoContentVariants verifies the thumbnail and spritesheet variants
+// of GET /v1/videos/{id}/content against a completed job, plus validation of
+// unknown variant values and unknown job ids.
+func TestVideoContentVariants(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
 	defer store.Close()
-	_, r := setupVideoRouter(t, store)
+	_, r := setupVideoRouterWithEdits(t, store)
 
-	req, _ := http.NewRequest(http.MethodGet, "/v1/videos/vid_x/content?variant=thumbnail", nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
+	gen := func(ctx context.Context, params videojobs.CreateParams, fn func([]byte, int, int)) error {
+		fn([]byte("frame-png"), 1, 1)
+		return nil
+	}
+	job, err := store.Create(videojobs.CreateParams{
+		Model: "m", Prompt: "p", Seconds: "4", Size: "720x1280", Generate: gen,
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for job.Status() != openai.VideoStatusCompleted && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if job.Status() != openai.VideoStatusCompleted {
+		t.Fatalf("job did not complete: status = %s", job.Status())
+	}
 
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501", w.Code)
+	tests := []struct {
+		name        string
+		url         string
+		wantCode    int
+		wantBody    string
+		wantContent string
+	}{
+		{name: "video variant", url: "/v1/videos/" + job.ID() + "/content?variant=video", wantCode: http.StatusOK, wantContent: "video/mp4"},
+		{name: "default variant", url: "/v1/videos/" + job.ID() + "/content", wantCode: http.StatusOK, wantContent: "video/mp4"},
+		{name: "thumbnail variant", url: "/v1/videos/" + job.ID() + "/content?variant=thumbnail", wantCode: http.StatusOK, wantBody: "decoded-frame", wantContent: "image/png"},
+		{name: "spritesheet variant", url: "/v1/videos/" + job.ID() + "/content?variant=spritesheet", wantCode: http.StatusOK, wantBody: "spritesheet-png", wantContent: "image/png"},
+		{name: "invalid variant", url: "/v1/videos/" + job.ID() + "/content?variant=bogus", wantCode: http.StatusBadRequest},
+		{name: "unknown job thumbnail", url: "/v1/videos/vid_unknown/content?variant=thumbnail", wantCode: http.StatusNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodGet, tt.url, nil)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d: %s", w.Code, tt.wantCode, w.Body.String())
+			}
+			if tt.wantContent != "" && w.Header().Get("Content-Type") != tt.wantContent {
+				t.Errorf("content-type = %q, want %q", w.Header().Get("Content-Type"), tt.wantContent)
+			}
+			if tt.wantBody != "" && w.Body.String() != tt.wantBody {
+				t.Errorf("body = %q, want %q", w.Body.String(), tt.wantBody)
+			}
+		})
 	}
 }
 
@@ -359,14 +413,25 @@ type extendableTranscoder struct{}
 func (extendableTranscoder) EncodeMP4(ctx context.Context, framePNGs [][]byte, fps int) ([]byte, error) {
 	return []byte{0, 0, 0, 0x18, 'f', 't', 'y', 'p'}, nil
 }
+
 func (extendableTranscoder) DecodeFrames(ctx context.Context, mp4 []byte, maxFrames int) ([][]byte, int, error) {
 	return [][]byte{[]byte("decoded-frame")}, 16, nil
 }
+
 func (extendableTranscoder) DecodeLastFrame(ctx context.Context, mp4 []byte) ([]byte, error) {
 	return []byte("decoded-last-frame"), nil
 }
+
 func (extendableTranscoder) ConcatMP4(ctx context.Context, first, second []byte, fps int) ([]byte, error) {
 	return []byte("stitched"), nil
+}
+
+func (extendableTranscoder) ProbeDurationSeconds(ctx context.Context, mp4 []byte) (int, error) {
+	return 8, nil
+}
+
+func (extendableTranscoder) Spritesheet(ctx context.Context, mp4 []byte) ([]byte, error) {
+	return []byte("spritesheet-png"), nil
 }
 func (extendableTranscoder) Available() bool { return true }
 
@@ -576,23 +641,47 @@ func TestVideoExtendAcceptsValidSeconds(t *testing.T) {
 	}
 }
 
-// TestVideoEditRejectsNonMultipart verifies that a JSON body is rejected
-// (edits/extensions require multipart/form-data per spec).
-func TestVideoEditRejectsNonMultipart(t *testing.T) {
+// TestVideoEditJSONFallback verifies the JSON extension on edits/extensions:
+// a JSON body with a {"id": ...} video reference is accepted (aiollama
+// extension; the spec content type is multipart), while a JSON body missing
+// the video reference is rejected.
+func TestVideoEditJSONFallback(t *testing.T) {
 	store := videojobs.NewJobStore(extendableTranscoder{})
 	defer store.Close()
 	_, r := setupVideoRouterWithEdits(t, store)
 
-	body := `{"prompt":"a cat","model":"wan2.1-t2v","video":{"id":"vid_abc"}}`
+	// JSON without a video reference → 400.
+	body := `{"prompt":"a cat","model":"wan2.1-t2v"}`
 	req, _ := http.NewRequest(http.MethodPost, "/v1/videos/edits", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
-
 	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 (multipart required)", w.Code)
+		t.Fatalf("status = %d, want 400 (video required): %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "multipart/form-data") {
-		t.Errorf("body = %q, want multipart requirement", w.Body.String())
+	if !strings.Contains(w.Body.String(), "video is required") {
+		t.Errorf("body = %q, want video requirement", w.Body.String())
+	}
+
+	// JSON with an {"id": ...} reference → accepted (job created). The
+	// referenced source doesn't exist, but job creation is asynchronous;
+	// the create itself returns 200 with status queued.
+	body = `{"prompt":"a cat","model":"wan2.1-t2v","video":{"id":"vid_abc"}}`
+	req, _ = http.NewRequest(http.MethodPost, "/v1/videos/edits", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var v openai.Video
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v.Status != openai.VideoStatusQueued {
+		t.Errorf("status = %q, want queued", v.Status)
+	}
+	if v.RemixedFromVideoID != "vid_abc" {
+		t.Errorf("remixed_from_video_id = %q, want vid_abc", v.RemixedFromVideoID)
 	}
 }

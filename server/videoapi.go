@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/ollama/ollama/llm"
@@ -201,10 +203,10 @@ func (s *Server) VideoDeleteHandler(c *gin.Context) {
 }
 
 // VideoContentHandler handles GET /v1/videos/{video_id}/content. It streams
-// the binary MP4 for a completed job. The OpenAI SDK sets
+// the binary content for a completed job. The OpenAI SDK sets
 // Accept: application/binary and reads the response as a binary stream.
-// variant=video (default) returns the MP4; variant=thumbnail and
-// variant=spritesheet are not yet implemented (501).
+// variant=video (default) returns the MP4; variant=thumbnail returns the
+// first frame as a PNG; variant=spritesheet returns a tiled frame grid PNG.
 func (s *Server) VideoContentHandler(c *gin.Context) {
 	if s.videoJobs == nil {
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, openai.NewError(http.StatusServiceUnavailable, "video generation is not available"))
@@ -213,8 +215,8 @@ func (s *Server) VideoContentHandler(c *gin.Context) {
 
 	id := c.Param("video_id")
 	variant := c.DefaultQuery("variant", "video")
-	if variant != "video" {
-		c.AbortWithStatusJSON(http.StatusNotImplemented, openai.NewError(http.StatusNotImplemented, fmt.Sprintf("variant %q is not supported; only \"video\" is available", variant)))
+	if variant != "video" && variant != "thumbnail" && variant != "spritesheet" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, fmt.Sprintf("variant must be one of video, thumbnail, spritesheet; got %q", variant)))
 		return
 	}
 
@@ -238,6 +240,37 @@ func (s *Server) VideoContentHandler(c *gin.Context) {
 	content, contentType := job.Content()
 	if len(content) == 0 {
 		c.AbortWithStatusJSON(http.StatusNotFound, openai.NewError(http.StatusNotFound, "video content is no longer available"))
+		return
+	}
+
+	switch variant {
+	case "thumbnail", "spritesheet":
+		tc := s.videoJobs.Transcoder()
+		if tc == nil || !tc.Available() {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, openai.NewError(http.StatusServiceUnavailable, "ffmpeg is required on PATH to produce image variants"))
+			return
+		}
+		var png []byte
+		var err error
+		if variant == "thumbnail" {
+			var frames [][]byte
+			frames, _, err = tc.DecodeFrames(c.Request.Context(), content, 1)
+			if err == nil && len(frames) > 0 {
+				png = frames[0]
+			}
+		} else {
+			png, err = tc.Spritesheet(c.Request.Context(), content)
+		}
+		if err != nil || len(png) == 0 {
+			if err == nil {
+				err = errors.New("no frame extracted")
+			}
+			c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, fmt.Sprintf("%s extraction failed: %v", variant, err)))
+			return
+		}
+		c.Header("Content-Type", "image/png")
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s_%s.png\"", id, variant))
+		c.Data(http.StatusOK, "image/png", png)
 		return
 	}
 
@@ -324,7 +357,6 @@ func (s *Server) buildVideoGenerateFunc(modelName string, width, height int32, s
 				}
 			}
 		})
-
 		if err != nil {
 			s.sched.expireRunnersForRuntimeOOM(m, err)
 			return err
@@ -337,10 +369,10 @@ func (s *Server) buildVideoGenerateFunc(modelName string, width, height int32, s
 // both multipart/form-data (the spec-mandated content type, used by the SDK)
 // and JSON (for convenience/curl).
 type videoCreateInput struct {
-	Prompt         string                    `json:"prompt" form:"prompt"`
-	Model          string                    `json:"model,omitempty" form:"model,omitempty"`
-	Seconds        string                    `json:"seconds,omitempty" form:"seconds,omitempty"`
-	Size           string                    `json:"size,omitempty" form:"size,omitempty"`
+	Prompt         string                           `json:"prompt" form:"prompt"`
+	Model          string                           `json:"model,omitempty" form:"model,omitempty"`
+	Seconds        string                           `json:"seconds,omitempty" form:"seconds,omitempty"`
+	Size           string                           `json:"size,omitempty" form:"size,omitempty"`
 	InputReference *openai.ImageInputReferenceParam `json:"input_reference,omitempty"`
 	// inputReferenceFile is populated from a multipart file part named
 	// "input_reference" (when the SDK uploads a file directly rather than
@@ -381,10 +413,10 @@ func (v *videoCreateInput) hasInputReference() bool {
 		(v.InputReference != nil && (v.InputReference.FileID != "" || v.InputReference.ImageURL != ""))
 }
 
-// resolveInputReference returns the raw image bytes for the input_reference,
-// or an error. File parts and data URLs are supported; http(s) URLs and
-// file_id are rejected (file_id requires a Files API upload store not
-// implemented in v1).
+// resolveInputReference returns the raw image bytes for the input_reference.
+// File parts, data URLs, and remote http(s) image URLs are supported;
+// file_id is rejected (it requires a Files API upload store not implemented
+// in v1).
 func (v *videoCreateInput) resolveInputReference(r *http.Request) ([]byte, error) {
 	if len(v.inputReferenceFile) > 0 {
 		return v.inputReferenceFile, nil
@@ -396,13 +428,60 @@ func (v *videoCreateInput) resolveInputReference(r *http.Request) ([]byte, error
 		return nil, openai.ErrVideoFileIDNotSupported
 	}
 	if v.InputReference.ImageURL != "" {
-		img, err := openai.DecodeImageDataURL(v.InputReference.ImageURL)
+		u := v.InputReference.ImageURL
+		if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+			return downloadRemoteImage(r.Context(), u)
+		}
+		img, err := openai.DecodeImageDataURL(u)
 		if err != nil {
 			return nil, fmt.Errorf("input_reference.image_url: %w", err)
 		}
 		return img, nil
 	}
 	return nil, errors.New("input_reference must provide exactly one of image_url or file_id")
+}
+
+// maxRemoteImageBytes bounds a downloaded input_reference image.
+const maxRemoteImageBytes int64 = 25 << 20 // 25 MiB
+
+// remoteImageClient is used for input_reference.image_url downloads. A
+// timeout bounds slow/malicious servers.
+var remoteImageClient = &http.Client{Timeout: 30 * time.Second}
+
+// downloadRemoteImage fetches a remote http(s) image for
+// input_reference.image_url, validating status, content type, and size.
+func downloadRemoteImage(ctx context.Context, u string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("input_reference.image_url: %w", err)
+	}
+	resp, err := remoteImageClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("input_reference.image_url: download failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("input_reference.image_url: download returned status %d", resp.StatusCode)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if ct != "" {
+		mediaType, _, _ := strings.Cut(ct, ";")
+		mediaType = strings.TrimSpace(mediaType)
+		if !strings.HasPrefix(mediaType, "image/") {
+			return nil, fmt.Errorf("input_reference.image_url: unexpected content type %q (expected an image)", ct)
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxRemoteImageBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("input_reference.image_url: read failed: %w", err)
+	}
+	if int64(len(data)) > maxRemoteImageBytes {
+		return nil, fmt.Errorf("input_reference.image_url: image exceeds the %d byte limit", maxRemoteImageBytes)
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("input_reference.image_url: download was empty")
+	}
+	return data, nil
 }
 
 // errorMessage extracts the message from a *openai.VideoError, or returns a
@@ -493,21 +572,45 @@ func (s *Server) parseEditExtendRequest(c *gin.Context, secondsRequired bool, se
 	const maxVideoBodyBytes int64 = 256 << 20 // 256 MiB (accommodate uploaded source MP4)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxVideoBodyBytes)
 
-	contentType := c.GetHeader("Content-Type")
-	if !strings.HasPrefix(contentType, "multipart/form-data") {
-		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "this endpoint requires multipart/form-data"))
-		return editExtendInput{}, false
-	}
-	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "failed to parse multipart form: "+err.Error()))
-		return editExtendInput{}, false
-	}
+	in := editExtendInput{}
 
-	in := editExtendInput{
-		prompt:  c.Request.FormValue("prompt"),
-		model:   c.Request.FormValue("model"),
-		seconds: c.Request.FormValue("seconds"),
-		size:    c.Request.FormValue("size"),
+	contentType := c.GetHeader("Content-Type")
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "failed to parse multipart form: "+err.Error()))
+			return editExtendInput{}, false
+		}
+		in.prompt = c.Request.FormValue("prompt")
+		in.model = c.Request.FormValue("model")
+		in.seconds = c.Request.FormValue("seconds")
+		in.size = c.Request.FormValue("size")
+		fields := map[string]string{
+			"video": c.Request.FormValue("video"),
+		}
+		if err := in.src.fromForm(c.Request, fields); err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
+			return editExtendInput{}, false
+		}
+	} else {
+		// JSON fallback (aiollama extension; the spec content type is
+		// multipart). The video source must be an {"id": ...} reference —
+		// file upload is only possible via multipart.
+		var body struct {
+			Prompt  string                     `json:"prompt"`
+			Model   string                     `json:"model,omitempty"`
+			Seconds string                     `json:"seconds,omitempty"`
+			Size    string                     `json:"size,omitempty"`
+			Video   openai.VideoReferenceParam `json:"video,omitempty"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
+			return editExtendInput{}, false
+		}
+		in.prompt = body.Prompt
+		in.model = body.Model
+		in.seconds = body.Seconds
+		in.size = body.Size
+		in.src.videoID = body.Video.ID
 	}
 
 	if in.prompt == "" {
@@ -543,23 +646,26 @@ func (s *Server) parseEditExtendRequest(c *gin.Context, secondsRequired bool, se
 		return editExtendInput{}, false
 	}
 
-	fields := map[string]string{
-		"video": c.Request.FormValue("video"),
-	}
-	if err := in.src.fromForm(c.Request, fields); err != nil {
-		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
-		return editExtendInput{}, false
-	}
 	if !in.src.hasVideo() {
 		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "video is required (a file part or a {id} object)"))
 		return editExtendInput{}, false
 	}
 
 	// Look up the source job's Seconds (for the remixed job's reporting)
-	// when the source is a {id} reference.
+	// when the source is a {id} reference. For an uploaded file on an
+	// extension, probe the duration so the stitched-total seconds is
+	// reported correctly.
 	if in.src.videoID != "" {
 		if job, err := s.videoJobs.Get(in.src.videoID); err == nil {
 			in.sourceSeconds = job.ToVideo().Seconds
+		}
+	} else if secondsRequired && len(in.src.videoFile) > 0 {
+		if tc := s.videoJobs.Transcoder(); tc != nil && tc.Available() {
+			if secs, err := tc.ProbeDurationSeconds(c.Request.Context(), in.src.videoFile); err == nil && secs > 0 {
+				in.sourceSeconds = strconv.Itoa(secs)
+			} else {
+				slog.Warn("could not probe uploaded source video duration; stitched seconds will report requested seconds only", "error", err)
+			}
 		}
 	}
 

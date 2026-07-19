@@ -825,85 +825,74 @@ func TestFromChatRequest_TopLogprobsRange(t *testing.T) {
 	}
 }
 
-func TestFromImageEditRequest_Basic(t *testing.T) {
-	req := ImageEditRequest{
-		Model:  "test-model",
-		Prompt: "make it blue",
-		Image:  prefix + image,
+func TestParseImageSize(t *testing.T) {
+	tests := []struct {
+		size    string
+		wantW   int32
+		wantH   int32
+		wantErr bool
+	}{
+		{size: "1024x1024", wantW: 1024, wantH: 1024},
+		{size: "512x768", wantW: 512, wantH: 768},
+		{size: "1x1", wantW: 1, wantH: 1},
+		{size: "4096x4096", wantW: 4096, wantH: 4096},
+		{size: "", wantErr: true},
+		{size: "1024", wantErr: true},
+		{size: "axb", wantErr: true},
+		{size: "0x100", wantErr: true},
+		{size: "-5x100", wantErr: true},
+		{size: "4097x100", wantErr: true},
+		{size: "100x4097", wantErr: true},
 	}
-
-	result, err := FromImageEditRequest(req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if result.Model != "test-model" {
-		t.Errorf("expected model 'test-model', got %q", result.Model)
-	}
-
-	if result.Prompt != "make it blue" {
-		t.Errorf("expected prompt 'make it blue', got %q", result.Prompt)
-	}
-
-	if len(result.Images) != 1 {
-		t.Fatalf("expected 1 image, got %d", len(result.Images))
-	}
-}
-
-func TestFromImageEditRequest_WithSize(t *testing.T) {
-	req := ImageEditRequest{
-		Model:  "test-model",
-		Prompt: "make it blue",
-		Image:  prefix + image,
-		Size:   "512x768",
-	}
-
-	result, err := FromImageEditRequest(req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if result.Width != 512 {
-		t.Errorf("expected width 512, got %d", result.Width)
-	}
-
-	if result.Height != 768 {
-		t.Errorf("expected height 768, got %d", result.Height)
+	for _, tt := range tests {
+		t.Run(tt.size, func(t *testing.T) {
+			w, h, err := ParseImageSize(tt.size)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", tt.size)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if w != tt.wantW || h != tt.wantH {
+				t.Errorf("expected %dx%d, got %dx%d", tt.wantW, tt.wantH, w, h)
+			}
+		})
 	}
 }
 
-func TestFromImageEditRequest_WithSeed(t *testing.T) {
-	seed := int64(12345)
-	req := ImageEditRequest{
-		Model:  "test-model",
-		Prompt: "make it blue",
-		Image:  prefix + image,
-		Seed:   &seed,
+func TestStepsForImageQuality(t *testing.T) {
+	tests := []struct {
+		quality string
+		want    int32
+	}{
+		{quality: "", want: 0},
+		{quality: ImageQualityAuto, want: 0},
+		{quality: ImageQualityLow, want: 20},
+		{quality: ImageQualityMedium, want: 30},
+		{quality: ImageQualityHigh, want: 50},
+		{quality: "bogus", want: 0},
 	}
-
-	result, err := FromImageEditRequest(req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if result.Options == nil {
-		t.Fatal("expected options to be set")
-	}
-
-	if result.Options["seed"] != seed {
-		t.Errorf("expected seed %d, got %v", seed, result.Options["seed"])
+	for _, tt := range tests {
+		t.Run(tt.quality, func(t *testing.T) {
+			if got := StepsForImageQuality(tt.quality); got != tt.want {
+				t.Errorf("expected %d, got %d", tt.want, got)
+			}
+		})
 	}
 }
 
-func TestFromImageEditRequest_InvalidImage(t *testing.T) {
-	req := ImageEditRequest{
-		Model:  "test-model",
-		Prompt: "make it blue",
-		Image:  "not-valid-base64",
+func TestValidImageQuality(t *testing.T) {
+	for _, q := range []string{"low", "medium", "high", "auto"} {
+		if !ValidImageQuality(q) {
+			t.Errorf("expected %q to be valid", q)
+		}
 	}
-
-	_, err := FromImageEditRequest(req)
-	if err == nil {
-		t.Error("expected error for invalid image")
+	for _, q := range []string{"", "hd", "standard", "AUTO"} {
+		if ValidImageQuality(q) {
+			t.Errorf("expected %q to be invalid", q)
+		}
 	}
 }

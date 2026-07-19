@@ -34,6 +34,7 @@ type DiffRequest struct {
 	FPS         int     `json:"fps,omitempty"`          // e.g. 16
 	FlowShift   float32 `json:"flow_shift,omitempty"`   // WAN: 3.0
 	EndImage    []byte  `json:"end_image,omitempty"`    // FLF2V end frame
+	Mask        []byte  `json:"mask,omitempty"`         // inpainting mask (white = edit region)
 
 	Options *RequestOptions `json:"options,omitempty"`
 }

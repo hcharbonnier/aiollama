@@ -486,6 +486,121 @@ func findNextPNGSig(data []byte, start int) int {
 // generous safety cap against accidental misuse with huge external files.
 var maxConcatInputBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
 
+// ffprobeLookup caches the ffprobe lookup (ships with ffmpeg).
+var ffprobeLookup struct {
+	once sync.Once
+	path string
+	err  error
+}
+
+func lookupFFprobe() (string, error) {
+	ffprobeLookup.once.Do(func() {
+		ffprobeLookup.path, ffprobeLookup.err = exec.LookPath("ffprobe")
+	})
+	return ffprobeLookup.path, ffprobeLookup.err
+}
+
+// ProbeDurationSeconds returns the video duration in whole seconds, rounded
+// to nearest. It prefers ffprobe; if ffprobe is absent or fails (e.g. a
+// container it cannot parse from a pipe), it falls back to parsing the
+// "Duration: HH:MM:SS.cc" line from ffmpeg -i stderr output.
+func (t *ffmpegTranscoder) ProbeDurationSeconds(ctx context.Context, mp4 []byte) (int, error) {
+	if len(mp4) == 0 {
+		return 0, errors.New("no video to probe")
+	}
+	if ffprobe, err := lookupFFprobe(); err == nil {
+		args := []string{
+			"-v", "error",
+			"-show_entries", "format=duration",
+			"-of", "default=noprint_wrappers=1:nokey=1",
+			"pipe:0",
+		}
+		cmd := exec.CommandContext(ctx, ffprobe, args...)
+		cmd.Stdin = bytes.NewReader(mp4)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if runErr := cmd.Run(); runErr == nil {
+			out := strings.TrimSpace(stdout.String())
+			if secs, parseErr := strconv.ParseFloat(out, 64); parseErr == nil && secs > 0 {
+				return int(secs + 0.5), nil
+			}
+		}
+	}
+
+	// Fallback: ffmpeg -i prints "Duration: 00:00:04.03" on stderr (and exits
+	// non-zero because no output was specified — expected).
+	ffmpeg, err := t.lookup()
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe and ffmpeg not found on PATH: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, ffmpeg, "-hide_banner", "-i", "pipe:0")
+	cmd.Stdin = bytes.NewReader(mp4)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	_ = cmd.Run() // non-zero exit is expected (no output file)
+
+	const marker = "Duration: "
+	idx := strings.Index(stderr.String(), marker)
+	if idx < 0 {
+		return 0, fmt.Errorf("could not determine video duration (no Duration line in ffmpeg output)")
+	}
+	fields := strings.Fields(stderr.String()[idx+len(marker):])
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("could not parse video duration")
+	}
+	hms := strings.TrimSuffix(fields[0], ",")
+	var hh, mm int
+	var ss float64
+	if _, err := fmt.Sscanf(hms, "%d:%d:%f", &hh, &mm, &ss); err != nil {
+		return 0, fmt.Errorf("could not parse video duration %q: %w", hms, err)
+	}
+	total := float64(hh*3600+mm*60) + ss
+	if total <= 0 {
+		return 0, fmt.Errorf("video has non-positive duration %q", hms)
+	}
+	return int(total + 0.5), nil
+}
+
+// Spritesheet renders a tiled grid of frames sampled across the video as a
+// single PNG, via ffmpeg's tile filter. Frames are sampled at ~1 fps over
+// the clip and tiled 5x5 (25 cells max), scaled to 320px-wide cells — a
+// reasonable storyboard for the short clips this API produces.
+func (t *ffmpegTranscoder) Spritesheet(ctx context.Context, mp4 []byte) ([]byte, error) {
+	if len(mp4) == 0 {
+		return nil, errors.New("no video to decode")
+	}
+	ffmpeg, err := t.lookup()
+	if err != nil {
+		return nil, fmt.Errorf("ffmpeg not found on PATH: %w", err)
+	}
+	args := []string{
+		"-hide_banner", "-loglevel", "error",
+		"-i", "pipe:0",
+		"-vf", "fps=1,scale=320:-2,tile=5x5:margin=2:padding=2",
+		"-frames:v", "1",
+		"-f", "image2pipe",
+		"-vcodec", "png",
+		"pipe:1",
+	}
+	cmd := exec.CommandContext(ctx, ffmpeg, args...)
+	cmd.Stdin = bytes.NewReader(mp4)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return nil, fmt.Errorf("ffmpeg spritesheet failed: %s", msg)
+	}
+	if stdout.Len() == 0 {
+		return nil, errors.New("ffmpeg spritesheet produced no output")
+	}
+	return stdout.Bytes(), nil
+}
+
 // ConcatMP4 concatenates two MP4 byte streams into a single MP4 using ffmpeg's
 // concat demuxer. Both inputs should have been produced by EncodeMP4 (same
 // codec/fps). fps sets the output frame rate explicitly to avoid drift. If
@@ -559,7 +674,8 @@ func (t *ffmpegTranscoder) concatWithCodec(ctx context.Context, ffmpeg, firstPat
 	if copyOnly {
 		args = append(args, "-c", "copy")
 	} else {
-		args = append(args,
+		args = append(
+			args,
 			"-r", strconv.Itoa(fps),
 			"-c:v", "libx264",
 			"-pix_fmt", "yuv420p",
@@ -567,7 +683,8 @@ func (t *ffmpegTranscoder) concatWithCodec(ctx context.Context, ffmpeg, firstPat
 			"-crf", "23",
 		)
 	}
-	args = append(args,
+	args = append(
+		args,
 		"-movflags", "+frag_keyframe+empty_moov+default_base_moof",
 		"-f", "mp4", "pipe:1",
 	)

@@ -793,20 +793,62 @@ func FromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 	}, nil
 }
 
-// ImageGenerationRequest is an OpenAI-compatible image generation request.
+// ImageGenerationRequest is an OpenAI-compatible image generation request,
+// covering the full field set of POST /v1/images/generations (gpt-image-1 /
+// dall-e-3). Style, Moderation, and User are accepted for SDK compatibility
+// but have no local effect. Seed is an aiollama extension.
 type ImageGenerationRequest struct {
-	Model          string `json:"model"`
-	Prompt         string `json:"prompt"`
-	N              int    `json:"n,omitempty"`
-	Size           string `json:"size,omitempty"`
-	ResponseFormat string `json:"response_format,omitempty"`
-	Seed           *int64 `json:"seed,omitempty"`
+	Model             string `json:"model"`
+	Prompt            string `json:"prompt"`
+	N                 int    `json:"n,omitempty"`
+	Size              string `json:"size,omitempty"`
+	Quality           string `json:"quality,omitempty"`
+	ResponseFormat    string `json:"response_format,omitempty"`
+	Style             string `json:"style,omitempty"`
+	Background        string `json:"background,omitempty"`
+	OutputFormat      string `json:"output_format,omitempty"`
+	OutputCompression *int   `json:"output_compression,omitempty"`
+	Moderation        string `json:"moderation,omitempty"`
+	Stream            bool   `json:"stream,omitempty"`
+	PartialImages     int    `json:"partial_images,omitempty"`
+	User              string `json:"user,omitempty"`
+	Seed              *int64 `json:"seed,omitempty"`
 }
+
+// Image field value constants per the OpenAI Images API.
+const (
+	ImageResponseFormatB64JSON = "b64_json"
+	ImageResponseFormatURL     = "url"
+
+	ImageOutputFormatPNG  = "png"
+	ImageOutputFormatJPEG = "jpeg"
+	ImageOutputFormatWebP = "webp"
+
+	ImageQualityLow    = "low"
+	ImageQualityMedium = "medium"
+	ImageQualityHigh   = "high"
+	ImageQualityAuto   = "auto"
+
+	ImageBackgroundTransparent = "transparent"
+	ImageBackgroundOpaque      = "opaque"
+	ImageBackgroundAuto        = "auto"
+
+	// ImageDefaultSize is the spec default size for gpt-image-1/dall-e-3.
+	ImageDefaultSize = "1024x1024"
+	// ImageMaxN bounds the number of images per request (spec: 1-10).
+	ImageMaxN = 10
+	// ImageMaxDimension bounds width/height (matches handleImageGenerate).
+	ImageMaxDimension = 4096
+	// ImageMaxEditInputs bounds the number of input images on edits
+	// (spec: up to 16 for gpt-image-1).
+	ImageMaxEditInputs = 16
+)
 
 // ImageGenerationResponse is an OpenAI-compatible image generation response.
 type ImageGenerationResponse struct {
 	Created int64            `json:"created"`
 	Data    []ImageURLOrData `json:"data"`
+	Usage   *ImageUsage      `json:"usage,omitempty"`
 }
 
 // ImageURLOrData contains either a URL or base64-encoded image data.
@@ -815,39 +857,51 @@ type ImageURLOrData struct {
 	B64JSON string `json:"b64_json,omitempty"`
 }
 
-// FromImageGenerationRequest converts an OpenAI image generation request to an Ollama GenerateRequest.
-func FromImageGenerationRequest(r ImageGenerationRequest) api.GenerateRequest {
-	req := api.GenerateRequest{
-		Model:  r.Model,
-		Prompt: r.Prompt,
-	}
-	// Parse size if provided (e.g., "1024x768")
-	if r.Size != "" {
-		var w, h int32
-		if _, err := fmt.Sscanf(r.Size, "%dx%d", &w, &h); err == nil {
-			req.Width = w
-			req.Height = h
-		}
-	}
-	if r.Seed != nil {
-		if req.Options == nil {
-			req.Options = map[string]any{}
-		}
-		req.Options["seed"] = *r.Seed
-	}
-	return req
+// ImageUsage is the token-usage block on Images API responses (gpt-image-1).
+// Local diffusion runners do not tokenize like gpt-image-1; fields are 0
+// unless the runner reported prompt-eval counts.
+type ImageUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	TotalTokens  int `json:"total_tokens"`
 }
 
-// ToImageGenerationResponse converts an Ollama GenerateResponse to an OpenAI ImageGenerationResponse.
-func ToImageGenerationResponse(resp api.GenerateResponse) ImageGenerationResponse {
-	var data []ImageURLOrData
-	if resp.Image != "" {
-		data = []ImageURLOrData{{B64JSON: resp.Image}}
+// ParseImageSize parses an OpenAI image size ("1024x1024") into width and
+// height. Unlike the cloud API, aiollama accepts any WxH within bounds
+// (extension); this validates format and range only.
+func ParseImageSize(size string) (int32, int32, error) {
+	var w, h int32
+	if _, err := fmt.Sscanf(size, "%dx%d", &w, &h); err != nil || w <= 0 || h <= 0 {
+		return 0, 0, fmt.Errorf("invalid size %q: expected WxH (e.g. \"1024x1024\")", size)
 	}
-	return ImageGenerationResponse{
-		Created: resp.CreatedAt.Unix(),
-		Data:    data,
+	if w > ImageMaxDimension || h > ImageMaxDimension {
+		return 0, 0, fmt.Errorf("size %q exceeds the maximum dimension of %d", size, ImageMaxDimension)
 	}
+	return w, h, nil
+}
+
+// StepsForImageQuality maps the OpenAI quality hint to a diffusion step
+// count for local runners. Empty/auto returns 0 (model default).
+func StepsForImageQuality(quality string) int32 {
+	switch quality {
+	case ImageQualityLow:
+		return 20
+	case ImageQualityMedium:
+		return 30
+	case ImageQualityHigh:
+		return 50
+	default:
+		return 0
+	}
+}
+
+// ValidImageQuality reports whether quality is a spec value.
+func ValidImageQuality(q string) bool {
+	switch q {
+	case ImageQualityLow, ImageQualityMedium, ImageQualityHigh, ImageQualityAuto:
+		return true
+	}
+	return false
 }
 
 // TranscriptionResponse is the response format for /v1/audio/transcriptions.
@@ -891,48 +945,29 @@ func FromTranscriptionRequest(r TranscriptionRequest) (*api.ChatRequest, error) 
 	}, nil
 }
 
-// ImageEditRequest is an OpenAI-compatible image edit request.
+// ImageEditRequest is the parsed form of an OpenAI-compatible image edit
+// request (POST /v1/images/edits). The spec content type is
+// multipart/form-data (image file parts + scalar fields); aiollama also
+// accepts JSON as an extension. Parsing happens in the server handlers, so
+// images arrive already decoded.
 type ImageEditRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Image  string `json:"image"`          // Base64-encoded image data
-	Size   string `json:"size,omitempty"` // e.g., "1024x1024"
-	Seed   *int64 `json:"seed,omitempty"`
-}
-
-// FromImageEditRequest converts an OpenAI image edit request to an Ollama GenerateRequest.
-func FromImageEditRequest(r ImageEditRequest) (api.GenerateRequest, error) {
-	req := api.GenerateRequest{
-		Model:  r.Model,
-		Prompt: r.Prompt,
-	}
-
-	// Decode the input image
-	if r.Image != "" {
-		imgData, err := decodeImageURL(r.Image)
-		if err != nil {
-			return api.GenerateRequest{}, fmt.Errorf("invalid image: %w", err)
-		}
-		req.Images = append(req.Images, imgData)
-	}
-
-	// Parse size if provided (e.g., "1024x768")
-	if r.Size != "" {
-		var w, h int32
-		if _, err := fmt.Sscanf(r.Size, "%dx%d", &w, &h); err == nil {
-			req.Width = w
-			req.Height = h
-		}
-	}
-
-	if r.Seed != nil {
-		if req.Options == nil {
-			req.Options = map[string]any{}
-		}
-		req.Options["seed"] = *r.Seed
-	}
-
-	return req, nil
+	Model  string
+	Prompt string
+	// Images are the decoded input image(s) (spec: up to 16 for
+	// gpt-image-1; the first is the primary image to edit).
+	Images []api.ImageData
+	// Mask is the decoded mask image converted to SD.cpp semantics
+	// (white = region to edit). Nil when no mask was provided.
+	Mask              api.ImageData
+	N                 int
+	Size              string
+	Quality           string
+	ResponseFormat    string
+	Background        string
+	OutputFormat      string
+	OutputCompression *int
+	User              string
+	Seed              *int64
 }
 
 // Video is the OpenAI Videos API Video object, returned by POST /v1/videos,
@@ -991,14 +1026,14 @@ type ImageInputReferenceParam struct {
 
 // Video object/type literals defined by the OpenAI Videos API.
 const (
-	VideoObject      = "video"
+	VideoObject        = "video"
 	VideoObjectDeleted = "video.deleted"
-	VideoObjectList  = "list"
+	VideoObjectList    = "list"
 
-	VideoStatusQueued    = "queued"
+	VideoStatusQueued     = "queued"
 	VideoStatusInProgress = "in_progress"
-	VideoStatusCompleted = "completed"
-	VideoStatusFailed    = "failed"
+	VideoStatusCompleted  = "completed"
+	VideoStatusFailed     = "failed"
 
 	// Default values per the spec. Note: model is NOT defaulted — it is
 	// required (the local scheduler needs a real Ollama model name, not the

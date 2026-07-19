@@ -249,3 +249,67 @@ func TestFFmpegTranscoderConcatMP4EmptyInputs(t *testing.T) {
 		t.Errorf("concat(solo, nil) = %v, %v; want solo, nil", got, err)
 	}
 }
+
+func TestFFmpegTranscoderProbeDurationSeconds(t *testing.T) {
+	requireFFmpeg(t)
+	tc := &ffmpegTranscoder{}
+
+	// 16 frames at 8 fps = 2 seconds.
+	frames := make([][]byte, 16)
+	for i := range frames {
+		frames[i] = pngFrame(64, 48, color.RGBA{255, 0, 0, 255})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	mp4, err := tc.EncodeMP4(ctx, frames, 8)
+	if err != nil {
+		t.Fatalf("EncodeMP4: %v", err)
+	}
+
+	secs, err := tc.ProbeDurationSeconds(ctx, mp4)
+	if err != nil {
+		t.Fatalf("ProbeDurationSeconds: %v", err)
+	}
+	if secs != 2 {
+		t.Errorf("duration = %d, want 2", secs)
+	}
+
+	if _, err := tc.ProbeDurationSeconds(ctx, nil); err == nil {
+		t.Error("expected error for empty input")
+	}
+}
+
+func TestFFmpegTranscoderSpritesheet(t *testing.T) {
+	requireFFmpeg(t)
+	tc := &ffmpegTranscoder{}
+
+	frames := make([][]byte, 16)
+	for i := range frames {
+		frames[i] = pngFrame(64, 48, color.RGBA{0, 255, 0, 255})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	mp4, err := tc.EncodeMP4(ctx, frames, 8)
+	if err != nil {
+		t.Fatalf("EncodeMP4: %v", err)
+	}
+
+	sheet, err := tc.Spritesheet(ctx, mp4)
+	if err != nil {
+		t.Fatalf("Spritesheet: %v", err)
+	}
+	img, err := png.Decode(bytes.NewReader(sheet))
+	if err != nil {
+		t.Fatalf("spritesheet is not a PNG: %v", err)
+	}
+	// Tiled sheet should be larger than a single 64x48 frame.
+	if img.Bounds().Dx() < 64 || img.Bounds().Dy() < 48 {
+		t.Errorf("spritesheet too small: %v", img.Bounds())
+	}
+
+	if _, err := tc.Spritesheet(ctx, nil); err == nil {
+		t.Error("expected error for empty input")
+	}
+}

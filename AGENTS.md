@@ -79,6 +79,10 @@ the full development workflow.
 - `server/videojobs/` implements the OpenAI Videos API (`/v1/videos`) async
   job store + worker (bridges the SDK's job/poll/download model with the
   synchronous diffgen runner; transcodes frames to MP4 via ffmpeg)
+- `server/imageapi.go` implements the OpenAI Images API (`/v1/images/generations`,
+  `/v1/images/edits`) as dedicated handlers driving the scheduler directly
+  (n>1, multipart edits with mask→SD.cpp inpaint plumbing, output transcoding,
+  `usage`); `server/imagefiles.go` is the TTL store behind `response_format=url`
 - `x/` contains experimental subsystems:
   - `x/imagegen/` — MLX image generation (Z-Image, FLUX.2 on macOS, retained)
   - `x/diffgen/` — SD.cpp image + video generation runner (video + broad image coverage, all platforms)

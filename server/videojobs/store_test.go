@@ -20,7 +20,7 @@ type mockTranscoder struct {
 		frames int
 		fps    int
 	}
-	output      []byte
+	output       []byte
 	decodeFrames [][]byte
 	decodeErr    error
 	concatErr    error
@@ -77,6 +77,16 @@ func (m *mockTranscoder) ConcatMP4(ctx context.Context, first, second []byte, fp
 		return m.concatOutput, nil
 	}
 	return []byte{0, 0, 0, 0x18, 'f', 't', 'y', 'p'}, nil
+}
+
+// ProbeDurationSeconds returns a canned 8-second duration.
+func (m *mockTranscoder) ProbeDurationSeconds(ctx context.Context, mp4 []byte) (int, error) {
+	return 8, nil
+}
+
+// Spritesheet returns a stub PNG.
+func (m *mockTranscoder) Spritesheet(ctx context.Context, mp4 []byte) ([]byte, error) {
+	return []byte("stub-spritesheet"), nil
 }
 
 func (m *mockTranscoder) Available() bool { return m.available }
@@ -733,9 +743,9 @@ func TestStitchSeconds(t *testing.T) {
 		{"8", "4", "12"},
 		{"4", "4", "8"},
 		{"12", "8", "20"},
-		{"", "4", "4"},     // unknown source → requested
-		{"abc", "4", "4"},  // invalid source → requested
-		{"8", "", ""},      // invalid requested → empty
+		{"", "4", "4"},    // unknown source → requested
+		{"abc", "4", "4"}, // invalid source → requested
+		{"8", "", ""},     // invalid requested → empty
 	}
 	for _, c := range cases {
 		got := stitchSeconds(c.source, c.requested)

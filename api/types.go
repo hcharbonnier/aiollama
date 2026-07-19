@@ -174,6 +174,11 @@ type GenerateRequest struct {
 
 	// EndImage is a base64-encoded end frame for FLF2V video generation.
 	EndImage []byte `json:"end_image,omitempty"`
+
+	// Mask is an inpainting mask image (PNG bytes) for image generation
+	// models. White pixels mark the region to (re)generate (SD.cpp
+	// semantics). Only used for image edit models that support inpainting.
+	Mask []byte `json:"mask,omitempty"`
 }
 
 // ChatRequest describes a request sent by [Client.Chat].

@@ -237,6 +237,9 @@ type CompletionRequest struct {
 	Sampler        string  `json:"sampler,omitempty"`
 	OutputFormat   string  `json:"output_format,omitempty"`
 	EndImage       []byte  `json:"end_image,omitempty"`
+	// Mask is an inpainting mask image (PNG bytes, white = region to edit)
+	// for image edit requests. Follows SD.cpp mask semantics.
+	Mask []byte `json:"mask,omitempty"`
 }
 
 type ChatRequest struct {

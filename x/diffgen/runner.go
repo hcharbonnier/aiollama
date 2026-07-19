@@ -246,6 +246,12 @@ func (s *runnerServer) handleImageCompletion(w http.ResponseWriter, r *http.Requ
 			initImage = &img
 		}
 	}
+	var maskImage *sdcpp.Image
+	if len(req.Mask) > 0 {
+		if img, err := bytesToSDImage(req.Mask); err == nil {
+			maskImage = &img
+		}
+	}
 
 	params := sdcpp.ImageGenParams{
 		Prompt:          req.Prompt,
@@ -255,6 +261,7 @@ func (s *runnerServer) handleImageCompletion(w http.ResponseWriter, r *http.Requ
 		Seed:            req.Seed,
 		BatchCount:      int32(max(1, req.BatchCount)),
 		InitImage:       initImage,
+		MaskImage:       maskImage,
 		ControlStrength: req.ControlStrength,
 		SampleParams: sdcpp.SampleParams{
 			SampleSteps: int32(req.Steps),
