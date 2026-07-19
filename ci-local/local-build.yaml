@@ -1,0 +1,210 @@
+# Local-only CI for building the default and ROCm Docker images with `act`.
+#
+# Mirrors .github/workflows/release.yaml (linux-depends matrix + the two
+# docker-build-push amd64 matrix entries: default and `-rocm`) adapted for
+# local execution:
+#   - no Docker Hub login (no secrets available locally)
+#   - loads images locally instead of pushing to a registry
+#   - no registry cache (cache-to/cache-from removed); instead a persistent
+#     named buildx builder (ci-local-builder) is created once on the host
+#     daemon and reused by every run, so layer cache, ccache and Go module
+#     cache mounts survive across `act` invocations. Remove it with
+#     `./ci-local/build-local.sh clean` to start from a cold cache.
+#   - backend sources (llama.cpp, MLX, MLX-C, SD.cpp) are cloned exactly once
+#     per build by the Dockerfile `sources` stage and shared by all backends
+#   - every loaded image is given an explicit stable tag so it survives in
+#     the local daemon and can be inspected/run with plain `docker run`.
+#
+# It is NOT referenced by any upstream CI trigger. Run it via:
+#   ./ci-local/build-local.sh              # build both default and rocm images
+#   ./ci-local/build-local.sh default       # only the default amd64 image
+#   ./ci-local/build-local.sh rocm          # only the amd64-rocm image
+#   ./ci-local/build-local.sh deps          # only the backend dep stages
+#   ./ci-local/build-local.sh setup         # install/verify act, then exit
+#
+# Built image tags:
+#   - aiollama:local                  default amd64 image
+#   - aiollama:local-rocm             ROCm amd64 image
+#   - aiollama/dep:<target>-amd64     one per backend dep stage
+#
+# This file is intentionally separate from .github/workflows/ so it is never
+# picked up by GitHub Actions.
+
+name: local-build
+
+on:
+  # Only ever triggered manually by the local runner script.
+  workflow_dispatch:
+
+env:
+  CGO_CFLAGS: "-O3"
+  CGO_CXXFLAGS: "-O3"
+  BUILDKIT_TIMEOUT: 28800000   # 4h
+  ACTIONS_RUNNER_DEBUG: "true" # extra logs
+
+jobs:
+  setup-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      GOFLAGS: ${{ steps.goflags.outputs.GOFLAGS }}
+      VERSION: ${{ steps.goflags.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set environment
+        id: goflags
+        run: |
+          echo "GOFLAGS='-ldflags=-w -s \"-X=github.com/ollama/ollama/version.Version=local\" \"-X=github.com/ollama/ollama/server.mode=release\"'" | tee -a "$GITHUB_OUTPUT"
+          echo "VERSION=local" | tee -a "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Dependency stages — every backend payload used by the default or ROCm
+  # image. Equivalent to release.yaml::linux-depends (minus the arm64 entries
+  # which are temporarily disabled upstream). Each result is loaded with a
+  # stable tag (aiollama/dep:<target>-amd64) so the local daemon keeps a
+  # named copy that can be inspected or re-tagged.
+  # ---------------------------------------------------------------------------
+  deps:
+    runs-on: ubuntu-latest
+    needs: setup-environment
+    env:
+      GOFLAGS: ${{ needs.setup-environment.outputs.GOFLAGS }}
+    strategy:
+      max-parallel: 4
+      matrix:
+        include:
+          - arch: amd64
+            target: llama-server-cpu
+            tag: aiollama/dep:llama-server-cpu-amd64
+          - arch: amd64
+            target: llama-server-cuda_v12
+            tag: aiollama/dep:llama-server-cuda_v12-amd64
+          - arch: amd64
+            target: llama-server-cuda_v13
+            tag: aiollama/dep:llama-server-cuda_v13-amd64
+          - arch: amd64
+            target: mlx
+            tag: aiollama/dep:mlx-amd64
+          - arch: amd64
+            target: llama-server-rocm_v7_2
+            tag: aiollama/dep:llama-server-rocm_v7_2-amd64
+          - arch: amd64
+            target: llama-server-vulkan
+            tag: aiollama/dep:llama-server-vulkan-amd64
+          - arch: amd64
+            target: sdcpp-cpu
+            tag: aiollama/dep:sdcpp-cpu-amd64
+          - arch: amd64
+            target: sdcpp-cuda_v12
+            tag: aiollama/dep:sdcpp-cuda_v12-amd64
+          - arch: amd64
+            target: sdcpp-cuda_v13
+            tag: aiollama/dep:sdcpp-cuda_v13-amd64
+          - arch: amd64
+            target: sdcpp-vulkan
+            tag: aiollama/dep:sdcpp-vulkan-amd64
+    steps:
+      - uses: actions/checkout@v4
+      # Persistent named builder on the host daemon (created once, reused by
+      # every act run) so layer cache and cache mounts (ccache, Go modules)
+      # survive between builds. setup-buildx-action would create a fresh,
+      # empty builder container on each invocation.
+      - name: Set up persistent buildx builder
+        run: |
+          docker buildx inspect ci-local-builder >/dev/null 2>&1 \
+            || docker buildx create --name ci-local-builder --driver docker-container
+          docker buildx use ci-local-builder
+          docker buildx inspect --bootstrap
+      - name: Build dep stage ${{ matrix.target }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          target: ${{ matrix.target }}
+          provenance: false
+          sbom: false
+          # `load` imports the resulting image into the local Docker daemon
+          # (visible to subsequent act jobs through the shared docker.sock).
+          # `tags` is required: without it, `load` produces an `<none>:<none>`
+          # image that is hard to reference later.
+          load: true
+          push: false
+          tags: ${{ matrix.tag }}
+          build-args: |
+            GOFLAGS=${{ env.GOFLAGS }}
+            CGO_CFLAGS=${{ env.CGO_CFLAGS }}
+            CGO_CXXFLAGS=${{ env.CGO_CXXFLAGS }}
+            OLLAMA_MLX_BUILD_JOBS=1
+            OLLAMA_MLX_NVCC_THREADS=1
+
+  # ---------------------------------------------------------------------------
+  # Default amd64 image — equivalent of release.yaml's first docker-build-push
+  # matrix entry (no FLAVOR, target=archive). Backend stages are rebuilt
+  # inline by `docker buildx build` from this single invocation; the `deps`
+  # job above is purely for validating each backend in isolation.
+  # ---------------------------------------------------------------------------
+  default-image:
+    runs-on: ubuntu-latest
+    needs: setup-environment
+    env:
+      GOFLAGS: ${{ needs.setup-environment.outputs.GOFLAGS }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up persistent buildx builder
+        run: |
+          docker buildx inspect ci-local-builder >/dev/null 2>&1 \
+            || docker buildx create --name ci-local-builder --driver docker-container
+          docker buildx use ci-local-builder
+          docker buildx inspect --bootstrap
+      - name: Build default amd64 image (archive target)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          target: archive
+          provenance: false
+          sbom: false
+          load: true
+          push: false
+          tags: aiollama:local
+          build-args: |
+            CGO_CFLAGS
+            CGO_CXXFLAGS
+            GOFLAGS=${{ env.GOFLAGS }}
+            OLLAMA_MLX_BUILD_JOBS=1
+            OLLAMA_MLX_NVCC_THREADS=1
+
+  # ---------------------------------------------------------------------------
+  # ROCm amd64 image — equivalent of release.yaml's second docker-build-push
+  # matrix entry (suffix=-rocm): target=image-archive with FLAVOR=rocm.
+  # ---------------------------------------------------------------------------
+  rocm-image:
+    runs-on: ubuntu-latest
+    needs: setup-environment
+    env:
+      GOFLAGS: ${{ needs.setup-environment.outputs.GOFLAGS }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up persistent buildx builder
+        run: |
+          docker buildx inspect ci-local-builder >/dev/null 2>&1 \
+            || docker buildx create --name ci-local-builder --driver docker-container
+          docker buildx use ci-local-builder
+          docker buildx inspect --bootstrap
+      - name: Build ROCm amd64 image (image-archive target, FLAVOR=rocm)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          target: image-archive
+          provenance: false
+          sbom: false
+          load: true
+          push: false
+          tags: aiollama:local-rocm
+          build-args: |
+            CGO_CFLAGS
+            CGO_CXXFLAGS
+            GOFLAGS=${{ env.GOFLAGS }}
+            FLAVOR=rocm
+            OLLAMA_MLX_BUILD_JOBS=1
+            OLLAMA_MLX_NVCC_THREADS=1

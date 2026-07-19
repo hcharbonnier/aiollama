@@ -38,6 +38,32 @@ ENV CMAKE_GENERATOR=Ninja
 ENV LDFLAGS=-s
 
 #
+# External sources — clone llama.cpp / MLX / MLX-C / SD.cpp exactly once per
+# build instead of once per backend stage. Each backend COPYs its source tree
+# from here and points CMake at it via the FETCHCONTENT_SOURCE_DIR_* /
+# OLLAMA_*_SOURCE overrides already supported by the build. Layers here are
+# keyed on the *_VERSION pins only, so with a persistent buildx builder the
+# clones are also reused across builds until a pin changes.
+#
+
+FROM base AS sources
+RUN command -v git >/dev/null 2>&1 || dnf install -y git
+WORKDIR /src
+COPY LLAMA_CPP_VERSION MLX_VERSION MLX_C_VERSION SD_CPP_VERSION .
+RUN set -e; \
+    clone() { \
+        git init -q "$3"; \
+        git -C "$3" remote add origin "$1"; \
+        git -C "$3" fetch -q --depth 1 origin "$2" || git -C "$3" fetch -q --depth 1 origin "refs/tags/$2"; \
+        git -C "$3" checkout -q FETCH_HEAD; \
+        rm -rf "$3/.git"; \
+    }; \
+    clone https://github.com/ggml-org/llama.cpp.git          "$(cat LLAMA_CPP_VERSION)" llama.cpp; \
+    clone https://github.com/ml-explore/mlx.git              "$(cat MLX_VERSION)"       mlx; \
+    clone https://github.com/ml-explore/mlx-c.git            "$(cat MLX_C_VERSION)"     mlx-c; \
+    clone https://github.com/leejet/stable-diffusion.cpp.git "$(cat SD_CPP_VERSION)"    sdcpp
+
+#
 # GPU toolchain stages — provide compilers for llama-server GPU builds
 #
 
@@ -84,8 +110,9 @@ FROM cpu-deps AS llama-server-cpu
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
 COPY llama/compat llama/compat
+COPY --from=sources /src/llama.cpp /src/llama.cpp
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -S llama/server --preset cpu \
+    cmake -S llama/server --preset cpu -DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP=/src/llama.cpp \
         && cmake --build build/llama-server-cpu -- -l $(nproc) \
         && cmake --install build/llama-server-cpu --component llama-server --strip \
         && for lib in \
@@ -103,8 +130,9 @@ FROM cuda-12-deps AS llama-server-cuda_v12
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
 COPY llama/compat llama/compat
+COPY --from=sources /src/llama.cpp /src/llama.cpp
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -S llama/server --preset llama_cuda_v12_linux \
+    cmake -S llama/server --preset llama_cuda_v12_linux -DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP=/src/llama.cpp \
         && cmake --build build/llama-server-cuda_v12 -- -l $(nproc) \
         && cmake --install build/llama-server-cuda_v12 --component llama-server --strip
 
@@ -115,8 +143,9 @@ FROM cuda-13-deps AS llama-server-cuda_v13
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
 COPY llama/compat llama/compat
+COPY --from=sources /src/llama.cpp /src/llama.cpp
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -S llama/server --preset llama_cuda_v13_linux \
+    cmake -S llama/server --preset llama_cuda_v13_linux -DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP=/src/llama.cpp \
         && cmake --build build/llama-server-cuda_v13 -- -l $(nproc) \
         && cmake --install build/llama-server-cuda_v13 --component llama-server --strip
 
@@ -128,8 +157,9 @@ ENV CC=clang CXX=clang++
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
 COPY llama/compat llama/compat
+COPY --from=sources /src/llama.cpp /src/llama.cpp
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -S llama/server --preset rocm_v7_2_linux \
+    cmake -S llama/server --preset rocm_v7_2_linux -DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP=/src/llama.cpp \
         && cmake --build build/llama-server-rocm_v7_2 -- -l $(nproc) \
         && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
 RUN rm -f dist/lib/ollama/rocm_v7_2/rocblas/library/*gfx90[06]*
@@ -141,8 +171,9 @@ FROM vulkan-deps AS llama-server-vulkan
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
 COPY llama/compat llama/compat
+COPY --from=sources /src/llama.cpp /src/llama.cpp
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -S llama/server --preset vulkan \
+    cmake -S llama/server --preset vulkan -DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP=/src/llama.cpp \
         && cmake --build build/llama-server-vulkan -- -l $(nproc) \
         && cmake --install build/llama-server-vulkan --component llama-server --strip
 
@@ -165,8 +196,9 @@ ENV CMAKE_GENERATOR=Ninja
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
 COPY llama/compat llama/compat
+COPY --from=sources /src/llama.cpp /src/llama.cpp
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -S llama/server --preset llama_cuda_jetpack5 \
+    cmake -S llama/server --preset llama_cuda_jetpack5 -DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP=/src/llama.cpp \
         && cmake --build build/llama-server-cuda_jetpack5 -- -l $(nproc) \
         && cmake --install build/llama-server-cuda_jetpack5 --component llama-server --strip
 
@@ -185,8 +217,9 @@ ENV CMAKE_GENERATOR=Ninja
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
 COPY llama/compat llama/compat
+COPY --from=sources /src/llama.cpp /src/llama.cpp
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -S llama/server --preset llama_cuda_jetpack6 \
+    cmake -S llama/server --preset llama_cuda_jetpack6 -DFETCHCONTENT_SOURCE_DIR_LLAMA_CPP=/src/llama.cpp \
         && cmake --build build/llama-server-cuda_jetpack6 -- -l $(nproc) \
         && cmake --install build/llama-server-cuda_jetpack6 --component llama-server --strip
 
@@ -216,17 +249,24 @@ COPY cmake cmake
 COPY x/imagegen/mlx x/imagegen/mlx
 COPY go.mod go.sum .
 COPY MLX_VERSION MLX_C_VERSION .
+COPY --from=sources /src/mlx /src/mlx
+COPY --from=sources /src/mlx-c /src/mlx-c
 RUN curl -fsSL https://golang.org/dl/go$(awk '/^go/ { print $2 }' go.mod).linux-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac).tar.gz | tar xz -C /usr/local
 ENV PATH=/usr/local/go/bin:$PATH
-RUN go mod download
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    go mod download
 RUN --mount=type=cache,target=/root/.ccache \
     --mount=type=bind,from=local-mlx,target=/tmp/local-mlx \
     --mount=type=bind,from=local-mlx-c,target=/tmp/local-mlx-c \
     if [ -f /tmp/local-mlx/CMakeLists.txt ]; then \
         export OLLAMA_MLX_SOURCE=/tmp/local-mlx; \
+    else \
+        export OLLAMA_MLX_SOURCE=/src/mlx; \
     fi \
     && if [ -f /tmp/local-mlx-c/CMakeLists.txt ]; then \
         export OLLAMA_MLX_C_SOURCE=/tmp/local-mlx-c; \
+    else \
+        export OLLAMA_MLX_C_SOURCE=/src/mlx-c; \
     fi \
     && cmake -S . -B build/mlx_cuda_v13 -DOLLAMA_MLX_BACKENDS=cuda_v13 -DBLAS_INCLUDE_DIRS=/usr/include/openblas -DLAPACK_INCLUDE_DIRS=/usr/include/openblas -DCMAKE_CUDA_FLAGS="-t ${OLLAMA_MLX_NVCC_THREADS}" ${MLX_CUDA_RAM_MB:+-DMLX_CUDA_RAM_MB=${MLX_CUDA_RAM_MB}} -DOLLAMA_PAYLOAD_INSTALL_PREFIX=/go/src/github.com/ollama/ollama/dist \
         && cmake --build build/mlx_cuda_v13 --target ollama-mlx-cuda_v13 -- -l $(nproc) ${OLLAMA_MLX_BUILD_JOBS:+-j ${OLLAMA_MLX_BUILD_JOBS}}
@@ -255,7 +295,9 @@ COPY CMakeLists.txt CMakePresets.json .
 COPY cmake cmake
 COPY x/sdcpp/include x/sdcpp/include
 COPY SD_CPP_VERSION .
+COPY --from=sources /src/sdcpp /src/sdcpp
 RUN --mount=type=cache,target=/root/.ccache \
+    OLLAMA_SD_CPP_SOURCE=/src/sdcpp \
     cmake -S . -B build/sdcpp-cpu -DOLLAMA_SDCPP_BACKENDS=cpu -DOLLAMA_PAYLOAD_INSTALL_PREFIX=/go/src/github.com/ollama/ollama/dist \
         && cmake --build build/sdcpp-cpu --target ollama-sdcpp-cpu -- -l $(nproc)
 
@@ -268,7 +310,9 @@ COPY CMakeLists.txt CMakePresets.json .
 COPY cmake cmake
 COPY x/sdcpp/include x/sdcpp/include
 COPY SD_CPP_VERSION .
+COPY --from=sources /src/sdcpp /src/sdcpp
 RUN --mount=type=cache,target=/root/.ccache \
+    OLLAMA_SD_CPP_SOURCE=/src/sdcpp \
     cmake -S . -B build/sdcpp-cuda_v12 -DOLLAMA_SDCPP_BACKENDS=cuda_v12 -DOLLAMA_PAYLOAD_INSTALL_PREFIX=/go/src/github.com/ollama/ollama/dist \
         && cmake --build build/sdcpp-cuda_v12 --target ollama-sdcpp-cuda_v12 -- -l $(nproc)
 
@@ -281,7 +325,9 @@ COPY CMakeLists.txt CMakePresets.json .
 COPY cmake cmake
 COPY x/sdcpp/include x/sdcpp/include
 COPY SD_CPP_VERSION .
+COPY --from=sources /src/sdcpp /src/sdcpp
 RUN --mount=type=cache,target=/root/.ccache \
+    OLLAMA_SD_CPP_SOURCE=/src/sdcpp \
     cmake -S . -B build/sdcpp-cuda_v13 -DOLLAMA_SDCPP_BACKENDS=cuda_v13 -DOLLAMA_PAYLOAD_INSTALL_PREFIX=/go/src/github.com/ollama/ollama/dist \
         && cmake --build build/sdcpp-cuda_v13 --target ollama-sdcpp-cuda_v13 -- -l $(nproc)
 
@@ -294,7 +340,9 @@ COPY CMakeLists.txt CMakePresets.json .
 COPY cmake cmake
 COPY x/sdcpp/include x/sdcpp/include
 COPY SD_CPP_VERSION .
+COPY --from=sources /src/sdcpp /src/sdcpp
 RUN --mount=type=cache,target=/root/.ccache \
+    OLLAMA_SD_CPP_SOURCE=/src/sdcpp \
     cmake -S . -B build/sdcpp-vulkan -DOLLAMA_SDCPP_BACKENDS=vulkan -DOLLAMA_PAYLOAD_INSTALL_PREFIX=/go/src/github.com/ollama/ollama/dist \
         && cmake --build build/sdcpp-vulkan --target ollama-sdcpp-vulkan -- -l $(nproc)
 
@@ -310,7 +358,8 @@ WORKDIR /go/src/github.com/ollama/ollama
 COPY go.mod go.sum .
 RUN curl -fsSL https://golang.org/dl/go$(awk '/^go/ { print $2 }' go.mod).linux-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac).tar.gz | tar xz -C /usr/local
 ENV PATH=/usr/local/go/bin:$PATH
-RUN go mod download
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    go mod download
 COPY . .
 ARG GOFLAGS="'-ldflags=-w -s'"
 ENV CGO_ENABLED=1

@@ -17,12 +17,21 @@
 #   - aiollama:local-rocm             ROCm amd64 image
 #   - aiollama/dep:<target>-amd64     one per backend dep stage
 #
+# Caching: backend sources (llama.cpp, MLX, MLX-C, SD.cpp) are cloned exactly
+# once per build by the Dockerfile `sources` stage and shared by all backend
+# stages. The workflow builds through a persistent named buildx builder
+# (`ci-local-builder`, docker-container driver) created once on the host
+# daemon, so layer cache and RUN --mount=type=cache contents (ccache, Go
+# module cache) are reused across runs — only changed stages rebuild.
+# Remove the builder with the `clean` mode to force a cold build.
+#
 # Usage:
 #   ./ci-local/build-local.sh              # build both default and rocm images
 #   ./ci-local/build-local.sh default       # only the default amd64 image
 #   ./ci-local/build-local.sh rocm          # only the amd64-rocm image
 #   ./ci-local/build-local.sh deps          # only the backend dep stages
 #   ./ci-local/build-local.sh setup         # only install/check act
+#   ./ci-local/build-local.sh clean         # remove the ci-local-builder cache
 #
 # Environment variables (optional):
 #   ACT_VERSION     pin a specific act release tag (default: latest)
@@ -55,7 +64,7 @@ err()  { printf '\033[1;31m[ci-local]\033[0m %s\n' "$*" >&2; }
 
 usage() {
   cat <<EOF
-Usage: $0 [all|default|rocm|deps|setup]
+Usage: $0 [all|default|rocm|deps|setup|clean]
 
   all       Build both the default amd64 and amd64-rocm images
   default   Build only the default amd64 image   (tagged aiollama:local)
@@ -63,6 +72,7 @@ Usage: $0 [all|default|rocm|deps|setup]
   deps      Build only the backend dep stages in isolation
             (tagged aiollama/dep:<target>-amd64, one per backend)
   setup     Install/verify act, then exit
+  clean     Remove the persistent ci-local-builder (drops all build cache)
 
 Environment:
   ACT_VERSION   act release tag (default: latest)
@@ -177,12 +187,23 @@ print_built_images() {
 # -----------------------------------------------------------------------------
 
 case "${MODE}" in
-  all|default|rocm|deps|setup) ;;
+  all|default|rocm|deps|setup|clean) ;;
   -h|--help|help) usage; exit 0 ;;
   *) err "unknown mode: '${MODE}'"; usage; exit 2 ;;
 esac
 
 check_docker
+
+if [ "${MODE}" = "clean" ]; then
+  if docker buildx inspect ci-local-builder >/dev/null 2>&1; then
+    docker buildx rm ci-local-builder
+    log "removed ci-local-builder (all build cache dropped)."
+  else
+    log "no ci-local-builder found, nothing to clean."
+  fi
+  exit 0
+fi
+
 install_act
 
 if [ "${MODE}" = "setup" ]; then
