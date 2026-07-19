@@ -180,7 +180,9 @@ func validateImageRequest(c *gin.Context, modelName, prompt string, n int, size,
 		return bad(fmt.Sprintf("n must be between 1 and %d", openai.ImageMaxN))
 	}
 
-	if size == "" {
+	if size == "" || size == "auto" {
+		// "auto" is sent by the SDK for the recent GPT image models; let the
+		// runner pick (spec default).
 		size = openai.ImageDefaultSize
 	}
 	w, h, err := openai.ParseImageSize(size)
@@ -342,9 +344,17 @@ func (s *Server) runImageGeneration(c *gin.Context, p imageGenParams) {
 		Created: time.Now().Unix(),
 		Data:    data,
 		Usage: &openai.ImageUsage{
-			InputTokens:  inputTokens,
+			InputTokens: inputTokens,
+			InputTokensDetails: &openai.ImageUsageTokensDetails{
+				ImageTokens: len(p.images),
+				TextTokens:  inputTokens,
+			},
 			OutputTokens: 0,
-			TotalTokens:  inputTokens,
+			OutputTokensDetails: &openai.ImageUsageTokensDetails{
+				ImageTokens: len(data),
+				TextTokens:  0,
+			},
+			TotalTokens: inputTokens,
 		},
 	})
 }

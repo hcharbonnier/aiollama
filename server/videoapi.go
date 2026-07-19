@@ -410,6 +410,16 @@ func (v *videoCreateInput) fromForm(r *http.Request) error {
 		}
 		v.InputReference = &ref
 	}
+	// The openai-python SDK serializes nested dicts in multipart bodies as
+	// bracket-notation fields (qs.stringify_items, array_format="brackets"):
+	// input_reference[image_url]=..., input_reference[file_id]=...
+	if v.InputReference == nil {
+		imageURL := r.FormValue("input_reference[image_url]")
+		fileID := r.FormValue("input_reference[file_id]")
+		if imageURL != "" || fileID != "" {
+			v.InputReference = &openai.ImageInputReferenceParam{ImageURL: imageURL, FileID: fileID}
+		}
+	}
 	return nil
 }
 
@@ -589,6 +599,11 @@ func (v *videoSourceInput) fromForm(r *http.Request, fields map[string]string) e
 		}
 		v.videoID = ref.ID
 	}
+	// The openai-python SDK serializes the {"id": ...} object in multipart
+	// bodies as a bracket-notation field: video[id]=vid_...
+	if v.videoID == "" {
+		v.videoID = r.FormValue("video[id]")
+	}
 	return nil
 }
 
@@ -614,12 +629,14 @@ type editExtendInput struct {
 
 // parseEditExtendRequest performs the shared validation for the edit and
 // extend handlers. It reads multipart/form-data, validates prompt/model/size,
-// resolves the `video` reference, and looks up the source job's Seconds (for
-// stitched-total reporting on extensions). secondsRequired controls whether
-// `seconds` is mandatory (extensions) or optional with a default (edits);
-// secondsValues selects the allowed set (VideoSecondsValues for edits,
-// VideoExtensionSecondsValues for extensions). On any validation failure it
-// aborts the gin context with a 400/503 and returns ok=false.
+// resolves the `video` reference, and when that reference is an {id} inherits
+// model/size from the source job (the SDK omits them, like the cloud API) and
+// captures its Seconds (for stitched-total reporting on extensions).
+// secondsRequired controls whether `seconds` is mandatory (extensions) or
+// optional with a default (edits); secondsValues selects the allowed set
+// (VideoSecondsValues for edits, VideoExtensionSecondsValues for extensions).
+// On any validation failure it aborts the gin context with a 400/503 and
+// returns ok=false.
 func (s *Server) parseEditExtendRequest(c *gin.Context, secondsRequired bool, secondsValues map[string]bool) (editExtendInput, bool) {
 	if s.videoJobs == nil {
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, openai.NewError(http.StatusServiceUnavailable, "video generation is not available"))
@@ -678,6 +695,31 @@ func (s *Server) parseEditExtendRequest(c *gin.Context, secondsRequired bool, se
 		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt must be 32000 characters or less"))
 		return editExtendInput{}, false
 	}
+
+	if !in.src.hasVideo() {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "video is required (a file part or a {id} object)"))
+		return editExtendInput{}, false
+	}
+
+	// The openai-python SDK sends neither model nor size on edits/extensions
+	// (the cloud API inherits them from the source video). When the source is
+	// an {id} reference, resolve the source job once — before model/size
+	// validation — and inherit the fields the client omitted. This lookup
+	// also captures the source's Seconds (for stitched-total reporting on
+	// extensions).
+	if in.src.videoID != "" {
+		if job, err := s.videoJobs.Get(in.src.videoID); err == nil {
+			src := job.ToVideo()
+			if in.model == "" {
+				in.model = src.Model
+			}
+			if in.size == "" {
+				in.size = src.Size
+			}
+			in.sourceSeconds = src.Seconds
+		}
+	}
+
 	if in.model == "" {
 		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "model is required"))
 		return editExtendInput{}, false
@@ -703,20 +745,10 @@ func (s *Server) parseEditExtendRequest(c *gin.Context, secondsRequired bool, se
 		return editExtendInput{}, false
 	}
 
-	if !in.src.hasVideo() {
-		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "video is required (a file part or a {id} object)"))
-		return editExtendInput{}, false
-	}
-
-	// Look up the source job's Seconds (for the remixed job's reporting)
-	// when the source is a {id} reference. For an uploaded file on an
-	// extension, probe the duration so the stitched-total seconds is
-	// reported correctly.
-	if in.src.videoID != "" {
-		if job, err := s.videoJobs.Get(in.src.videoID); err == nil {
-			in.sourceSeconds = job.ToVideo().Seconds
-		}
-	} else if secondsRequired && len(in.src.videoFile) > 0 {
+	// For an uploaded file on an extension, probe the duration so the
+	// stitched-total seconds is reported correctly. (For an {id} reference
+	// the source job's Seconds was already captured above.)
+	if in.src.videoID == "" && secondsRequired && len(in.src.videoFile) > 0 {
 		if tc := s.videoJobs.Transcoder(); tc != nil && tc.Available() {
 			if secs, err := tc.ProbeDurationSeconds(c.Request.Context(), in.src.videoFile); err == nil && secs > 0 {
 				in.sourceSeconds = strconv.Itoa(secs)
@@ -801,4 +833,81 @@ func (s *Server) VideoExtendHandler(c *gin.Context) {
 
 	c.Header(openaiPollAfterMS, strconv.Itoa(defaultPollIntervalMS))
 	c.JSON(http.StatusOK, job.ToVideo())
+}
+
+// VideoRemixHandler handles POST /v1/videos/{video_id}/remix. The request
+// body is JSON {"prompt": "..."} (the SDK's VideoRemixParams carries no file
+// params, hence no multipart). Remix is semantically an edit by id with a
+// new prompt: it re-renders a new video from the source's first frame as an
+// I2V init image, inheriting model/size/seconds from the source job. The
+// response Video.remixed_from_video_id references the source.
+//
+// Spec: https://developers.openai.com/api/reference/resources/videos/remix
+func (s *Server) VideoRemixHandler(c *gin.Context) {
+	if s.videoJobs == nil {
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, openai.NewError(http.StatusServiceUnavailable, "video generation is not available"))
+		return
+	}
+
+	id := c.Param("video_id")
+	src, err := s.videoJobs.Get(id)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusNotFound, openai.NewError(http.StatusNotFound, "video not found: "+id))
+		return
+	}
+	srcVideo := src.ToVideo()
+	if srcVideo.Status != openai.VideoStatusCompleted {
+		c.AbortWithStatusJSON(http.StatusConflict, openai.NewError(http.StatusConflict, fmt.Sprintf("video is not completed (status: %s)", srcVideo.Status)))
+		return
+	}
+
+	const maxRemixBodyBytes int64 = 1 << 20 // 1 MiB (prompt-only JSON)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRemixBodyBytes)
+	var body struct {
+		Prompt string `json:"prompt"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
+		return
+	}
+	if body.Prompt == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt is required"))
+		return
+	}
+	if len(body.Prompt) > 32000 {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt must be 32000 characters or less"))
+		return
+	}
+
+	width, height, _ := strings.Cut(srcVideo.Size, "x")
+	w, _ := strconv.Atoi(width)
+	h, _ := strconv.Atoi(height)
+
+	job, err := s.videoJobs.Create(videojobs.CreateParams{
+		Model:         srcVideo.Model,
+		Prompt:        body.Prompt,
+		Seconds:       srcVideo.Seconds,
+		Size:          srcVideo.Size,
+		RemixedFromID: id,
+		SourceVideoID: id,
+		Extend:        false,
+		SourceSeconds: srcVideo.Seconds,
+		Generate:      s.buildVideoGenerateFunc(srcVideo.Model, int32(w), int32(h), srcVideo.Seconds),
+	})
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, err.Error()))
+		return
+	}
+
+	c.Header(openaiPollAfterMS, strconv.Itoa(defaultPollIntervalMS))
+	c.JSON(http.StatusOK, job.ToVideo())
+}
+
+// VideoCharactersHandler responds 501 Not Implemented for the Sora cloud
+// characters endpoints (POST /v1/videos/characters, GET
+// /v1/videos/characters/{id}). Persistent characters are a cloud feature
+// with no local SD.cpp/WAN/LTX equivalent; the local character-consistency
+// use case is covered by LoRAs and input_reference.
+func (s *Server) VideoCharactersHandler(c *gin.Context) {
+	c.AbortWithStatusJSON(http.StatusNotImplemented, openai.NewError(http.StatusNotImplemented, "characters are a Sora cloud feature; not supported by aiollama"))
 }

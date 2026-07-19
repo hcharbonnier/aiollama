@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"mime/multipart"
@@ -567,6 +568,9 @@ func setupVideoRouterWithEdits(t *testing.T, store videojobs.JobStore) (*Server,
 	r.GET("/v1/videos/:video_id/content", s.VideoContentHandler)
 	r.POST("/v1/videos/edits", s.VideoEditHandler)
 	r.POST("/v1/videos/extensions", s.VideoExtendHandler)
+	r.POST("/v1/videos/:video_id/remix", s.VideoRemixHandler)
+	r.POST("/v1/videos/characters", s.VideoCharactersHandler)
+	r.GET("/v1/videos/characters/:character_id", s.VideoCharactersHandler)
 	return s, r
 }
 
@@ -801,5 +805,313 @@ func TestVideoEditJSONFallback(t *testing.T) {
 	}
 	if v.RemixedFromVideoID != "vid_abc" {
 		t.Errorf("remixed_from_video_id = %q, want vid_abc", v.RemixedFromVideoID)
+	}
+}
+
+// createCompletedJob seeds the store with a completed video job and returns
+// its id. Used by edit/extend/remix tests that reference a source {id}.
+func createCompletedJob(t *testing.T, store videojobs.JobStore, modelName, size, seconds string) string {
+	t.Helper()
+	gen := func(ctx context.Context, params videojobs.CreateParams, fn func([]byte, int, int)) error {
+		fn([]byte("frame-png"), 1, 1)
+		return nil
+	}
+	job, err := store.Create(videojobs.CreateParams{
+		Model: modelName, Prompt: "p", Seconds: seconds, Size: size, Generate: gen,
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for job.Status() != openai.VideoStatusCompleted && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if job.Status() != openai.VideoStatusCompleted {
+		t.Fatalf("job did not complete: status = %s", job.Status())
+	}
+	return job.ID()
+}
+
+// TestVideoCreateInputFromFormBracketFields verifies that the openai-python
+// SDK multipart wire format is parsed: nested input_reference dicts arrive
+// as bracket-notation fields (input_reference[image_url]=...), produced by
+// qs.stringify_items(array_format="brackets").
+func TestVideoCreateInputFromFormBracketFields(t *testing.T) {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	_ = mw.WriteField("prompt", "a cat")
+	_ = mw.WriteField("input_reference[image_url]", "https://example.com/ref.png")
+	_ = mw.Close()
+	req, err := http.NewRequest(http.MethodPost, "/v1/videos", &body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	if err := req.ParseMultipartForm(32 << 20); err != nil {
+		t.Fatal(err)
+	}
+
+	var in videoCreateInput
+	if err := in.fromForm(req); err != nil {
+		t.Fatal(err)
+	}
+	if in.InputReference == nil || in.InputReference.ImageURL != "https://example.com/ref.png" {
+		t.Errorf("InputReference = %+v, want image_url from bracket field", in.InputReference)
+	}
+	if !in.hasInputReference() {
+		t.Error("hasInputReference = false, want true")
+	}
+}
+
+// TestVideoCreateAcceptsBracketImageURL exercises the full create handler
+// with the SDK's bracket-notation input_reference[image_url] data URL.
+func TestVideoCreateAcceptsBracketImageURL(t *testing.T) {
+	store := videojobs.NewJobStore(nilTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouter(t, store)
+
+	dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("png-bytes"))
+	req := newMultipartRequest(t, "/v1/videos", map[string]string{
+		"prompt":                     "a cat",
+		"model":                      "wan2.1-t2v",
+		"input_reference[image_url]": dataURL,
+	}, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	// A malformed data URL in the bracket field must 400 (proving the field
+	// is actually consumed, not silently dropped).
+	req = newMultipartRequest(t, "/v1/videos", map[string]string{
+		"prompt":                     "a cat",
+		"model":                      "wan2.1-t2v",
+		"input_reference[image_url]": "data:image/png;base64,!!!not-base64!!!",
+	}, nil)
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid data URL: status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestVideoCreateRejectsBracketFileID verifies that the SDK's bracket-form
+// input_reference[file_id] is rejected with ErrVideoFileIDNotSupported
+// instead of being silently ignored.
+func TestVideoCreateRejectsBracketFileID(t *testing.T) {
+	store := videojobs.NewJobStore(nilTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouter(t, store)
+
+	req := newMultipartRequest(t, "/v1/videos", map[string]string{
+		"prompt":                   "a cat",
+		"model":                    "wan2.1-t2v",
+		"input_reference[file_id]": "file_abc",
+	}, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "file_id is not supported") {
+		t.Errorf("body = %q, want file_id rejection", w.Body.String())
+	}
+}
+
+// TestVideoEditParsesBracketVideoID verifies the SDK multipart wire format
+// video[id]=vid_... is accepted as an {id} reference on edits.
+func TestVideoEditParsesBracketVideoID(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	srcID := createCompletedJob(t, store, "src-model", "1280x720", "8")
+
+	req := newMultipartRequestWithVideo(t, "/v1/videos/edits", map[string]string{
+		"prompt":    "a cat running",
+		"model":     "wan2.1-t2v",
+		"video[id]": srcID,
+	}, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var v openai.Video
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v.RemixedFromVideoID != srcID {
+		t.Errorf("remixed_from_video_id = %q, want %q", v.RemixedFromVideoID, srcID)
+	}
+}
+
+// TestVideoEditInheritsModelSizeFromSource verifies that model and size,
+// which the openai-python SDK does not send on edits, are inherited from the
+// referenced source job (matching the cloud API behavior).
+func TestVideoEditInheritsModelSizeFromSource(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	srcID := createCompletedJob(t, store, "src-model", "1280x720", "8")
+
+	req := newMultipartRequestWithVideo(t, "/v1/videos/edits", map[string]string{
+		"prompt":    "a cat running",
+		"video[id]": srcID,
+	}, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var v openai.Video
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v.Model != "src-model" {
+		t.Errorf("model = %q, want inherited %q", v.Model, "src-model")
+	}
+	if v.Size != "1280x720" {
+		t.Errorf("size = %q, want inherited %q", v.Size, "1280x720")
+	}
+}
+
+// TestVideoExtendInheritsModelSizeFromSource verifies model/size inheritance
+// on extensions (seconds remains a required explicit field there).
+func TestVideoExtendInheritsModelSizeFromSource(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	srcID := createCompletedJob(t, store, "src-model", "1280x720", "8")
+
+	req := newMultipartRequestWithVideo(t, "/v1/videos/extensions", map[string]string{
+		"prompt":    "continue the scene",
+		"seconds":   "4",
+		"video[id]": srcID,
+	}, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var v openai.Video
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v.Model != "src-model" {
+		t.Errorf("model = %q, want inherited %q", v.Model, "src-model")
+	}
+	if v.Size != "1280x720" {
+		t.Errorf("size = %q, want inherited %q", v.Size, "1280x720")
+	}
+}
+
+// TestVideoRemix verifies POST /v1/videos/{id}/remix: unknown id → 404,
+// missing prompt → 400, and a valid remix of a completed job → 200 queued
+// with remixed_from_video_id and model/size/seconds inherited from the
+// source job.
+func TestVideoRemix(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	srcID := createCompletedJob(t, store, "src-model", "1280x720", "8")
+
+	post := func(url, body string) *httptest.ResponseRecorder {
+		req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	if w := post("/v1/videos/vid_unknown/remix", `{"prompt":"x"}`); w.Code != http.StatusNotFound {
+		t.Errorf("unknown id: status = %d, want 404: %s", w.Code, w.Body.String())
+	}
+
+	w := post("/v1/videos/"+srcID+"/remix", `{}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("missing prompt: status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "prompt is required") {
+		t.Errorf("body = %q, want 'prompt is required'", w.Body.String())
+	}
+
+	w = post("/v1/videos/"+srcID+"/remix", `{"prompt":"a new take"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("remix: status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var v openai.Video
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v.Status != openai.VideoStatusQueued {
+		t.Errorf("status = %q, want queued", v.Status)
+	}
+	if v.RemixedFromVideoID != srcID {
+		t.Errorf("remixed_from_video_id = %q, want %q", v.RemixedFromVideoID, srcID)
+	}
+	if v.Model != "src-model" || v.Size != "1280x720" || v.Seconds != "8" {
+		t.Errorf("inherited = %q/%q/%q, want src-model/1280x720/8", v.Model, v.Size, v.Seconds)
+	}
+}
+
+// TestVideoRemixRejectsUncompletedSource verifies remixing a job that is not
+// completed returns 409.
+func TestVideoRemixRejectsUncompletedSource(t *testing.T) {
+	store := videojobs.NewJobStore(extendableTranscoder{})
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	gen := func(ctx context.Context, params videojobs.CreateParams, fn func([]byte, int, int)) error {
+		return errors.New("boom")
+	}
+	job, err := store.Create(videojobs.CreateParams{
+		Model: "m", Prompt: "p", Seconds: "4", Size: "720x1280", Generate: gen,
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for job.Status() != openai.VideoStatusFailed && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if job.Status() != openai.VideoStatusFailed {
+		t.Fatalf("job did not fail: status = %s", job.Status())
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, "/v1/videos/"+job.ID()+"/remix", strings.NewReader(`{"prompt":"x"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestVideoCharactersNotImplemented verifies the Sora cloud characters
+// endpoints return an explicit 501 in the OpenAI error envelope.
+func TestVideoCharactersNotImplemented(t *testing.T) {
+	store := videojobs.NewJobStore(nil)
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	for _, tt := range []struct{ method, url string }{
+		{http.MethodPost, "/v1/videos/characters"},
+		{http.MethodGet, "/v1/videos/characters/char_abc"},
+	} {
+		req, _ := http.NewRequest(tt.method, tt.url, nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusNotImplemented {
+			t.Errorf("%s %s: status = %d, want 501: %s", tt.method, tt.url, w.Code, w.Body.String())
+		}
+		var errResp openai.ErrorResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+			t.Errorf("%s %s: body is not OpenAI error format: %v", tt.method, tt.url, err)
+		}
 	}
 }

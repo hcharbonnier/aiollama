@@ -5,7 +5,8 @@
 l'API OpenAI officielle, pour servir de checklist lors de l'intégration dans
 LibreChat (ou tout autre client conforme au SDK OpenAI).
 **Date :** 2026-07-19 (mise à jour post-corrections — voir §4 ; revue
-openai-python **2.46.0** — voir §6 ; plan de correctifs — voir §7)
+openai-python **2.46.0** — voir §6 ; plan de correctifs §7 **appliqué** :
+O1, O2, F1, F3, F4, F5 corrigés)
 **Sources auditées :**
 - `openai/openai.go` (types `Image*`, `Video*`, constantes, helpers)
 - `server/imageapi.go` (handlers dédiés Images API : generations, edits, files)
@@ -38,7 +39,7 @@ Les endpoints images sont implémentés par des **handlers dédiés**
 | `model` requis, énumération (`dall-e-3`, `gpt-image-1`) | `model` requis, **nom de modèle Ollama libre** (ex `flux2-klein-4b`) | ⚠️ Extension (par conception, fork local) |
 | `prompt` requis | ✅ requis | ✅ |
 | `n` (1..10) | ✅ supporté (boucle de génération séquentielle, seeds `seed+i` si `seed` fourni) ; hors plage → 400 | ✅ |
-| `size` enum (`1024x1024`, …) | Accepte n'importe quel `WxH` (≤ 4096), défaut `1024x1024` ; format invalide → 400 ; **la valeur `"auto"` (envoyée par les GPT image models récents) est rejetée → 400** | ⚠️ Extension (cf. §6.1) |
+| `size` enum (`1024x1024`, …) | Accepte n'importe quel `WxH` (≤ 4096), défaut `1024x1024` ; format invalide → 400 ; **`"auto"` accepté** (valeur envoyée par les GPT image models récents) → taille par défaut | ⚠️ Extension |
 | `quality` (`low`/`medium`/`high`/`auto`) | ✅ validée et mappée sur les steps diffusion (`low`→20, `medium`→30, `high`→50, `auto`→défaut modèle) ; **alias legacy acceptés** (`standard`→auto, `hd`→high) ; valeur inconnue → 400 | ✅ |
 | `response_format` (`url`/`b64_json`) | ✅ `b64_json` (défaut) ou `url` (absolue, servie par `GET /v1/images/files/{id}`, TTL 30 min) ; valeur inconnue → 400 | ✅ |
 | `style` (`vivid`/`natural`) | Validée (valeur inconnue → 400), sans effet local (concept DALL·E 3) | ✅ (no-op documenté) |
@@ -51,7 +52,7 @@ Les endpoints images sont implémentés par des **handlers dédiés**
 | `seed` | **Accepté** (extension aiollama ; déterministe par image via `seed+i`) | ⚠️ Extension |
 | Content-Type : `application/json` | ✅ JSON | ✅ |
 | Réponse : `{created, data:[{b64_json\|url}]}` | ✅ identique | ✅ |
-| Champ `usage` (`input_tokens`/`output_tokens`/`total_tokens`) | ✅ toujours retourné (tokens mesurés si le runner les rapporte, sinon 0) ; **les sous-objets `input_tokens_details` / `output_tokens_details` attendus par le SDK 2.46.0 sont omis** (parse tolérant côté SDK → OK, mais accès à `.input_tokens_details.image_tokens` → `AttributeError`) | ✅ (cf. §6.4) |
+| Champ `usage` (`input_tokens`/`output_tokens`/`total_tokens`) | ✅ toujours retourné (tokens mesurés si le runner les rapporte, sinon 0) ; **sous-objets `input_tokens_details` / `output_tokens_details` peuplés** (`{image_tokens, text_tokens}`, conformes SDK 2.46.0) | ✅ |
 | Modèle non trouvé | 404 au format `{error:{message,type,code}}` | ✅ |
 
 **Fichiers :** `server/imageapi.go` (`ImageGenerationsHandler`),
@@ -100,9 +101,9 @@ plumbing mask : `llm/server.go` (`CompletionRequest.Mask`),
 | `GET /v1/videos/{id}/content?variant=thumbnail` | ✅ première frame PNG via ffmpeg (calculée une fois, **mise en cache sur le job**) | ✅ |
 | `GET /v1/videos/{id}/content?variant=spritesheet` | ✅ grille 5×5 PNG via ffmpeg (`tile` filter, **mise en cache sur le job**) | ✅ |
 | `variant` invalide | 400 explicite | ✅ |
-| `POST /v1/videos/characters` | ❌ Non implémenté (spécifique Sora cloud, sans équivalent local) — **non retenu**, 501 explicite prévu (fix F5, §7.2) | ❌ |
-| `GET /v1/videos/characters/{id}` | ❌ Non implémenté — **non retenu**, 501 explicite prévu (fix F5, §7.2) | ❌ |
-| `POST /v1/videos/{id}/remix` | ❌ Non implémenté — **retenu**, implémentation prévue (fix F1, §7.2) | ❌ |
+| `POST /v1/videos/characters` | ✅ **501 explicite** au format d'erreur OpenAI (spécifique Sora cloud, sans équivalent local) | ✅ (501 documenté) |
+| `GET /v1/videos/characters/{id}` | ✅ **501 explicite** | ✅ (501 documenté) |
+| `POST /v1/videos/{id}/remix` | ✅ JSON `{prompt}` ; source `:video_id` (404 si inconnu, 409 si non complété) ; `model`/`size`/`seconds` hérités du job source ; `remixed_from_video_id` positionné | ✅ |
 
 ### 2.2 `POST /v1/videos` — corps de requête
 
@@ -114,9 +115,9 @@ plumbing mask : `llm/server.go` (`CompletionRequest.Mask`),
 | `seconds` (`"4"`/`"8"`/`"12"`, défaut `"4"`) | ✅ validé strictement | ✅ |
 | `size` (4 valeurs, défaut `720x1280`) | ✅ validé strictement | ✅ |
 | `input_reference` (file part) | ✅ accepté | ✅ |
-| `input_reference.image_url` (data URL) | ⚠️ accepté via JSON string dans le form-field `input_reference`, **mais le SDK openai-python sérialise les dicts imbriqués en notation à crochets (`input_reference[image_url]=...`) → ignoré silencieusement** (cf. §6.2) | ⚠️ (cf. §6.2) |
-| `input_reference.image_url` (URL http(s) distante) | ⚠️ même limitation que ci-dessus via le SDK ; via `curl` ou `requests` JSON-string OK | ⚠️ (cf. §6.2) |
-| `input_reference.file_id` | ❌ rejeté (`ErrVideoFileIDNotSupported` — pas de Files API store) ; **via SDK, ignoré silencieusement au lieu d'être rejeté** | ❌ (cf. §6.2) |
+| `input_reference.image_url` (data URL) | ✅ accepté : JSON string dans le form-field `input_reference` **et** notation à crochets du SDK (`input_reference[image_url]=...`) | ✅ |
+| `input_reference.image_url` (URL http(s) distante) | ✅ idem (filtrage anti-SSRF conservé) | ✅ |
+| `input_reference.file_id` | ✅ rejeté proprement (`ErrVideoFileIDNotSupported`), **y compris via la notation à crochets du SDK** (`input_reference[file_id]`) | ✅ (rejet documenté) |
 | Header réponse `openai-poll-after-ms` | ✅ 2000 ms | ✅ |
 
 ### 2.3 Objet `Video` (réponse)
@@ -129,18 +130,18 @@ Tous les champs spec sont présents (`id`, `object`, `created_at`, `completed_at
 
 | Champ spec | Implémentation | Statut |
 |---|---|---|
-| `prompt` requis, `model` requis | ✅ côté serveur ; **le SDK openai-python 2.46.0 n'envoie pas `model`** (cloud API hérite du modèle de la vidéo source) → 400 "model is required" sauf `extra_body={"model": "..."}` (cf. §6.2) | ❌ (cf. §6.2) |
-| `video` (file part ou `{id}`) | ⚠️ file part OK ; **référence `{id}` cassée via SDK** : sérialisée en champ bracket `video[id]=...` non parsé → 400 "video is required (a file part or a {id} object)" (cf. §6.2) | ⚠️ (cf. §6.2) |
+| `prompt` requis ; `model` hérité de la source | ✅ `model` (non envoyé par le SDK) **hérité du job source** quand `video={id}` ; 400 conservé si fichier uploadé sans `model` | ✅ |
+| `video` (file part ou `{id}`) | ✅ file part **et** référence `{id}` via le champ bracket `video[id]=...` du SDK | ✅ |
 | Content-Type : multipart | ✅ multipart ; JSON accepté aussi (extension homogène) | ✅ (+⚠️) |
 | Sémantique : re-render I2V depuis 1ère frame | ✅ | ✅ |
-| `remixed_from_video_id` positionné si `{id}` | ✅ (mais inatteignable via SDK, cf. ci-dessus) | ⚠️ (cf. §6.2) |
+| `remixed_from_video_id` positionné si `{id}` | ✅ | ✅ |
 
 ### 2.5 `POST /v1/videos/extensions`
 
 | Champ spec | Implémentation | Statut |
 |---|---|---|
-| `prompt` requis, `seconds` requis (`"4"`..`"20"`) | ✅ côté serveur ; **`model` requis par le serveur, pas envoyé par le SDK** → 400 (cf. §6.2) | ❌ (cf. §6.2) |
-| `video` (file part ou `{id}`) | ⚠️ file part OK ; **référence `{id}` cassée via SDK** (bracket `video[id]`, idem §2.4) | ⚠️ (cf. §6.2) |
+| `prompt` requis, `seconds` requis (`"4"`..`"20"`) | ✅ ; `model` (non envoyé par le SDK) **hérité du job source** quand `video={id}` | ✅ |
+| `video` (file part ou `{id}`) | ✅ file part **et** référence `{id}` via le champ bracket `video[id]=...` du SDK | ✅ |
 | `Video.seconds` = total stitché (source + extension) | ✅ **dans les deux cas** : `{id}` → `seconds` du job source ; fichier uploadé → durée sondée par `ffprobe` (fallback : parsing `ffmpeg -i`, puis valeur demandée seule si indéterminable) | ✅ |
 | Concaténation source + extension | ✅ via `ConcatMP4` | ✅ |
 | Init image = dernière frame de la source | ✅ via `DecodeLastFrame` (ffmpeg `-sseof`) | ✅ |
@@ -230,6 +231,28 @@ Inchangé : create 200 + `queued`, polling avec `openai-poll-after-ms`,
 - [ ] Authentification par clé API / rate limiting / moderation — **non
       fait** : hors périmètre d'un fork local auto-hébergé (documenté §3).
 
+### Plan §7 (revue SDK 2.46.0) → **appliqué (2026-07-19)**
+
+- [x] **O1** — champs multipart en notation bracket du SDK parsés
+      (`video[id]`, `input_reference[image_url]`,
+      `input_reference[file_id]`) sur create/edits/extensions ;
+      `input_reference[file_id]` → 400 explicite au lieu d'un drop
+      silencieux.
+- [x] **O2** — `model`/`size` hérités du job source sur edits/extensions
+      quand `video={id}` (le SDK ne les envoie pas, comme l'API cloud) ;
+      400 conservé pour un fichier uploadé sans `model`.
+- [x] **F1** — `POST /v1/videos/{id}/remix` implémenté : JSON `{prompt}`,
+      source 404/409 selon son état, héritage `model`/`size`/`seconds`,
+      `remixed_from_video_id` positionné.
+- [x] **F3** — `size: "auto"` accepté (generations + edits) → taille par
+      défaut.
+- [x] **F4** — `usage.input_tokens_details` / `output_tokens_details`
+      peuplés (`{image_tokens, text_tokens}`).
+- [x] **F5** — `POST /v1/videos/characters` et
+      `GET /v1/videos/characters/{id}` → 501 explicite au format OpenAI.
+- Non retenus (§7.3, inchangés) : personnages persistants (capacité),
+      `images/variations`, streaming images, `input_fidelity`.
+
 ---
 
 ## 5. Recommandations pour l'intégration LibreChat
@@ -257,13 +280,13 @@ Tableau de compatibilité global (état final) :
 
 | Famille | Compat SDK OpenAI natif | Notes |
 |---|---|---|
-| `/v1/images/generations` | ✅ (avec 2 réserves cf. §6.1) | n, quality, response_format (b64/url), output_format, usage, seed |
-| `/v1/images/edits` | ✅ (avec 1 réserve cf. §6.1) | multipart natif + mask + image[] ×16 ; JSON en extension |
-| `/v1/videos` (create/retrieve/content) | ✅ partiel (cf. §6.2) | variants video/thumbnail/spritesheet ; `input_reference` dict via SDK cassé |
-| `/v1/videos/edits` | ❌ via SDK (cf. §6.2) | multipart + JSON (extension) ; référence `{id}` et `model` manquants via SDK |
-| `/v1/videos/extensions` | ❌ via SDK (cf. §6.2) | seconds stitché correct (ffprobe sur upload) ; idem §2.5 |
-| `/v1/videos/{id}/remix` | ❌ | Endpoint non implémenté |
-| `/v1/videos/characters` | ❌ | Sora cloud-only, non implémenté |
+| `/v1/images/generations` | ✅ | n, quality (+alias legacy), size auto, response_format (b64/url), output_format, usage (+details), seed |
+| `/v1/images/edits` | ✅ | multipart natif + mask + image[] ×16 ; JSON en extension |
+| `/v1/videos` (create/retrieve/content) | ✅ | variants video/thumbnail/spritesheet ; `input_reference` dict du SDK parsé (bracket) |
+| `/v1/videos/edits` | ✅ | référence `{id}` via `video[id]` ; `model`/`size` hérités de la source |
+| `/v1/videos/extensions` | ✅ | seconds stitché correct (ffprobe sur upload) ; héritage idem edits |
+| `/v1/videos/{id}/remix` | ✅ | JSON `{prompt}` ; `model`/`size`/`seconds` hérités de la source |
+| `/v1/videos/characters` | ✅ (501) | Sora cloud-only → 501 explicite |
 
 ---
 
@@ -276,7 +299,7 @@ L'objectif : valider qu'un script `import openai; client = OpenAI(...)` ciblant
 aiollama produit un comportement strictement identique à celui de l'API cloud
 OpenAI.
 
-### 6.1 Images — écarts tolérables (2)
+### 6.1 Images — écarts tolérables (2) → **tous corrigés**
 
 - **`quality: "standard" | "hd"`** : la valeur `quality` du SDK 2.46.0 accepte
   ces deux littéraux (legacy `dall-e-2/3`) en plus de
@@ -285,13 +308,12 @@ OpenAI.
   (`standard`→`auto`, `hd`→`high`) dans `validateImageRequest`
   (`server/imageapi.go`).
 - **`size: "auto"`** : le SDK autorise cette valeur (les GPT image models
-  récents la supportent nativement). `ParseImageSize` (Sscanf `%dx%d`)
-  échoue sur `"auto"` → 400. Non envoyé par défaut quand omis, donc ne
-  casse que les appels explicites. **Recommandation :** court-circuiter
-  `ParseImageSize` quand `size == "auto"` et laisser le runner choisir
-  (1024×1024 par défaut).
+  récents la supportent nativement). ~~`ParseImageSize` (Sscanf `%dx%d`)
+  échoue sur `"auto"` → 400~~ **CORRIGÉ (2026-07-19) :** `"auto"` est
+  court-circuité dans `validateImageRequest` et mappé sur la taille par
+  défaut (1024×1024), sur generations et edits.
 
-### 6.2 Vidéos — `client.videos.create/edit/extend` : 3 cassures via le SDK
+### 6.2 Vidéos — `client.videos.create/edit/extend` : 3 cassures via le SDK → **toutes corrigées (2026-07-19)**
 
 Trois écarts de wire format entre la sérialisation multipart du SDK et le
 parsing serveur. Vérifié empiriquement en exécutant
@@ -309,61 +331,64 @@ ne l'a jamais couverte.)
 
 **a. `video={"id": "..."}` sur `/v1/videos/edits` et `/v1/videos/extensions`**
 
-Le serveur lit `r.FormValue("video")` (chaîne JSON) ou un *file part*
+~~Le serveur lit `r.FormValue("video")` (chaîne JSON) ou un *file part*
 nommé `video` ; `video[id]` n'est reconnu par aucun des deux → 400
-"video is required (a file part or a {id} object)". Le test
-`videoapi_test.go:645` (JSON body `{video:{id}}`) ne couvre pas le wire
-format réel du SDK. **Recommandation :** dans `videoSourceInput.fromForm`,
-lire aussi `r.FormValue("video[id]")` (et `r.FormValue("input_reference[image_url]")`,
-`r.FormValue("input_reference[file_id]")`).
+"video is required (a file part or a {id} object)".~~ **CORRIGÉ
+(2026-07-19) :** `videoSourceInput.fromForm` lit aussi
+`r.FormValue("video[id]")` ; test multipart au format exact du SDK
+(`mw.WriteField("video[id]", ...)`) dans `server/videoapi_test.go`.
 
 **b. `input_reference={...}` sur `/v1/videos` (create)**
 
-Le serveur lit `r.FormValue("input_reference")` (JSON string) ou un
+~~Le serveur lit `r.FormValue("input_reference")` (JSON string) ou un
 *file part* ; `input_reference[image_url]` n'est pas reconnu →
 `hasInputReference()` renvoie `false` et la génération part **sans**
-image d'init (échec silencieux, pas d'erreur 400). Pire : un
-`input_reference={"file_id": "..."}` est aussi silencieusement ignoré
-au lieu de renvoyer `ErrVideoFileIDNotSupported`. **Recommandation :**
-idempotente a).
+image d'init (échec silencieux). Un `input_reference={"file_id": "..."}`
+est aussi silencieusement ignoré au lieu de renvoyer
+`ErrVideoFileIDNotSupported`.~~ **CORRIGÉ (2026-07-19) :**
+`videoCreateInput.fromForm` lit aussi `input_reference[image_url]` et
+`input_reference[file_id]` ; ce dernier alimente `FileID` et déclenche
+donc `ErrVideoFileIDNotSupported` (400 explicite) au lieu d'un drop
+silencieux.
 
 **c. `model` absent du wire sur `edit` et `extend`**
 
-`VideoEditParams`/`VideoExtendParams` du SDK 2.46.0 ne portent **que**
+~~`VideoEditParams`/`VideoExtendParams` du SDK 2.46.0 ne portent **que**
 `prompt`, `video` (+ `seconds` pour extend) — pas de `model` ni `size`.
-Le cloud OpenAI hérite du modèle et de la taille de la vidéo source.
-Le serveur exige `model` → 400 "model is required" à chaque appel.
-**Recommandation :** dans `parseEditExtendRequest`, quand la vidéo est
-une référence `{id}` (résolvable via `s.videoJobs.Get`), hériter
-`model`/`size` du job source ; sinon garder le 400 actuel et le
-documenter.
+Le serveur exige `model` → 400 "model is required" à chaque appel.~~
+**CORRIGÉ (2026-07-19) :** `parseEditExtendRequest` résout le job source
+via `s.videoJobs.Get` **avant** la validation `model`/`size` quand la
+vidéo est une référence `{id}` et hérite `model`/`size` du job source
+(une seule résolution, fusionnée avec la lookup `sourceSeconds`) ; le
+400 est conservé pour un fichier uploadé sans `model` (déviation
+documentée : pas de modèle à hériter).
 
-### 6.3 Endpoints vidéo absents
+### 6.3 Endpoints vidéo absents → **traités (2026-07-19)**
 
 - `POST /v1/videos/{video_id}/remix` (corps JSON `{prompt}`) — méthode
-  `client.videos.remix()` du SDK → 404.
+  `client.videos.remix()` du SDK. ~~404~~ **CORRIGÉ (2026-07-19) :**
+  implémenté (`VideoRemixHandler`) — source en path (404 si inconnue,
+  409 si non complétée), `model`/`size`/`seconds` hérités du job source,
+  `remixed_from_video_id` positionné, re-render I2V depuis la 1ère frame
+  (même machinerie que `VideoEditHandler`).
 - `POST /v1/videos/characters` et `GET /v1/videos/characters/{id}` —
   API Sora cloud (personnages persistants), sans équivalent local
-  naturel. À exposer en `501 Not Implemented` plutôt que `404` pour
-  clarifier le statut.
+  naturel. ~~404~~ **CORRIGÉ (2026-07-19) :** 501 explicite au format
+  d'erreur OpenAI (`VideoCharactersHandler`) — la capacité reste absente
+  mais le statut est désormais non ambigu pour les clients.
 
-**Recommandation :** implémenter `remix` (faible coût : quasi-alias de
-`VideoEditHandler` avec `prompt` + `video=id` ; un re-render I2V depuis
-la 1ère frame de la source) ; renvoyer `501` pour `characters/*`.
-
-### 6.4 Images — bloc `usage` incomplet
+### 6.4 Images — bloc `usage` incomplet → **corrigé (2026-07-19)**
 
 Le SDK 2.46.0 attend dans `ImagesResponse.usage` les champs
 `input_tokens_details: {image_tokens, text_tokens}` (requis) et
 `output_tokens_details: {image_tokens, text_tokens}` (optionnel).
-Le serveur n'émet que `input_tokens`/`output_tokens`/`total_tokens`.
-Vérifié : le parser `openai._models.construct_type` est **tolérant**
-(utilise `model_construct`-like) → pas d'exception, mais
-`response.usage.input_tokens_details` est `None` ; tout code client
-qui accède à `.image_tokens` lève `AttributeError`. **Recommandation :**
-peupler `input_tokens_details: {image_tokens: 0, text_tokens: N}` (N =
-`PromptEvalCount` du runner) et `output_tokens_details: {image_tokens: 1,
-text_tokens: 0}` quand l'image est générée.
+~~Le serveur n'émet que `input_tokens`/`output_tokens`/`total_tokens`~~
+**CORRIGÉ (2026-07-19) :** `openai.ImageUsage` porte désormais
+`InputTokensDetails`/`OutputTokensDetails` (`{image_tokens, text_tokens}`),
+peuplés dans `runImageGeneration` — input : `{image_tokens: nombre
+d'images d'entrée, text_tokens: tokens du runner}` ; output :
+`{image_tokens: images générées, text_tokens: 0}`. Forme JSON verrouillée
+par un test (`TestImageUsageWireShape`).
 
 ### 6.5 Streaming, input_fidelity, variations (mineur)
 
@@ -380,12 +405,12 @@ text_tokens: 0}` quand l'image est générée.
 | # | Écart | Gravité | Casse le client ? | Correctif proposé |
 |---|---|---|---|---|
 | 6.1a | ~~`quality: standard/hd` rejetés~~ **CORRIGÉ** (alias acceptés : `standard`→auto, `hd`→high) | — | non | fait |
-| 6.1b | `size: "auto"` rejeté | basse | oui (400) si explicitement passé | court-circuit `ParseImageSize` (fix F3, §7.2) |
-| 6.2a | `video[id]` non parsé | haute | oui (400 sur `edits`/`extensions`) | parser le form-field bracket (fix O1, §7.1) |
-| 6.2b | `input_reference[*]` non parsé | haute | oui (échec silencieux sur `create`) | idem + émettre `ErrVideoFileIDNotSupported` pour `file_id` (fix O1, §7.1) |
-| 6.2c | `model` manquant sur `edit`/`extend` | haute | oui (400) | hériter du job source quand `{id}` (fix O2, §7.1) |
-| 6.3  | `remix`/`characters` absents | moyenne (remix), haute (cloud) | oui (404) | implémenter remix (fix F1, §7.2) ; 501 pour characters (fix F5, §7.2) |
-| 6.4  | `usage.input_tokens_details` manquant | très basse | non (parse tolérant) | émettre les détails (fix F4, §7.2) |
+| 6.1b | ~~`size: "auto"` rejeté~~ **CORRIGÉ** (accepté → taille par défaut, fix F3) | — | non | fait |
+| 6.2a | ~~`video[id]` non parsé~~ **CORRIGÉ** (champ bracket parsé, fix O1) | — | non | fait |
+| 6.2b | ~~`input_reference[*]` non parsé~~ **CORRIGÉ** (bracket parsé ; `file_id` → `ErrVideoFileIDNotSupported`, fix O1) | — | non | fait |
+| 6.2c | ~~`model` manquant sur `edit`/`extend`~~ **CORRIGÉ** (hérité du job source quand `{id}`, fix O2) | — | non | fait |
+| 6.3  | ~~`remix`/`characters` absents~~ **CORRIGÉ** (remix implémenté, fix F1 ; 501 pour characters, fix F5) | — | non | fait |
+| 6.4  | ~~`usage.input_tokens_details` manquant~~ **CORRIGÉ** (détails peuplés, fix F4) | — | non | fait |
 | 6.5  | streaming, `input_fidelity`, variations | basse | partiel | **non retenus** (§7.3) : 400 explicite conservé pour streaming, `input_fidelity` ignoré, variations en 404 |
 
 ### Validation
@@ -402,12 +427,13 @@ text_tokens: 0}` quand l'image est générée.
   de 31 Go fait échouer le sampling natif par manque de RAM — limite
   d'environnement, indépendante de la couche API).
 - **Revue `openai-python 2.46.0`** (juillet 2026, dernière version
-  publiée) : voir §6 pour le détail des écarts de wire format identifiés
-  après mise à jour de la lib côté client. Trois cassures bloquantes via
-  le SDK sur les chemins `videos.create` (`input_reference` dict
-  ignoré silencieusement) et `videos.edit`/`extend` (référence `{id}` +
-  `model` manquant → 400), plus `remix` non implémenté (404). Correctifs
-  proposés colonne de droite du tableau §6.6.
+  publiée) : les trois cassures bloquantes via le SDK (`videos.create`
+  avec `input_reference` dict ignoré silencieusement,
+  `videos.edit`/`extend` avec référence `{id}` et `model` manquant → 400)
+  ainsi que `remix` (404) sont **corrigées** — voir §6 et §7. Les
+  nouveaux tests reproduisent le **wire format réel du SDK 2.46.0**
+  (champs multipart bracket `video[id]`, `input_reference[image_url]`,
+  `input_reference[file_id]`) et non seulement les chemins JSON/curl.
 
 ---
 
@@ -417,17 +443,19 @@ Critère de tri : *le backend local peut-il honorer la sémantique ?* ×
 *un client réel l'appelle-t-il ?* × *le coût est-il proportionné ?*.
 Résultat : 3 fixes **obligatoires** (§7.1), 5 fixes **facultatifs**
 (§7.2), 3 écarts **non retenus** (§7.3, décisions documentées).
+**Statut : plan appliqué le 2026-07-19 — tous les fixes retenus sont
+implémentés et testés.**
 
 Definition of done commune : `go test ./...` vert dans WSL, et les
 nouveaux tests reproduisent le **wire format réel du SDK 2.46.0**
 (champs bracket `video[id]`, `input_reference[image_url]`) — pas
-seulement les chemins JSON/curl déjà couverts.
+seulement les chemins JSON/curl déjà couverts. ✅ Atteinte.
 
 ### 7.1 Fixes obligatoires (cassent les chemins principaux du SDK)
 
-- [ ] **O1 — Parser les champs multipart en notation bracket du SDK**
-      (corrige §6.2a + §6.2b). Le SDK openai-python sérialise les dicts
-      imbriqués via `qs.stringify_items(array_format="brackets")` :
+- [x] **O1 — Parser les champs multipart en notation bracket du SDK**
+      (corrige §6.2a + §6.2b) — **FAIT (2026-07-19)**. Le SDK openai-python
+      sérialise les dicts imbriqués via `qs.stringify_items(array_format="brackets")` :
       `video[id]=...`, `input_reference[image_url]=...`,
       `input_reference[file_id]=...`.
   - `server/videoapi.go` — `videoCreateInput.fromForm` : après le file
@@ -446,28 +474,27 @@ seulement les chemins JSON/curl déjà couverts.
     `input_reference[file_id]` → 400 avec le message
     `ErrVideoFileIDNotSupported` (et non un drop silencieux).
 
-- [ ] **O2 — Hériter `model`/`size` du job source sur edits/extensions**
-      (corrige §6.2c). Le SDK n'envoie ni `model` ni `size` sur
-      `videos.edit`/`videos.extend` ; le cloud les hérite de la vidéo
-      source.
+- [x] **O2 — Hériter `model`/`size` du job source sur edits/extensions**
+      (corrige §6.2c) — **FAIT (2026-07-19)**. Le SDK n'envoie ni `model`
+      ni `size` sur `videos.edit`/`videos.extend` ; le cloud les hérite de
+      la vidéo source.
   - `server/videoapi.go` — `parseEditExtendRequest` : quand
     `in.src.videoID != ""`, résoudre le job source via
     `s.videoJobs.Get(in.src.videoID)` **avant** la validation
     `model`/`size` ; si résolu : `model` vide → modèle du job source,
     `size` vide → taille du job source (au lieu du défaut `720x1280`).
-    Fusionner avec la lookup `sourceSeconds` existante (une seule
+    Fusionné avec la lookup `sourceSeconds` existante (une seule
     résolution).
-  - Si la source est un fichier uploadé et `model` vide → conserver le
-    400 actuel (déviation documentée : pas de modèle à hériter).
+  - Si la source est un fichier uploadé et `model` vide → 400 conservé
+    (déviation documentée : pas de modèle à hériter).
   - Tests : edit/extend multipart avec `video[id]` d'un job complété et
     **sans** `model`/`size` → job créé avec modèle et taille hérités ;
     fichier uploadé sans `model` → 400 inchangé.
 
 ### 7.2 Fixes facultatifs (robustesse / surface additionnelle justifiée)
 
-- [ ] **F1 — Implémenter `POST /v1/videos/{video_id}/remix`** (§6.3).
-      Seul endpoint manquant retenu : sémantiquement un `edit` par id
-      avec nouveau prompt ; réutilise toute la machinerie existante.
+- [x] **F1 — Implémenter `POST /v1/videos/{video_id}/remix`** (§6.3) —
+      **FAIT (2026-07-19)**.
   - `server/routes.go` :
     `r.POST("/v1/videos/:video_id/remix", cloudPassthroughMiddleware(...), s.VideoRemixHandler)`.
   - `server/videoapi.go` — `VideoRemixHandler` : corps JSON `{prompt}`
@@ -485,13 +512,13 @@ seulement les chemins JSON/curl déjà couverts.
       (2026-07-19)** : alias mappés dans `validateImageRequest`
       (`standard`→auto, `hd`→high) + tests (`server/imageapi_test.go`).
 
-- [ ] **F3 — Accepter `size: "auto"`** (§6.1b).
+- [x] **F3 — Accepter `size: "auto"`** (§6.1b) — **FAIT (2026-07-19)**.
   - `server/imageapi.go` — `validateImageRequest` :
     `if size == "" || size == "auto" { size = openai.ImageDefaultSize }`.
   - Tests : `size=auto` accepté sur generations et edits.
 
-- [ ] **F4 — Peupler `usage.input_tokens_details` /
-      `output_tokens_details`** (§6.4).
+- [x] **F4 — Peupler `usage.input_tokens_details` /
+      `output_tokens_details`** (§6.4) — **FAIT (2026-07-19)**.
   - `openai/openai.go` : `ImageUsage` gagne
     `InputTokensDetails *ImageUsageTokensDetails` et
     `OutputTokensDetails *ImageUsageTokensDetails`
@@ -500,9 +527,10 @@ seulement les chemins JSON/curl déjà couverts.
     `{image_tokens: len(p.images), text_tokens: inputTokens}`, output
     `{image_tokens: n, text_tokens: 0}`.
   - Tests : assertion sur la forme JSON du bloc `usage`
-    (`server/imageapi_test.go`).
+    (`server/imageapi_test.go`, `TestImageUsageWireShape`).
 
-- [ ] **F5 — Renvoyer 501 explicite sur `characters`** (§6.3).
+- [x] **F5 — Renvoyer 501 explicite sur `characters`** (§6.3) — **FAIT
+      (2026-07-19)**.
   - `server/routes.go` : `POST /v1/videos/characters` et
     `GET /v1/videos/characters/:character_id` → handler renvoyant
     `openai.NewError(http.StatusNotImplemented, "characters are a Sora cloud feature; not supported by aiollama")`.
@@ -517,7 +545,7 @@ seulement les chemins JSON/curl déjà couverts.
 | Streaming images (`stream=true`, `partial_images`) | **Non retenu** (400 explicite conservé) | Gros chantier (flux SSE d'événements `partial_image`) pour une valeur niche ; à reconsidérer uniquement si la preview progressive devient un besoin UX réel. |
 | `input_fidelity` sur `images.edit` | **Non retenu** (ignoré silencieusement, documenté §1.2) | Concept gpt-image-1 (préservation des traits) ; l'équivalent local (denoising strength) n'a pas de mapping fidèle. |
 
-### 7.4 Ordre d'exécution recommandé
+### 7.4 Ordre d'exécution (suivi le 2026-07-19)
 
 1. **O1 + O2** (ensemble, même fichier `server/videoapi.go`) — débloque
    `videos.create` (input_reference dict), `videos.edit`, `videos.extend`

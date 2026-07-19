@@ -65,6 +65,7 @@ func TestImageGenerationsValidation(t *testing.T) {
 		{name: "bad quality", body: `{"model": "m", "prompt": "p", "quality": "ultra"}`, wantCode: 400, wantMsg: "quality must be one of"},
 		{name: "quality alias standard", body: `{"model": "m", "prompt": "p", "quality": "standard"}`, wantCode: 404},
 		{name: "quality alias hd", body: `{"model": "m", "prompt": "p", "quality": "hd"}`, wantCode: 404},
+		{name: "size auto", body: `{"model": "m", "prompt": "p", "size": "auto"}`, wantCode: 404},
 		{name: "partial_images unsupported", body: `{"model": "m", "prompt": "p", "partial_images": 2}`, wantCode: 400, wantMsg: "streaming"},
 		{name: "bad response_format", body: `{"model": "m", "prompt": "p", "response_format": "xml"}`, wantCode: 400, wantMsg: "response_format must be one of"},
 		{name: "bad output_format", body: `{"model": "m", "prompt": "p", "output_format": "tiff"}`, wantCode: 400, wantMsg: "output_format must be one of"},
@@ -175,6 +176,13 @@ func TestImageEditsParsing(t *testing.T) {
 				return newImageEditMultipart(t, map[string]string{"model": "m"}, []string{"image"}, false)
 			},
 			wantCode: 400, wantMsg: "prompt is required",
+		},
+		{
+			name: "multipart size auto",
+			build: func() *http.Request {
+				return newImageEditMultipart(t, map[string]string{"model": "m", "prompt": "p", "size": "auto"}, []string{"image"}, false)
+			},
+			wantCode: 404, // "auto" is accepted; model lookup fails
 		},
 		{
 			name: "multipart bad n",
@@ -289,6 +297,65 @@ func TestConvertMaskToSDCPP(t *testing.T) {
 	}
 	if r, _, _, _ := gray.At(1, 0).RGBA(); r>>8 != 0 {
 		t.Errorf("native black pixel lost: got %d", r>>8)
+	}
+}
+
+// TestImageUsageWireShape locks the JSON shape of the usage block emitted by
+// runImageGeneration: the openai-python SDK (≥ 2.x) expects
+// usage.input_tokens_details.{image_tokens,text_tokens} and
+// usage.output_tokens_details on Images API responses.
+func TestImageUsageWireShape(t *testing.T) {
+	resp := openai.ImageGenerationResponse{
+		Created: 1,
+		Data:    []openai.ImageURLOrData{{B64JSON: "x"}},
+		Usage: &openai.ImageUsage{
+			InputTokens: 12,
+			InputTokensDetails: &openai.ImageUsageTokensDetails{
+				ImageTokens: 2,
+				TextTokens:  12,
+			},
+			OutputTokens: 0,
+			OutputTokensDetails: &openai.ImageUsageTokensDetails{
+				ImageTokens: 1,
+				TextTokens:  0,
+			},
+			TotalTokens: 12,
+		},
+	}
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Usage struct {
+			InputTokens        int `json:"input_tokens"`
+			InputTokensDetails struct {
+				ImageTokens int `json:"image_tokens"`
+				TextTokens  int `json:"text_tokens"`
+			} `json:"input_tokens_details"`
+			OutputTokens        int `json:"output_tokens"`
+			OutputTokensDetails struct {
+				ImageTokens int `json:"image_tokens"`
+				TextTokens  int `json:"text_tokens"`
+			} `json:"output_tokens_details"`
+			TotalTokens int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	u := decoded.Usage
+	if u.InputTokens != 12 || u.TotalTokens != 12 || u.OutputTokens != 0 {
+		t.Errorf("scalars = %d/%d/%d, want 12/12/0", u.InputTokens, u.TotalTokens, u.OutputTokens)
+	}
+	if u.InputTokensDetails.ImageTokens != 2 || u.InputTokensDetails.TextTokens != 12 {
+		t.Errorf("input_tokens_details = %+v, want {2, 12}", u.InputTokensDetails)
+	}
+	if u.OutputTokensDetails.ImageTokens != 1 || u.OutputTokensDetails.TextTokens != 0 {
+		t.Errorf("output_tokens_details = %+v, want {1, 0}", u.OutputTokensDetails)
+	}
+	if !strings.Contains(string(raw), `"input_tokens_details"`) {
+		t.Errorf("usage block missing input_tokens_details key: %s", raw)
 	}
 }
 

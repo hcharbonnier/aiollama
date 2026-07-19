@@ -1953,6 +1953,13 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	//   https://developers.openai.com/api/reference/resources/videos/extend
 	r.POST("/v1/videos/edits", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoEditHandler)
 	r.POST("/v1/videos/extensions", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoExtendHandler)
+	// Remix an existing video with a new prompt (JSON body; model/size/
+	// seconds inherited from the source job).
+	// Spec: https://developers.openai.com/api/reference/resources/videos/remix
+	r.POST("/v1/videos/:video_id/remix", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoRemixHandler)
+	// Sora cloud characters endpoints: no local equivalent → explicit 501.
+	r.POST("/v1/videos/characters", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoCharactersHandler)
+	r.GET("/v1/videos/characters/:character_id", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), s.VideoCharactersHandler)
 	// Deprecated video endpoints (replaced by the conformant /v1/videos
 	// surface above). Return 410 Gone for one release so existing clients
 	// see a clear deprecation signal instead of an opaque 404.

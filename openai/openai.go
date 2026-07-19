@@ -862,9 +862,18 @@ type ImageURLOrData struct {
 // Local diffusion runners do not tokenize like gpt-image-1; fields are 0
 // unless the runner reported prompt-eval counts.
 type ImageUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	InputTokens         int                      `json:"input_tokens"`
+	InputTokensDetails  *ImageUsageTokensDetails `json:"input_tokens_details,omitempty"`
+	OutputTokens        int                      `json:"output_tokens"`
+	OutputTokensDetails *ImageUsageTokensDetails `json:"output_tokens_details,omitempty"`
+	TotalTokens         int                      `json:"total_tokens"`
+}
+
+// ImageUsageTokensDetails breaks usage down between image and text tokens,
+// matching the SDK's ImagesResponse.usage shape (openai-python ≥ 2.x).
+type ImageUsageTokensDetails struct {
+	ImageTokens int `json:"image_tokens"`
+	TextTokens  int `json:"text_tokens"`
 }
 
 // ParseImageSize parses an OpenAI image size ("1024x1024") into width and
