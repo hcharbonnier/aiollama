@@ -217,8 +217,9 @@ Inchangé : create 200 + `queued`, polling avec `openai-poll-after-ms`,
       via `ffprobe` (fallback `ffmpeg -i`) → `seconds` total stitché correct.
 - [x] `input_reference.image_url` http(s) : téléchargement (timeout 30 s,
       ≤ 25 MiB, validation Content-Type, **filtrage anti-SSRF** :
-      destinations privées/loopback/link-local rejetées, IP publique épinglée
-      au connect, erreurs génériques anti-oracle).
+      destinations privées/loopback/link-local **et plages spéciales non
+      routables (RFC 6598/CGNAT-Tailscale, benchmark, réservé)** rejetées,
+      IP publique épinglée au connect, erreurs génériques anti-oracle).
 - [x] Cohérence JSON/multipart : les 3 endpoints vidéo (`create`, `edits`,
       `extensions`) acceptent multipart (spec) **et** JSON (extension
       documentée et homogène).

@@ -507,11 +507,6 @@ func FFmpegPath() (string, error) {
 	return defaultTranscoder.lookup()
 }
 
-// FFprobePath returns the resolved ffprobe binary path (cached lookup).
-func FFprobePath() (string, error) {
-	return lookupFFprobe()
-}
-
 // maxProbeFallbackBytes bounds how much of an uploaded video the ffmpeg -i
 // duration fallback reads. The container header (which carries the Duration
 // line) sits at the start for the MP4s this API handles, so a few MiB

@@ -200,13 +200,13 @@ func (j *Job) Content() ([]byte, string) {
 
 // CachedVariant returns the cached PNG for a /content variant ("thumbnail"
 // or "spritesheet"), computing and caching it via fn on first access. fn is
-// called at most once per variant per job (the source MP4 is immutable).
-// The job mutex is held during computation to avoid duplicate concurrent
-// ffmpeg runs; variant extraction is fast for the short clips this API
-// produces.
+// called at most once per variant per job in practice (the source MP4 is
+// immutable), but it runs OUTSIDE the job mutex: it shells out to ffmpeg,
+// which can take seconds, and holding j.mu would stall concurrent downloads
+// and polls of this job as well as the store's eviction passes (which take
+// j.mu.RLock while holding the store mutex). Concurrent first-time requests
+// may compute twice; the first stored result wins.
 func (j *Job) CachedVariant(variant string, fn func() ([]byte, error)) ([]byte, error) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
 	var slot *[]byte
 	switch variant {
 	case "thumbnail":
@@ -216,12 +216,23 @@ func (j *Job) CachedVariant(variant string, fn func() ([]byte, error)) ([]byte, 
 	default:
 		return nil, fmt.Errorf("unknown variant %q", variant)
 	}
-	if *slot != nil {
-		return *slot, nil
+
+	j.mu.RLock()
+	cached := *slot
+	j.mu.RUnlock()
+	if cached != nil {
+		return cached, nil
 	}
+
 	b, err := fn()
 	if err != nil {
 		return nil, err
+	}
+
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if *slot != nil {
+		return *slot, nil // a concurrent request computed it first
 	}
 	*slot = b
 	return b, nil

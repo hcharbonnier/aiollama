@@ -355,7 +355,6 @@ type ImageGenParams struct {
 	ClipSkip         int32
 	InitImage        *Image
 	RefImages        []Image
-	RefImageArgs     string
 	MaskImage        *Image
 	Width            int32
 	Height           int32

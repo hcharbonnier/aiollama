@@ -1,6 +1,7 @@
 package server
 
 import (
+	"container/list"
 	"crypto/rand"
 	"encoding/hex"
 	"sort"
@@ -22,6 +23,9 @@ type storedImage struct {
 	data        []byte
 	contentType string
 	expiresAt   time.Time
+	// element is the entry's position in the store's insertion-order list
+	// (value: the image id).
+	element *list.Element
 }
 
 // imageFileStore is a small in-memory store backing
@@ -30,10 +34,14 @@ type storedImage struct {
 // GET /v1/images/files/{id} until the TTL expires. The store is
 // process-local (lost on restart), like the video job store. A background
 // sweep reclaims expired entries every minute (mirroring videojobs'
-// evictLoop) so idle servers don't retain a full store indefinitely.
+// evictLoop) so idle servers don't retain a full store indefinitely. All
+// entries share one TTL, so insertion order is expiry order: the oldest
+// entry is always at the front of the list, making cap eviction O(1) per
+// evicted entry instead of a full map scan.
 type imageFileStore struct {
 	mu         sync.Mutex
 	files      map[string]*storedImage
+	oldest     *list.List // ids in insertion order; front = oldest
 	totalBytes int64
 	done       chan struct{}
 	closeOnce  sync.Once
@@ -41,8 +49,9 @@ type imageFileStore struct {
 
 func newImageFileStore() *imageFileStore {
 	s := &imageFileStore{
-		files: make(map[string]*storedImage),
-		done:  make(chan struct{}),
+		files:  make(map[string]*storedImage),
+		oldest: list.New(),
+		done:   make(chan struct{}),
 	}
 	go s.sweepLoop()
 	return s
@@ -76,39 +85,31 @@ func newImageFileID() string {
 	return "img_" + hex.EncodeToString(b)
 }
 
-// put stores the image and returns its id. Expired entries are purged and
-// the global byte cap is enforced by evicting oldest-first.
+// put stores the image and returns its id. The global byte cap is enforced
+// by evicting oldest-first (front of the insertion-order list, O(1) per
+// evicted entry). Expired entries are reclaimed by the 1-minute sweep and
+// lazily on get, so no per-put expiry scan is needed.
 func (s *imageFileStore) put(data []byte, contentType string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.evictExpiredLocked(time.Now())
-
 	id := newImageFileID()
-	s.files[id] = &storedImage{
+	img := &storedImage{
 		data:        data,
 		contentType: contentType,
 		expiresAt:   time.Now().Add(imageFileTTL),
 	}
+	img.element = s.oldest.PushBack(id)
+	s.files[id] = img
 	s.totalBytes += int64(len(data))
 
-	// LRU-evict oldest until under the cap.
+	// Evict oldest-first until under the cap, keeping the just-stored entry.
 	for s.totalBytes > maxImageFileBytes && len(s.files) > 1 {
-		oldestID := ""
-		var oldestExp time.Time
-		for fid, f := range s.files {
-			if fid == id {
-				continue
-			}
-			if oldestID == "" || f.expiresAt.Before(oldestExp) {
-				oldestID, oldestExp = fid, f.expiresAt
-			}
-		}
-		if oldestID == "" {
+		el := s.oldest.Front()
+		if el == nil {
 			break
 		}
-		s.totalBytes -= int64(len(s.files[oldestID].data))
-		delete(s.files, oldestID)
+		s.evictLocked(el.Value.(string))
 	}
 	return id
 }
@@ -123,11 +124,21 @@ func (s *imageFileStore) get(id string) ([]byte, string, bool) {
 		return nil, "", false
 	}
 	if time.Now().After(f.expiresAt) {
-		s.totalBytes -= int64(len(f.data))
-		delete(s.files, id)
+		s.evictLocked(id)
 		return nil, "", false
 	}
 	return f.data, f.contentType, true
+}
+
+// evictLocked removes a single entry. Caller holds s.mu.
+func (s *imageFileStore) evictLocked(id string) {
+	f, ok := s.files[id]
+	if !ok {
+		return
+	}
+	s.totalBytes -= int64(len(f.data))
+	s.oldest.Remove(f.element)
+	delete(s.files, id)
 }
 
 // evictExpiredLocked removes all expired entries. Caller holds s.mu.
@@ -141,7 +152,6 @@ func (s *imageFileStore) evictExpiredLocked(now time.Time) {
 	}
 	sort.Strings(expired) // deterministic for tests
 	for _, id := range expired {
-		s.totalBytes -= int64(len(s.files[id].data))
-		delete(s.files, id)
+		s.evictLocked(id)
 	}
 }

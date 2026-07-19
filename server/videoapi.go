@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,35 @@ const openaiPollAfterMS = "openai-poll-after-ms"
 // for non-terminal jobs. Long enough to avoid hammering the server, short
 // enough that a completed job is noticed promptly.
 const defaultPollIntervalMS = 2000
+
+// maxVideoPromptChars bounds the prompt length on all video endpoints
+// (spec: 32000).
+const maxVideoPromptChars = 32000
+
+// validateVideoPrompt enforces the shared prompt rules for the video
+// endpoints. On failure it aborts the gin context with a 400 and returns
+// false.
+func validateVideoPrompt(c *gin.Context, prompt string) bool {
+	if prompt == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt is required"))
+		return false
+	}
+	if len(prompt) > maxVideoPromptChars {
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, fmt.Sprintf("prompt must be %d characters or less", maxVideoPromptChars)))
+		return false
+	}
+	return true
+}
+
+// videoSizeDimensions splits a validated "WxH" video size into width and
+// height. Callers must have validated the size against VideoSizeValues (or
+// inherited it from a validated job) first.
+func videoSizeDimensions(size string) (int, int) {
+	width, height, _ := strings.Cut(size, "x")
+	w, _ := strconv.Atoi(width)
+	h, _ := strconv.Atoi(height)
+	return w, h
+}
 
 // VideoCreateHandler handles POST /v1/videos. It accepts multipart/form-data
 // with prompt (required), model, seconds, size, and optional input_reference,
@@ -70,12 +100,7 @@ func (s *Server) VideoCreateHandler(c *gin.Context) {
 		}
 	}
 
-	if params.Prompt == "" {
-		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt is required"))
-		return
-	}
-	if len(params.Prompt) > 32000 {
-		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt must be 32000 characters or less"))
+	if !validateVideoPrompt(c, params.Prompt) {
 		return
 	}
 
@@ -106,9 +131,7 @@ func (s *Server) VideoCreateHandler(c *gin.Context) {
 		initImage = img
 	}
 
-	width, height, _ := strings.Cut(params.Size, "x")
-	w, _ := strconv.Atoi(width)
-	h, _ := strconv.Atoi(height)
+	w, h := videoSizeDimensions(params.Size)
 
 	job, err := s.videoJobs.Create(videojobs.CreateParams{
 		Model:     params.Model,
@@ -391,36 +414,57 @@ func (v *videoCreateInput) fromForm(r *http.Request) error {
 	v.Seconds = r.FormValue("seconds")
 	v.Size = r.FormValue("size")
 
-	// input_reference can be a file part OR a JSON object in the
-	// "input_reference" form field.
-	if file, _, err := r.FormFile("input_reference"); err == nil {
+	// input_reference: file part, JSON object form field, or SDK
+	// bracket-notation fields (input_reference[image_url],
+	// input_reference[file_id]).
+	var ref openai.ImageInputReferenceParam
+	var imageURL, fileID string
+	data, err := parseMultipartRefField(r, "input_reference", &ref, map[string]*string{
+		"image_url": &imageURL,
+		"file_id":   &fileID,
+	})
+	if err != nil {
+		return err
+	}
+	v.inputReferenceFile = data
+	switch {
+	case ref.ImageURL != "" || ref.FileID != "":
+		v.InputReference = &ref
+	case imageURL != "" || fileID != "":
+		v.InputReference = &openai.ImageInputReferenceParam{ImageURL: imageURL, FileID: fileID}
+	}
+	return nil
+}
+
+// parseMultipartRefField parses a multipart "reference" field as emitted by
+// the openai-python SDK, in one of three wire forms: a file part named
+// <field> (returned as fileData), a JSON object string in the <field> form
+// value (unmarshaled into jsonTarget), or bracket-notation subfields
+// "<field>[sub]" (the SDK serializes nested dicts via qs.stringify_items,
+// array_format="brackets"), each assigned to its target string. Precedence:
+// file part, then JSON string, then bracket fields; empty bracket values
+// never clobber.
+func parseMultipartRefField(r *http.Request, field string, jsonTarget any, brackets map[string]*string) (fileData []byte, err error) {
+	if file, _, err := r.FormFile(field); err == nil {
 		defer file.Close()
 		data, err := io.ReadAll(file)
 		if err != nil {
-			return fmt.Errorf("read input_reference file: %w", err)
+			return nil, fmt.Errorf("read %s file: %w", field, err)
 		}
-		v.inputReferenceFile = data
-		return nil
+		return data, nil
 	}
-	// No file part: check for a JSON object form field.
-	if refStr := r.FormValue("input_reference"); refStr != "" {
-		var ref openai.ImageInputReferenceParam
-		if err := json.Unmarshal([]byte(refStr), &ref); err != nil {
-			return fmt.Errorf("invalid input_reference: %w", err)
+	if refStr := r.FormValue(field); refStr != "" {
+		if err := json.Unmarshal([]byte(refStr), jsonTarget); err != nil {
+			return nil, fmt.Errorf("invalid %s: %w", field, err)
 		}
-		v.InputReference = &ref
+		return nil, nil
 	}
-	// The openai-python SDK serializes nested dicts in multipart bodies as
-	// bracket-notation fields (qs.stringify_items, array_format="brackets"):
-	// input_reference[image_url]=..., input_reference[file_id]=...
-	if v.InputReference == nil {
-		imageURL := r.FormValue("input_reference[image_url]")
-		fileID := r.FormValue("input_reference[file_id]")
-		if imageURL != "" || fileID != "" {
-			v.InputReference = &openai.ImageInputReferenceParam{ImageURL: imageURL, FileID: fileID}
+	for sub, dst := range brackets {
+		if val := r.FormValue(field + "[" + sub + "]"); val != "" {
+			*dst = val
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 func (v *videoCreateInput) hasInputReference() bool {
@@ -463,17 +507,42 @@ const maxRemoteImageBytes int64 = 25 << 20 // 25 MiB
 // to a non-public destination.
 var errBlockedRemoteHost = errors.New("input_reference.image_url: host is not allowed (private, loopback, link-local, or otherwise non-public address)")
 
+// blockedRemoteCIDRs lists special-use ranges that are not globally routable
+// but are not covered by net.IP's IsPrivate/IsLoopback/etc. predicates:
+// RFC 6598 shared address space (CGNAT — used by Tailscale tailnets),
+// RFC 6890 protocol assignments, RFC 2544 benchmarking, and reserved space.
+var blockedRemoteCIDRs = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+}
+
 // isBlockedRemoteIP reports whether ip is a non-public destination
-// (loopback, private RFC1918/RFC4193, link-local, unspecified, multicast).
-// input_reference downloads are restricted to public IPs to prevent SSRF
-// against internal services on deployments where the server is exposed.
+// (loopback, private RFC1918/RFC4193, CGNAT/shared, link-local, unspecified,
+// multicast, or other special-use ranges). input_reference downloads are
+// restricted to public IPs to prevent SSRF against internal services on
+// deployments where the server is exposed.
 func isBlockedRemoteIP(ip net.IP) bool {
-	return ip.IsLoopback() ||
+	if ip.IsLoopback() ||
 		ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() ||
 		ip.IsUnspecified() ||
-		ip.IsMulticast()
+		ip.IsMulticast() {
+		return true
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true // unparseable: fail closed
+	}
+	addr = addr.Unmap()
+	for _, p := range blockedRemoteCIDRs {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // remoteImageClient is used for input_reference.image_url downloads. Its
@@ -577,32 +646,20 @@ type videoSourceInput struct {
 	videoID string
 }
 
-// fromForm parses the `video` reference from a multipart form. The `video`
-// field may be a file part (uploaded MP4) or a JSON object string. Returns
-// the source input and the model/size fields (also parsed here so the edit/
-// extend handlers share one parse pass).
-func (v *videoSourceInput) fromForm(r *http.Request, fields map[string]string) error {
-	if file, _, err := r.FormFile("video"); err == nil {
-		defer file.Close()
-		data, err := io.ReadAll(file)
-		if err != nil {
-			return fmt.Errorf("read video file: %w", err)
-		}
-		v.videoFile = data
-		return nil
+// fromForm parses the `video` reference from a multipart form: a file part
+// (uploaded MP4), a JSON object form field, or the SDK's bracket-notation
+// field video[id].
+func (v *videoSourceInput) fromForm(r *http.Request) error {
+	var ref openai.VideoReferenceParam
+	data, err := parseMultipartRefField(r, "video", &ref, map[string]*string{
+		"id": &v.videoID,
+	})
+	if err != nil {
+		return err
 	}
-	// No file part: check for a JSON object form field.
-	if refStr, ok := fields["video"]; ok && refStr != "" {
-		var ref openai.VideoReferenceParam
-		if err := json.Unmarshal([]byte(refStr), &ref); err != nil {
-			return fmt.Errorf("invalid video reference: %w", err)
-		}
+	v.videoFile = data
+	if ref.ID != "" {
 		v.videoID = ref.ID
-	}
-	// The openai-python SDK serializes the {"id": ...} object in multipart
-	// bodies as a bracket-notation field: video[id]=vid_...
-	if v.videoID == "" {
-		v.videoID = r.FormValue("video[id]")
 	}
 	return nil
 }
@@ -658,10 +715,7 @@ func (s *Server) parseEditExtendRequest(c *gin.Context, secondsRequired bool, se
 		in.model = c.Request.FormValue("model")
 		in.seconds = c.Request.FormValue("seconds")
 		in.size = c.Request.FormValue("size")
-		fields := map[string]string{
-			"video": c.Request.FormValue("video"),
-		}
-		if err := in.src.fromForm(c.Request, fields); err != nil {
+		if err := in.src.fromForm(c.Request); err != nil {
 			c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
 			return editExtendInput{}, false
 		}
@@ -687,12 +741,7 @@ func (s *Server) parseEditExtendRequest(c *gin.Context, secondsRequired bool, se
 		in.src.videoID = body.Video.ID
 	}
 
-	if in.prompt == "" {
-		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt is required"))
-		return editExtendInput{}, false
-	}
-	if len(in.prompt) > 32000 {
-		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt must be 32000 characters or less"))
+	if !validateVideoPrompt(c, in.prompt) {
 		return editExtendInput{}, false
 	}
 
@@ -758,11 +807,36 @@ func (s *Server) parseEditExtendRequest(c *gin.Context, secondsRequired bool, se
 		}
 	}
 
-	width, height, _ := strings.Cut(in.size, "x")
-	in.width, _ = strconv.Atoi(width)
-	in.height, _ = strconv.Atoi(height)
+	in.width, in.height = videoSizeDimensions(in.size)
 
 	return in, true
+}
+
+// createSourceBasedJob creates the async job shared by the edit, extend, and
+// remix handlers: a re-render driven from a source video (a referenced job
+// and/or uploaded bytes). extend selects the extension semantics (last-frame
+// init + source concatenation) versus the edit/remix semantics (first-frame
+// init, new standalone clip).
+func (s *Server) createSourceBasedJob(c *gin.Context, in editExtendInput, extend bool) {
+	job, err := s.videoJobs.Create(videojobs.CreateParams{
+		Model:         in.model,
+		Prompt:        in.prompt,
+		Seconds:       in.seconds,
+		Size:          in.size,
+		RemixedFromID: in.src.videoID,
+		SourceVideoID: in.src.videoID,
+		SourceVideo:   in.src.videoFile,
+		Extend:        extend,
+		SourceSeconds: in.sourceSeconds,
+		Generate:      s.buildVideoGenerateFunc(in.model, int32(in.width), int32(in.height), in.seconds),
+	})
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, err.Error()))
+		return
+	}
+
+	c.Header(openaiPollAfterMS, strconv.Itoa(defaultPollIntervalMS))
+	c.JSON(http.StatusOK, job.ToVideo())
 }
 
 // VideoEditHandler handles POST /v1/videos/edits. It accepts multipart/form-data
@@ -778,26 +852,7 @@ func (s *Server) VideoEditHandler(c *gin.Context) {
 	if !ok {
 		return
 	}
-
-	job, err := s.videoJobs.Create(videojobs.CreateParams{
-		Model:         in.model,
-		Prompt:        in.prompt,
-		Seconds:       in.seconds,
-		Size:          in.size,
-		RemixedFromID: in.src.videoID,
-		SourceVideoID: in.src.videoID,
-		SourceVideo:   in.src.videoFile,
-		Extend:        false,
-		SourceSeconds: in.sourceSeconds,
-		Generate:      s.buildVideoGenerateFunc(in.model, int32(in.width), int32(in.height), in.seconds),
-	})
-	if err != nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, err.Error()))
-		return
-	}
-
-	c.Header(openaiPollAfterMS, strconv.Itoa(defaultPollIntervalMS))
-	c.JSON(http.StatusOK, job.ToVideo())
+	s.createSourceBasedJob(c, in, false)
 }
 
 // VideoExtendHandler handles POST /v1/videos/extensions. It accepts
@@ -813,26 +868,7 @@ func (s *Server) VideoExtendHandler(c *gin.Context) {
 	if !ok {
 		return
 	}
-
-	job, err := s.videoJobs.Create(videojobs.CreateParams{
-		Model:         in.model,
-		Prompt:        in.prompt,
-		Seconds:       in.seconds,
-		Size:          in.size,
-		RemixedFromID: in.src.videoID,
-		SourceVideoID: in.src.videoID,
-		SourceVideo:   in.src.videoFile,
-		Extend:        true,
-		SourceSeconds: in.sourceSeconds,
-		Generate:      s.buildVideoGenerateFunc(in.model, int32(in.width), int32(in.height), in.seconds),
-	})
-	if err != nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, err.Error()))
-		return
-	}
-
-	c.Header(openaiPollAfterMS, strconv.Itoa(defaultPollIntervalMS))
-	c.JSON(http.StatusOK, job.ToVideo())
+	s.createSourceBasedJob(c, in, true)
 }
 
 // VideoRemixHandler handles POST /v1/videos/{video_id}/remix. The request
@@ -870,37 +906,21 @@ func (s *Server) VideoRemixHandler(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
 		return
 	}
-	if body.Prompt == "" {
-		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt is required"))
-		return
-	}
-	if len(body.Prompt) > 32000 {
-		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, "prompt must be 32000 characters or less"))
+	if !validateVideoPrompt(c, body.Prompt) {
 		return
 	}
 
-	width, height, _ := strings.Cut(srcVideo.Size, "x")
-	w, _ := strconv.Atoi(width)
-	h, _ := strconv.Atoi(height)
-
-	job, err := s.videoJobs.Create(videojobs.CreateParams{
-		Model:         srcVideo.Model,
-		Prompt:        body.Prompt,
-		Seconds:       srcVideo.Seconds,
-		Size:          srcVideo.Size,
-		RemixedFromID: id,
-		SourceVideoID: id,
-		Extend:        false,
-		SourceSeconds: srcVideo.Seconds,
-		Generate:      s.buildVideoGenerateFunc(srcVideo.Model, int32(w), int32(h), srcVideo.Seconds),
-	})
-	if err != nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, err.Error()))
-		return
-	}
-
-	c.Header(openaiPollAfterMS, strconv.Itoa(defaultPollIntervalMS))
-	c.JSON(http.StatusOK, job.ToVideo())
+	w, h := videoSizeDimensions(srcVideo.Size)
+	s.createSourceBasedJob(c, editExtendInput{
+		prompt:        body.Prompt,
+		model:         srcVideo.Model,
+		seconds:       srcVideo.Seconds,
+		size:          srcVideo.Size,
+		src:           videoSourceInput{videoID: id},
+		sourceSeconds: srcVideo.Seconds,
+		width:         w,
+		height:        h,
+	}, false)
 }
 
 // VideoCharactersHandler responds 501 Not Implemented for the Sora cloud

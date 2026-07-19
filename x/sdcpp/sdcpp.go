@@ -383,11 +383,6 @@ func (c *Context) GenerateImage(p ImageGenParams, progress ProgressFunc) ([]Imag
 			}
 		}()
 	}
-	if p.RefImageArgs != "" {
-		args, freeArgs := cstr(p.RefImageArgs)
-		defer freeArgs()
-		params.ref_image_args = args
-	}
 	if p.MaskImage != nil {
 		params.mask_image = goImageToC(p.MaskImage)
 		defer C.free(unsafe.Pointer(params.mask_image.data))
