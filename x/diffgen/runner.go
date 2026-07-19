@@ -246,6 +246,16 @@ func (s *runnerServer) handleImageCompletion(w http.ResponseWriter, r *http.Requ
 			initImage = &img
 		}
 	}
+	// Additional edit inputs (OpenAI multi-image edits) become SD.cpp
+	// reference images.
+	var refImages []sdcpp.Image
+	if len(req.Images) > 1 {
+		for _, data := range req.Images[1:] {
+			if img, err := bytesToSDImage(data); err == nil {
+				refImages = append(refImages, img)
+			}
+		}
+	}
 	var maskImage *sdcpp.Image
 	if len(req.Mask) > 0 {
 		if img, err := bytesToSDImage(req.Mask); err == nil {
@@ -261,6 +271,7 @@ func (s *runnerServer) handleImageCompletion(w http.ResponseWriter, r *http.Requ
 		Seed:            req.Seed,
 		BatchCount:      int32(max(1, req.BatchCount)),
 		InitImage:       initImage,
+		RefImages:       refImages,
 		MaskImage:       maskImage,
 		ControlStrength: req.ControlStrength,
 		SampleParams: sdcpp.SampleParams{

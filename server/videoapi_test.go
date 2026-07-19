@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -434,6 +435,123 @@ func (extendableTranscoder) Spritesheet(ctx context.Context, mp4 []byte) ([]byte
 	return []byte("spritesheet-png"), nil
 }
 func (extendableTranscoder) Available() bool { return true }
+
+// countingTranscoder counts DecodeFrames/Spritesheet calls to verify
+// variant caching on the job.
+type countingTranscoder struct {
+	decodeCalls int
+	sheetCalls  int
+}
+
+func (c *countingTranscoder) EncodeMP4(ctx context.Context, framePNGs [][]byte, fps int) ([]byte, error) {
+	return []byte{0, 0, 0, 0x18, 'f', 't', 'y', 'p'}, nil
+}
+
+func (c *countingTranscoder) DecodeFrames(ctx context.Context, mp4 []byte, maxFrames int) ([][]byte, int, error) {
+	c.decodeCalls++
+	return [][]byte{[]byte("decoded-frame")}, 16, nil
+}
+
+func (c *countingTranscoder) DecodeLastFrame(ctx context.Context, mp4 []byte) ([]byte, error) {
+	return []byte("decoded-last-frame"), nil
+}
+
+func (c *countingTranscoder) ConcatMP4(ctx context.Context, first, second []byte, fps int) ([]byte, error) {
+	return []byte("stitched"), nil
+}
+
+func (c *countingTranscoder) ProbeDurationSeconds(ctx context.Context, mp4 []byte) (int, error) {
+	return 8, nil
+}
+
+func (c *countingTranscoder) Spritesheet(ctx context.Context, mp4 []byte) ([]byte, error) {
+	c.sheetCalls++
+	return []byte("spritesheet-png"), nil
+}
+func (c *countingTranscoder) Available() bool { return true }
+
+// TestVideoContentVariantCached verifies that repeated downloads of the same
+// variant for the same job reuse the cached bytes (single ffmpeg run).
+func TestVideoContentVariantCached(t *testing.T) {
+	tc := &countingTranscoder{}
+	store := videojobs.NewJobStore(tc)
+	defer store.Close()
+	_, r := setupVideoRouterWithEdits(t, store)
+
+	gen := func(ctx context.Context, params videojobs.CreateParams, fn func([]byte, int, int)) error {
+		fn([]byte("frame-png"), 1, 1)
+		return nil
+	}
+	job, err := store.Create(videojobs.CreateParams{
+		Model: "m", Prompt: "p", Seconds: "4", Size: "720x1280", Generate: gen,
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for job.Status() != openai.VideoStatusCompleted && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if job.Status() != openai.VideoStatusCompleted {
+		t.Fatalf("job did not complete: status = %s", job.Status())
+	}
+
+	for i := 0; i < 3; i++ {
+		req, _ := http.NewRequest(http.MethodGet, "/v1/videos/"+job.ID()+"/content?variant=thumbnail", nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d", i, w.Code)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		req, _ := http.NewRequest(http.MethodGet, "/v1/videos/"+job.ID()+"/content?variant=spritesheet", nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("spritesheet request %d: status = %d", i, w.Code)
+		}
+	}
+
+	if tc.decodeCalls != 1 {
+		t.Errorf("DecodeFrames called %d times, want 1 (cached)", tc.decodeCalls)
+	}
+	if tc.sheetCalls != 1 {
+		t.Errorf("Spritesheet called %d times, want 1 (cached)", tc.sheetCalls)
+	}
+}
+
+// TestIsBlockedRemoteIP verifies the SSRF destination filter used for
+// input_reference.image_url downloads.
+func TestIsBlockedRemoteIP(t *testing.T) {
+	blocked := []string{
+		"127.0.0.1", "127.53.1.9", "::1",
+		"10.0.0.1", "172.16.0.1", "192.168.1.1",
+		"169.254.169.254", "fe80::1",
+		"0.0.0.0", "224.0.0.1", "ff02::1",
+	}
+	public := []string{
+		"8.8.8.8", "1.1.1.1", "2606:4700:4700::1111",
+	}
+	for _, s := range blocked {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			t.Fatalf("bad test ip %q", s)
+		}
+		if !isBlockedRemoteIP(ip) {
+			t.Errorf("ip %s should be blocked", s)
+		}
+	}
+	for _, s := range public {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			t.Fatalf("bad test ip %q", s)
+		}
+		if isBlockedRemoteIP(ip) {
+			t.Errorf("ip %s should be allowed", s)
+		}
+	}
+}
 
 // setupVideoRouterWithEdits binds all video routes (including edits/extensions)
 // to the server's job store.

@@ -149,9 +149,9 @@ main.go                 # entry; cobra CLI
 cmd/                    # CLI commands (cmd.go registers imagegen flags)
 api/                    # public Go client + API types (GenerateRequest has Width/Height/Steps/Image)
 server/                 # HTTP server, routes.go, sched.go (scheduler), create.go (model import)
+                        #   + imageapi.go/imagefiles.go: dedicated OpenAI Images API handlers
 openai/                 # OpenAI-compatible request/response types (ImageGenerationRequest, etc.)
-middleware/             # gin middleware: ImageGenerationsMiddleware, ImageEditsMiddleware
-middleware/openai.go    # ImageWriter translates ndjson stream → OpenAI response
+middleware/             # gin middleware (chat/completions/embeddings; image middlewares REMOVED — see note §4.2)
 types/model/config.go   # ConfigV2 (Capabilities, ModelFormat, Architecture)
 x/
   imagegen/             # *** existing image-gen subsystem (MLX-based) — RETAINED for MLX-supported image models ***
@@ -814,6 +814,16 @@ Add `Video string` to `api.GenerateResponse` for the final container. The
 streaming `Step`/`Total` fields (already present) carry progress.
 
 #### 4.2 Image endpoints (preserved, backend-agnostic)
+
+> **SUPERSEDED (2026-07-19):** the image middlewares described below
+> (`ImageGenerationsMiddleware`, `ImageEditsMiddleware`, `ImageWriter`) were
+> **removed**. `/v1/images/generations` and `/v1/images/edits` are now
+> dedicated handlers in `server/imageapi.go` (driving the scheduler
+> directly) — required for spec conformance (n>1, multipart edits + mask,
+> output transcoding, `usage`, `response_format=url`). The backend-agnostic
+> routing property is preserved (the handlers use the same
+> `scheduleRunner` path). See `docs/openai-api-conformance-report.md`.
+
 `/v1/images/generations` and `/v1/images/edits` remain. The middleware
 (`middleware/openai.go:601`) is unchanged — it converts to
 `api.GenerateRequest` and the scheduler routes it to the appropriate runner
@@ -878,12 +888,9 @@ data: {"created": 1704067200, "data": [{"video": "base64..."}]}
 ```
 
 #### 4.4 Middleware (`middleware/`)
-- `ImageGenerationsMiddleware` / `ImageEditsMiddleware` — unchanged (already
-  produce `api.GenerateRequest` with `Width`/`Height`).
-- Add `VideoGenerationsMiddleware()` and `VideoEditsMiddleware()` mirroring
-  the image middleware, converting video request fields.
-- Add a `VideoWriter` that assembles the streaming response (parallel to
-  `ImageWriter`).
+- `ImageGenerationsMiddleware` / `ImageEditsMiddleware` — **REMOVED
+  (2026-07-19)**: superseded by the dedicated handlers in
+  `server/imageapi.go`; see the SUPERSEDED note in §4.2.
 
 Register in `routes.go`:
 ```go

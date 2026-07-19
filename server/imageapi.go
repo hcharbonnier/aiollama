@@ -14,16 +14,17 @@ import (
 	"image/png"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/openai"
+	"github.com/ollama/ollama/server/videojobs"
 	"github.com/ollama/ollama/types/model"
 )
 
@@ -75,7 +76,7 @@ func (s *Server) ImageGenerationsHandler(c *gin.Context) {
 		return
 	}
 
-	params, ok := validateImageRequest(c, req.Model, req.Prompt, req.N, req.Size, req.Quality, req.ResponseFormat, req.OutputFormat, req.OutputCompression, req.Background, req.Style, req.Moderation, req.Stream, req.Seed)
+	params, ok := validateImageRequest(c, req.Model, req.Prompt, req.N, req.Size, req.Quality, req.ResponseFormat, req.OutputFormat, req.OutputCompression, req.Background, req.Style, req.Moderation, req.Stream, req.PartialImages, req.Seed)
 	if !ok {
 		return
 	}
@@ -109,7 +110,7 @@ func (s *Server) ImageEditsHandler(c *gin.Context) {
 		}
 	}
 
-	params, ok := validateImageRequest(c, req.Model, req.Prompt, req.N, req.Size, req.Quality, req.ResponseFormat, req.OutputFormat, req.OutputCompression, req.Background, "", "", false, req.Seed)
+	params, ok := validateImageRequest(c, req.Model, req.Prompt, req.N, req.Size, req.Quality, req.ResponseFormat, req.OutputFormat, req.OutputCompression, req.Background, "", "", false, 0, req.Seed)
 	if !ok {
 		return
 	}
@@ -154,8 +155,9 @@ func (s *Server) ImageFileHandler(c *gin.Context) {
 // validateImageRequest applies the spec's shared scalar validation and
 // defaults for generations and edits. On failure it aborts with a 400 and
 // returns ok=false. style/moderation/user are validated for enum
-// conformance but otherwise have no local effect.
-func validateImageRequest(c *gin.Context, modelName, prompt string, n int, size, quality, responseFormat, outputFormat string, outputCompression *int, background, style, moderation string, stream bool, seed *int64) (imageGenParams, bool) {
+// conformance but otherwise have no local effect. DALL·E 3 quality aliases
+// ("standard", "hd") are accepted and mapped onto the gpt-image-1 enum.
+func validateImageRequest(c *gin.Context, modelName, prompt string, n int, size, quality, responseFormat, outputFormat string, outputCompression *int, background, style, moderation string, stream bool, partialImages int, seed *int64) (imageGenParams, bool) {
 	bad := func(msg string) (imageGenParams, bool) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, msg))
 		return imageGenParams{}, false
@@ -167,7 +169,7 @@ func validateImageRequest(c *gin.Context, modelName, prompt string, n int, size,
 	if modelName == "" {
 		return bad("model is required")
 	}
-	if stream {
+	if stream || partialImages > 0 {
 		return bad("streaming (stream=true with partial_images) is not supported by this server")
 	}
 
@@ -186,6 +188,14 @@ func validateImageRequest(c *gin.Context, modelName, prompt string, n int, size,
 		return bad(err.Error())
 	}
 
+	// DALL·E 3 quality aliases (accepted by the official API): map onto the
+	// gpt-image-1 enum before validation.
+	switch quality {
+	case "standard":
+		quality = openai.ImageQualityAuto
+	case "hd":
+		quality = openai.ImageQualityHigh
+	}
 	if quality == "" {
 		quality = openai.ImageQualityAuto
 	} else if !openai.ValidImageQuality(quality) {
@@ -252,7 +262,7 @@ func (s *Server) runImageGeneration(c *gin.Context, p imageGenParams) {
 
 	runner, m, _, err := s.scheduleRunner(ctx, p.model, []model.Capability{model.CapabilityImage}, nil, nil, nil)
 	if err != nil {
-		handleScheduleError(c, p.model, err)
+		writeImageScheduleError(c, p.model, err)
 		return
 	}
 
@@ -297,6 +307,17 @@ func (s *Server) runImageGeneration(c *gin.Context, p imageGenParams) {
 			return
 		}
 
+		// Fast path: the runner already returns base64 PNG, so the default
+		// (png + b64_json) needs no decode/transcode/re-encode round trip.
+		if p.outputFormat == openai.ImageOutputFormatPNG && p.responseFormat == openai.ImageResponseFormatB64JSON {
+			if !strings.HasPrefix(imgB64, pngB64SignaturePrefix) {
+				c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, "runner returned invalid image data"))
+				return
+			}
+			data = append(data, openai.ImageURLOrData{B64JSON: imgB64})
+			continue
+		}
+
 		pngBytes, err := base64.StdEncoding.DecodeString(imgB64)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, "runner returned invalid image data"))
@@ -328,6 +349,28 @@ func (s *Server) runImageGeneration(c *gin.Context, p imageGenParams) {
 	})
 }
 
+// writeImageScheduleError maps scheduler errors to HTTP statuses using the
+// same mapping as handleScheduleError, but with the OpenAI error envelope
+// (the Images API must stay SDK-parseable even on overload/model races).
+func writeImageScheduleError(c *gin.Context, name string, err error) {
+	switch {
+	case errors.Is(err, errCapabilities), errors.Is(err, errRequired):
+		c.AbortWithStatusJSON(http.StatusBadRequest, openai.NewError(http.StatusBadRequest, err.Error()))
+	case errors.Is(err, context.Canceled):
+		c.AbortWithStatusJSON(499, openai.NewError(499, "request canceled"))
+	case errors.Is(err, ErrMaxQueue):
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, openai.NewError(http.StatusServiceUnavailable, err.Error()))
+	case errors.Is(err, os.ErrNotExist):
+		c.AbortWithStatusJSON(http.StatusNotFound, openai.NewError(http.StatusNotFound, fmt.Sprintf("model %q not found, try pulling it first", name)))
+	default:
+		c.AbortWithStatusJSON(http.StatusInternalServerError, openai.NewError(http.StatusInternalServerError, err.Error()))
+	}
+}
+
+// pngB64SignaturePrefix is the base64 prefix of the 8-byte PNG signature
+// (\x89PNG\r\n\x1a\n), used to sanity-check runner output on the fast path.
+const pngB64SignaturePrefix = "iVBORw0KGgo"
+
 // requestBaseURL builds the absolute base URL for this request, honoring
 // reverse-proxy headers, for response_format=url download links.
 func requestBaseURL(c *gin.Context) string {
@@ -338,7 +381,13 @@ func requestBaseURL(c *gin.Context) string {
 	if proto := c.GetHeader("X-Forwarded-Proto"); proto != "" {
 		scheme = proto
 	}
-	return scheme + "://" + c.Request.Host
+	host := c.Request.Host
+	if fwdHost := c.GetHeader("X-Forwarded-Host"); fwdHost != "" {
+		// First value wins when a proxy chain appends multiple hosts.
+		host, _, _ = strings.Cut(fwdHost, ",")
+		host = strings.TrimSpace(host)
+	}
+	return scheme + "://" + host
 }
 
 // transcodeOutputImage converts the runner's PNG output to the requested
@@ -376,30 +425,18 @@ func transcodeOutputImage(ctx context.Context, pngBytes []byte, format string, q
 	return nil, "", fmt.Errorf("unsupported output_format %q", format)
 }
 
-// imageFFmpeg caches the ffmpeg lookup used for WebP encoding.
-var imageFFmpeg struct {
-	once sync.Once
-	path string
-	err  error
-}
-
-func lookupImageFFmpeg() (string, error) {
-	imageFFmpeg.once.Do(func() {
-		imageFFmpeg.path, imageFFmpeg.err = exec.LookPath("ffmpeg")
-	})
-	return imageFFmpeg.path, imageFFmpeg.err
-}
-
 // webpEncodeAvailable reports whether WebP output transcoding is possible.
+// The ffmpeg lookup is shared with the video pipeline (videojobs) so both
+// APIs resolve the binary the same way.
 func webpEncodeAvailable() bool {
-	_, err := lookupImageFFmpeg()
+	_, err := videojobs.FFmpegPath()
 	return err == nil
 }
 
 // encodeWebP transcodes a PNG to lossy WebP via ffmpeg. quality maps to
 // ffmpeg's -quality (0-100, default 100 per the OpenAI spec).
 func encodeWebP(ctx context.Context, pngBytes []byte, quality *int) ([]byte, error) {
-	ffmpeg, err := lookupImageFFmpeg()
+	ffmpeg, err := videojobs.FFmpegPath()
 	if err != nil {
 		return nil, fmt.Errorf("output_format \"webp\" requires ffmpeg on PATH: %w", err)
 	}
@@ -445,7 +482,6 @@ func imageEditFromMultipart(r *http.Request, req *openai.ImageEditRequest) error
 	req.ResponseFormat = r.FormValue("response_format")
 	req.Background = r.FormValue("background")
 	req.OutputFormat = r.FormValue("output_format")
-	req.User = r.FormValue("user")
 
 	if v := r.FormValue("n"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -504,9 +540,6 @@ func imageEditFromMultipart(r *http.Request, req *openai.ImageEditRequest) error
 			}
 		}
 	}
-	if len(req.Images) > openai.ImageMaxEditInputs {
-		return fmt.Errorf("too many images: got %d, maximum is %d", len(req.Images), openai.ImageMaxEditInputs)
-	}
 
 	// Optional mask: file part or base64 form value.
 	var maskRaw []byte
@@ -528,6 +561,16 @@ func imageEditFromMultipart(r *http.Request, req *openai.ImageEditRequest) error
 			}
 			maskRaw = img
 		}
+	}
+	return finalizeEditInputs(req, maskRaw)
+}
+
+// finalizeEditInputs applies the shared post-parse normalization for both
+// edit content types: the input-count cap and the mask conversion to SD.cpp
+// semantics. Keeping this in one place prevents multipart/JSON drift.
+func finalizeEditInputs(req *openai.ImageEditRequest, maskRaw []byte) error {
+	if len(req.Images) > openai.ImageMaxEditInputs {
+		return fmt.Errorf("too many images: got %d, maximum is %d", len(req.Images), openai.ImageMaxEditInputs)
 	}
 	if len(maskRaw) > 0 {
 		mask, err := ConvertMaskToSDCPP(maskRaw)
@@ -555,7 +598,6 @@ func imageEditFromJSON(r *http.Request, req *openai.ImageEditRequest) error {
 		Background        string          `json:"background,omitempty"`
 		OutputFormat      string          `json:"output_format,omitempty"`
 		OutputCompression *int            `json:"output_compression,omitempty"`
-		User              string          `json:"user,omitempty"`
 		Seed              *int64          `json:"seed,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -571,7 +613,6 @@ func imageEditFromJSON(r *http.Request, req *openai.ImageEditRequest) error {
 	req.Background = body.Background
 	req.OutputFormat = body.OutputFormat
 	req.OutputCompression = body.OutputCompression
-	req.User = body.User
 	req.Seed = body.Seed
 
 	if len(body.Image) > 0 && string(body.Image) != "null" {
@@ -590,23 +631,17 @@ func imageEditFromJSON(r *http.Request, req *openai.ImageEditRequest) error {
 			}
 			req.Images = append(req.Images, img)
 		}
-		if len(req.Images) > openai.ImageMaxEditInputs {
-			return fmt.Errorf("too many images: got %d, maximum is %d", len(req.Images), openai.ImageMaxEditInputs)
-		}
 	}
 
+	var maskRaw []byte
 	if body.Mask != "" {
-		maskRaw, err := openai.DecodeImageDataURL(body.Mask)
+		img, err := openai.DecodeImageDataURL(body.Mask)
 		if err != nil {
 			return fmt.Errorf("invalid mask: %w", err)
 		}
-		mask, err := ConvertMaskToSDCPP(maskRaw)
-		if err != nil {
-			return fmt.Errorf("invalid mask: %w", err)
-		}
-		req.Mask = mask
+		maskRaw = img
 	}
-	return nil
+	return finalizeEditInputs(req, maskRaw)
 }
 
 // ConvertMaskToSDCPP converts an OpenAI edit mask to SD.cpp inpainting mask
@@ -614,7 +649,17 @@ func imageEditFromJSON(r *http.Request, req *openai.ImageEditRequest) error {
 // edit. SD.cpp: white (255) marks the region to edit. If the mask has no
 // meaningful alpha channel, it is treated as an SD-native mask already
 // (bright pixels = edit region). The result is an opaque grayscale PNG.
+// Dimensions are validated via DecodeConfig before decoding so a hostile
+// mask cannot force a huge allocation (decompression bomb).
 func ConvertMaskToSDCPP(maskBytes []byte) ([]byte, error) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(maskBytes))
+	if err != nil {
+		return nil, fmt.Errorf("decode mask: %w", err)
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > openai.ImageMaxDimension || cfg.Height > openai.ImageMaxDimension {
+		return nil, fmt.Errorf("mask dimensions %dx%d are invalid or exceed the maximum of %d", cfg.Width, cfg.Height, openai.ImageMaxDimension)
+	}
+
 	img, _, err := image.Decode(bytes.NewReader(maskBytes))
 	if err != nil {
 		return nil, fmt.Errorf("decode mask: %w", err)

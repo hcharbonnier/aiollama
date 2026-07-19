@@ -958,6 +958,32 @@ func TestHandlerImageInitImageForwarded(t *testing.T) {
 	}
 }
 
+// TestHandlerImageRefImagesForwarded verifies that additional edit input
+// images (OpenAI multi-image edits) are forwarded as SD.cpp reference images.
+func TestHandlerImageRefImagesForwarded(t *testing.T) {
+	mock := &mockSDContext{
+		supportsImage: true,
+		imageResult:   []sdcpp.Image{testImage()},
+	}
+	s := newTestServer(ModeImage, mock)
+
+	png1x1 := testPNGBytes()
+
+	_, _ = doCompletion(t, s, DiffRequest{
+		Prompt: "x", Width: 1, Height: 1, Steps: 1, Seed: 1,
+		Images: [][]byte{png1x1, png1x1, png1x1},
+	})
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.lastImageParams.InitImage == nil {
+		t.Fatal("InitImage not forwarded")
+	}
+	if len(mock.lastImageParams.RefImages) != 2 {
+		t.Fatalf("RefImages count = %d, want 2", len(mock.lastImageParams.RefImages))
+	}
+}
+
 func TestHandlerContextImplementsInterface(t *testing.T) {
 	var _ sdContext = (*mockSDContext)(nil)
 }

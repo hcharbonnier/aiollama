@@ -77,6 +77,15 @@ func cloudPassthroughMiddleware(disabledOperation string) gin.HandlerFunc {
 			return
 		}
 
+		// Multipart bodies (image edits, video create/edit/extend) are never
+		// JSON: skip body inspection entirely. Buffering them here would
+		// read the whole upload into memory unbounded, defeating the
+		// handlers' own MaxBytesReader limits.
+		if strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") {
+			c.Next()
+			return
+		}
+
 		// Decompress zstd-encoded request bodies so we can inspect the model
 		if c.GetHeader("Content-Encoding") == "zstd" {
 			reader, err := zstd.NewReader(c.Request.Body, zstd.WithDecoderMaxMemory(8<<20))

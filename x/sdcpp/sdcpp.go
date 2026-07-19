@@ -370,6 +370,24 @@ func (c *Context) GenerateImage(p ImageGenParams, progress ProgressFunc) ([]Imag
 		params.init_image = goImageToC(p.InitImage)
 		defer C.free(unsafe.Pointer(params.init_image.data))
 	}
+	if len(p.RefImages) > 0 {
+		cRefs := make([]C.sd_image_t, len(p.RefImages))
+		for i := range p.RefImages {
+			cRefs[i] = goImageToC(&p.RefImages[i])
+		}
+		params.ref_images = (*C.sd_image_t)(unsafe.Pointer(&cRefs[0]))
+		params.ref_images_count = C.int(len(cRefs))
+		defer func() {
+			for i := range cRefs {
+				C.free(unsafe.Pointer(cRefs[i].data))
+			}
+		}()
+	}
+	if p.RefImageArgs != "" {
+		args, freeArgs := cstr(p.RefImageArgs)
+		defer freeArgs()
+		params.ref_image_args = args
+	}
 	if p.MaskImage != nil {
 		params.mask_image = goImageToC(p.MaskImage)
 		defer C.free(unsafe.Pointer(params.mask_image.data))

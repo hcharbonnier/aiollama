@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -250,17 +251,21 @@ func (s *Server) VideoContentHandler(c *gin.Context) {
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, openai.NewError(http.StatusServiceUnavailable, "ffmpeg is required on PATH to produce image variants"))
 			return
 		}
-		var png []byte
-		var err error
-		if variant == "thumbnail" {
-			var frames [][]byte
-			frames, _, err = tc.DecodeFrames(c.Request.Context(), content, 1)
-			if err == nil && len(frames) > 0 {
-				png = frames[0]
+		// Variants are derived from the immutable job MP4; compute once and
+		// cache on the job rather than re-running ffmpeg per download.
+		png, err := job.CachedVariant(variant, func() ([]byte, error) {
+			if variant == "thumbnail" {
+				frames, _, err := tc.DecodeFrames(c.Request.Context(), content, 1)
+				if err != nil {
+					return nil, err
+				}
+				if len(frames) == 0 {
+					return nil, errors.New("no frame extracted")
+				}
+				return frames[0], nil
 			}
-		} else {
-			png, err = tc.Spritesheet(c.Request.Context(), content)
-		}
+			return tc.Spritesheet(c.Request.Context(), content)
+		})
 		if err != nil || len(png) == 0 {
 			if err == nil {
 				err = errors.New("no frame extracted")
@@ -444,42 +449,94 @@ func (v *videoCreateInput) resolveInputReference(r *http.Request) ([]byte, error
 // maxRemoteImageBytes bounds a downloaded input_reference image.
 const maxRemoteImageBytes int64 = 25 << 20 // 25 MiB
 
-// remoteImageClient is used for input_reference.image_url downloads. A
-// timeout bounds slow/malicious servers.
-var remoteImageClient = &http.Client{Timeout: 30 * time.Second}
+// errBlockedRemoteHost is returned when an input_reference.image_url resolves
+// to a non-public destination.
+var errBlockedRemoteHost = errors.New("input_reference.image_url: host is not allowed (private, loopback, link-local, or otherwise non-public address)")
+
+// isBlockedRemoteIP reports whether ip is a non-public destination
+// (loopback, private RFC1918/RFC4193, link-local, unspecified, multicast).
+// input_reference downloads are restricted to public IPs to prevent SSRF
+// against internal services on deployments where the server is exposed.
+func isBlockedRemoteIP(ip net.IP) bool {
+	return ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() ||
+		ip.IsMulticast()
+}
+
+// remoteImageClient is used for input_reference.image_url downloads. Its
+// Transport pins each connection to a validated public IP: the DialContext
+// resolves the host, rejects non-public destinations, and dials the resolved
+// public IP directly. This both blocks SSRF to internal addresses and pins
+// the IP at connect time (DNS rebinding between resolve and dial is moot).
+// TLS ServerName still comes from the URL hostname, so HTTPS verification is
+// unaffected. Redirects are safe: every new connection goes through the same
+// dial validation.
+var remoteImageClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, errBlockedRemoteHost
+			}
+			var public []net.IP
+			for _, ipa := range ips {
+				if !isBlockedRemoteIP(ipa.IP) {
+					public = append(public, ipa.IP)
+				}
+			}
+			if len(public) == 0 {
+				return nil, errBlockedRemoteHost
+			}
+			d := &net.Dialer{Timeout: 10 * time.Second}
+			return d.DialContext(ctx, network, net.JoinHostPort(public[0].String(), port))
+		},
+	},
+}
 
 // downloadRemoteImage fetches a remote http(s) image for
-// input_reference.image_url, validating status, content type, and size.
+// input_reference.image_url, validating scheme, destination, status, content
+// type, and size. Client-facing errors are deliberately generic: echoing
+// upstream statuses/content-types would give an internal network
+// fingerprinting oracle.
 func downloadRemoteImage(ctx context.Context, u string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, fmt.Errorf("input_reference.image_url: %w", err)
+		return nil, errors.New("input_reference.image_url: invalid URL")
 	}
 	resp, err := remoteImageClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("input_reference.image_url: download failed: %w", err)
+		if errors.Is(err, errBlockedRemoteHost) {
+			return nil, errBlockedRemoteHost
+		}
+		return nil, errors.New("input_reference.image_url: download failed")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("input_reference.image_url: download returned status %d", resp.StatusCode)
+		return nil, errors.New("input_reference.image_url: download failed")
 	}
-	ct := resp.Header.Get("Content-Type")
-	if ct != "" {
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		mediaType, _, _ := strings.Cut(ct, ";")
-		mediaType = strings.TrimSpace(mediaType)
-		if !strings.HasPrefix(mediaType, "image/") {
-			return nil, fmt.Errorf("input_reference.image_url: unexpected content type %q (expected an image)", ct)
+		if !strings.HasPrefix(strings.TrimSpace(mediaType), "image/") {
+			return nil, errors.New("input_reference.image_url: URL did not return an image")
 		}
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxRemoteImageBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("input_reference.image_url: read failed: %w", err)
+		return nil, errors.New("input_reference.image_url: download failed")
 	}
 	if int64(len(data)) > maxRemoteImageBytes {
 		return nil, fmt.Errorf("input_reference.image_url: image exceeds the %d byte limit", maxRemoteImageBytes)
 	}
 	if len(data) == 0 {
-		return nil, fmt.Errorf("input_reference.image_url: download was empty")
+		return nil, errors.New("input_reference.image_url: download was empty")
 	}
 	return data, nil
 }

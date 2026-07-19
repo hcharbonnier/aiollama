@@ -796,7 +796,8 @@ func FromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 // ImageGenerationRequest is an OpenAI-compatible image generation request,
 // covering the full field set of POST /v1/images/generations (gpt-image-1 /
 // dall-e-3). Style, Moderation, and User are accepted for SDK compatibility
-// but have no local effect. Seed is an aiollama extension.
+// but have no local effect. Seed is an aiollama extension. Stream and
+// PartialImages (streaming) are rejected with a 400 by the handler.
 type ImageGenerationRequest struct {
 	Model             string `json:"model"`
 	Prompt            string `json:"prompt"`
@@ -949,7 +950,8 @@ func FromTranscriptionRequest(r TranscriptionRequest) (*api.ChatRequest, error) 
 // request (POST /v1/images/edits). The spec content type is
 // multipart/form-data (image file parts + scalar fields); aiollama also
 // accepts JSON as an extension. Parsing happens in the server handlers, so
-// images arrive already decoded.
+// images arrive already decoded. The spec's `user` field is accepted on the
+// wire but ignored (no local effect), as on generations.
 type ImageEditRequest struct {
 	Model  string
 	Prompt string
@@ -966,7 +968,6 @@ type ImageEditRequest struct {
 	Background        string
 	OutputFormat      string
 	OutputCompression *int
-	User              string
 	Seed              *int64
 }
 

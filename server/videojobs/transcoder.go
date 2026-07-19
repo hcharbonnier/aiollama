@@ -500,6 +500,25 @@ func lookupFFprobe() (string, error) {
 	return ffprobeLookup.path, ffprobeLookup.err
 }
 
+// FFmpegPath returns the resolved ffmpeg binary path, sharing the default
+// transcoder's cached lookup. It lets other packages (e.g. the Images API
+// WebP transcoder) reuse one ffmpeg resolution instead of duplicating it.
+func FFmpegPath() (string, error) {
+	return defaultTranscoder.lookup()
+}
+
+// FFprobePath returns the resolved ffprobe binary path (cached lookup).
+func FFprobePath() (string, error) {
+	return lookupFFprobe()
+}
+
+// maxProbeFallbackBytes bounds how much of an uploaded video the ffmpeg -i
+// duration fallback reads. The container header (which carries the Duration
+// line) sits at the start for the MP4s this API handles, so a few MiB
+// suffice; feeding the full (up to 256 MiB) upload twice per request would
+// be wasteful.
+var maxProbeFallbackBytes int64 = 8 << 20 // 8 MiB
+
 // ProbeDurationSeconds returns the video duration in whole seconds, rounded
 // to nearest. It prefers ffprobe; if ffprobe is absent or fails (e.g. a
 // container it cannot parse from a pipe), it falls back to parsing the
@@ -529,13 +548,18 @@ func (t *ffmpegTranscoder) ProbeDurationSeconds(ctx context.Context, mp4 []byte)
 	}
 
 	// Fallback: ffmpeg -i prints "Duration: 00:00:04.03" on stderr (and exits
-	// non-zero because no output was specified — expected).
+	// non-zero because no output was specified — expected). Only the head of
+	// the container is needed for the duration line.
 	ffmpeg, err := t.lookup()
 	if err != nil {
 		return 0, fmt.Errorf("ffprobe and ffmpeg not found on PATH: %w", err)
 	}
+	head := mp4
+	if int64(len(head)) > maxProbeFallbackBytes {
+		head = head[:maxProbeFallbackBytes]
+	}
 	cmd := exec.CommandContext(ctx, ffmpeg, "-hide_banner", "-i", "pipe:0")
-	cmd.Stdin = bytes.NewReader(mp4)
+	cmd.Stdin = bytes.NewReader(head)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	_ = cmd.Run() // non-zero exit is expected (no output file)

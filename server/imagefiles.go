@@ -28,15 +28,45 @@ type storedImage struct {
 // response_format=url on the OpenAI Images API. The OpenAI cloud API
 // returns short-lived signed URLs; aiollama serves the bytes itself from
 // GET /v1/images/files/{id} until the TTL expires. The store is
-// process-local (lost on restart), like the video job store.
+// process-local (lost on restart), like the video job store. A background
+// sweep reclaims expired entries every minute (mirroring videojobs'
+// evictLoop) so idle servers don't retain a full store indefinitely.
 type imageFileStore struct {
 	mu         sync.Mutex
 	files      map[string]*storedImage
 	totalBytes int64
+	done       chan struct{}
+	closeOnce  sync.Once
 }
 
 func newImageFileStore() *imageFileStore {
-	return &imageFileStore{files: make(map[string]*storedImage)}
+	s := &imageFileStore{
+		files: make(map[string]*storedImage),
+		done:  make(chan struct{}),
+	}
+	go s.sweepLoop()
+	return s
+}
+
+// Close stops the background sweep.
+func (s *imageFileStore) Close() {
+	s.closeOnce.Do(func() { close(s.done) })
+}
+
+// sweepLoop periodically purges expired entries.
+func (s *imageFileStore) sweepLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case now := <-ticker.C:
+			s.mu.Lock()
+			s.evictExpiredLocked(now)
+			s.mu.Unlock()
+		}
+	}
 }
 
 // newImageFileID generates a spec-plausible image file id: "img_" + 24 hex.

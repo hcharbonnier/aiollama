@@ -73,6 +73,12 @@ type Job struct {
 	content     []byte
 	contentType string
 
+	// Cached thumbnail/spritesheet variants (PNG), computed lazily on first
+	// GET /content?variant=... The source MP4 is immutable once completed,
+	// so variants never need recomputation.
+	thumbnail   []byte
+	spritesheet []byte
+
 	cancel     context.CancelFunc
 	cancelOnce sync.Once
 	done       chan struct{}
@@ -190,6 +196,35 @@ func (j *Job) Content() ([]byte, string) {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
 	return j.content, j.contentType
+}
+
+// CachedVariant returns the cached PNG for a /content variant ("thumbnail"
+// or "spritesheet"), computing and caching it via fn on first access. fn is
+// called at most once per variant per job (the source MP4 is immutable).
+// The job mutex is held during computation to avoid duplicate concurrent
+// ffmpeg runs; variant extraction is fast for the short clips this API
+// produces.
+func (j *Job) CachedVariant(variant string, fn func() ([]byte, error)) ([]byte, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var slot *[]byte
+	switch variant {
+	case "thumbnail":
+		slot = &j.thumbnail
+	case "spritesheet":
+		slot = &j.spritesheet
+	default:
+		return nil, fmt.Errorf("unknown variant %q", variant)
+	}
+	if *slot != nil {
+		return *slot, nil
+	}
+	b, err := fn()
+	if err != nil {
+		return nil, err
+	}
+	*slot = b
+	return b, nil
 }
 
 // Status returns the current job status without locking for the full ToVideo
@@ -605,6 +640,8 @@ func (s *memStore) Delete(id string) (bool, error) {
 	j.mu.Lock()
 	j.content = nil
 	j.contentType = ""
+	j.thumbnail = nil
+	j.spritesheet = nil
 	j.mu.Unlock()
 	return true, nil
 }

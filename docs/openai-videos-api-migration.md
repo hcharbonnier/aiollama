@@ -474,7 +474,9 @@ cancelled on shutdown.
   `VideoEditRequest`, `FromVideoGenerationRequest`, `ToVideoGenerationResponse`,
   `FromVideoEditRequest` from `openai/openai.go:931-1096`.
 - The `ImageWriter`/`ImageGenerationsMiddleware`/`ImageEditsMiddleware` (image
-  path) are **untouched**.
+  path) are **untouched**. *(Note, 2026-07-19: these were subsequently
+  **removed** — `/v1/images/*` is now served by dedicated handlers in
+  `server/imageapi.go`; see `docs/openai-api-conformance-report.md`.)*
 
 ### 4.8 Tests
 

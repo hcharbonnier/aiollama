@@ -2074,6 +2074,9 @@ func Serve(ln net.Listener) error {
 		if s.videoJobs != nil {
 			s.videoJobs.Close()
 		}
+		if s.imageFiles != nil {
+			s.imageFiles.Close()
+		}
 		done()
 	}()
 

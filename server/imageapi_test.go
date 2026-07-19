@@ -63,6 +63,9 @@ func TestImageGenerationsValidation(t *testing.T) {
 		{name: "bad size", body: `{"model": "m", "prompt": "p", "size": "big"}`, wantCode: 400, wantMsg: "invalid size"},
 		{name: "oversized", body: `{"model": "m", "prompt": "p", "size": "8192x8192"}`, wantCode: 400, wantMsg: "maximum dimension"},
 		{name: "bad quality", body: `{"model": "m", "prompt": "p", "quality": "ultra"}`, wantCode: 400, wantMsg: "quality must be one of"},
+		{name: "quality alias standard", body: `{"model": "m", "prompt": "p", "quality": "standard"}`, wantCode: 404},
+		{name: "quality alias hd", body: `{"model": "m", "prompt": "p", "quality": "hd"}`, wantCode: 404},
+		{name: "partial_images unsupported", body: `{"model": "m", "prompt": "p", "partial_images": 2}`, wantCode: 400, wantMsg: "streaming"},
 		{name: "bad response_format", body: `{"model": "m", "prompt": "p", "response_format": "xml"}`, wantCode: 400, wantMsg: "response_format must be one of"},
 		{name: "bad output_format", body: `{"model": "m", "prompt": "p", "output_format": "tiff"}`, wantCode: 400, wantMsg: "output_format must be one of"},
 		{name: "bad output_compression", body: `{"model": "m", "prompt": "p", "output_compression": 101}`, wantCode: 400, wantMsg: "output_compression must be between 0 and 100"},
@@ -327,6 +330,22 @@ func TestImageFileStoreRoundTrip(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expired id status = %d, want 404", w.Code)
+	}
+}
+
+func TestConvertMaskToSDCPPRejectsOversized(t *testing.T) {
+	// A mask whose declared dimensions exceed ImageMaxDimension must be
+	// rejected via DecodeConfig before any large allocation (decompression
+	// bomb guard). 4100x1 is tiny in practice but over the per-dimension cap.
+	img := image.NewRGBA(image.Rect(0, 0, 4100, 1))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ConvertMaskToSDCPP(buf.Bytes()); err == nil {
+		t.Fatal("expected error for oversized mask")
+	} else if !strings.Contains(err.Error(), "maximum") {
+		t.Errorf("error = %q, want mention of maximum", err.Error())
 	}
 }
 
