@@ -50,13 +50,17 @@ FROM base AS sources
 RUN command -v git >/dev/null 2>&1 || dnf install -y git
 WORKDIR /src
 COPY LLAMA_CPP_VERSION MLX_VERSION MLX_C_VERSION SD_CPP_VERSION .
+# Keep .git and initialize submodules (SD.cpp vendors ggml as a submodule),
+# mirroring what the CMake ExternalProject/FetchContent clones produced —
+# the build derives embedded version/commit info from the git metadata.
 RUN set -e; \
     clone() { \
         git init -q "$3"; \
         git -C "$3" remote add origin "$1"; \
         git -C "$3" fetch -q --depth 1 origin "$2" || git -C "$3" fetch -q --depth 1 origin "refs/tags/$2"; \
         git -C "$3" checkout -q FETCH_HEAD; \
-        rm -rf "$3/.git"; \
+        git -C "$3" submodule update --init --recursive --depth 1 \
+            || git -C "$3" submodule update --init --recursive; \
     }; \
     clone https://github.com/ggml-org/llama.cpp.git          "$(cat LLAMA_CPP_VERSION)" llama.cpp; \
     clone https://github.com/ml-explore/mlx.git              "$(cat MLX_VERSION)"       mlx; \
