@@ -260,6 +260,8 @@ ENV PATH=/usr/local/go/bin:$PATH
 RUN --mount=type=cache,target=/root/go/pkg/mod \
     go mod download
 RUN --mount=type=cache,target=/root/.ccache \
+    --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=bind,from=local-mlx,target=/tmp/local-mlx \
     --mount=type=bind,from=local-mlx-c,target=/tmp/local-mlx-c \
     if [ -f /tmp/local-mlx/CMakeLists.txt ]; then \
@@ -377,6 +379,7 @@ ENV CGO_CXXFLAGS="${CGO_CXXFLAGS}"
 # time (bind-mounted from the sdcpp-cpu stage below) and at runtime (copied
 # into the final image by the assembly stages).
 RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/root/go/pkg/mod \
     --mount=type=bind,from=sdcpp-cpu,source=/go/src/github.com/ollama/ollama/dist/lib/ollama/sdcpp/cpu,target=/tmp/sdcpp-cpu \
     CGO_LDFLAGS="${CGO_LDFLAGS} -L/tmp/sdcpp-cpu -lstable-diffusion" \
     go build -trimpath -tags=sdcpp -buildmode=pie -o /bin/ollama .
@@ -393,6 +396,7 @@ COPY --from=build /bin/ollama /bin/ollama
 
 FROM build AS build-nosdcpp
 RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/root/go/pkg/mod \
     go build -trimpath -buildmode=pie -o /bin/ollama-nosdcpp .
 
 FROM scratch AS publish-go-nosdcpp

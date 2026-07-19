@@ -9,3 +9,8 @@ build
 test_data
 .git
 
+/.test-models
+/integration/testdata/models
+/build-cuda
+/original-ollama
+/.kilo
