@@ -305,7 +305,14 @@ COPY --from=sources /src/sdcpp /src/sdcpp
 RUN --mount=type=cache,target=/root/.ccache \
     OLLAMA_SD_CPP_SOURCE=/src/sdcpp \
     cmake -S . -B build/sdcpp-cpu -DOLLAMA_SDCPP_BACKENDS=cpu -DOLLAMA_PAYLOAD_INSTALL_PREFIX=/go/src/github.com/ollama/ollama/dist \
-        && cmake --build build/sdcpp-cpu --target ollama-sdcpp-cpu -- -l $(nproc)
+        && cmake --build build/sdcpp-cpu --target ollama-sdcpp-cpu -- -l $(nproc) \
+        && for lib in \
+            /usr/lib64/libgomp.so* \
+            /usr/lib64/libomp.so* \
+            /opt/rh/gcc-toolset-11/root/usr/lib64/libgomp.so* \
+            /opt/rh/gcc-toolset-11/root/usr/lib64/libomp.so*; do \
+                [ -e "$lib" ] && cp -a "$lib" dist/lib/ollama/sdcpp/cpu/ || true; \
+            done
 
 FROM scratch AS publish-sdcpp-cpu
 COPY --from=sdcpp-cpu /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
@@ -377,11 +384,16 @@ ENV CGO_CXXFLAGS="${CGO_CXXFLAGS}"
 # supports diffgen (image/video) models out of the box. The SD.cpp CPU library
 # is linked directly via CGO (not dlopen), so it must be resolvable at link
 # time (bind-mounted from the sdcpp-cpu stage below) and at runtime (copied
-# into the final image by the assembly stages).
+# into the final image by the assembly stages). The $ORIGIN-relative rpath
+# makes the loader find the CPU payload next to the binary in every install
+# layout (/usr/bin/ollama -> /usr/lib/ollama/sdcpp/cpu in images,
+# <prefix>/bin/ollama -> <prefix>/lib/ollama/sdcpp/cpu in tarballs). New dtags
+# keep LD_LIBRARY_PATH authoritative so the diffgen runner subprocess can
+# override with a backend-specific payload dir.
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/root/go/pkg/mod \
     --mount=type=bind,from=sdcpp-cpu,source=/go/src/github.com/ollama/ollama/dist/lib/ollama/sdcpp/cpu,target=/tmp/sdcpp-cpu \
-    CGO_LDFLAGS="${CGO_LDFLAGS} -L/tmp/sdcpp-cpu -lstable-diffusion" \
+    CGO_LDFLAGS="${CGO_LDFLAGS} -L/tmp/sdcpp-cpu -lstable-diffusion -Wl,--enable-new-dtags -Wl,-rpath,\$ORIGIN/../lib/ollama/sdcpp/cpu" \
     go build -trimpath -tags=sdcpp -buildmode=pie -o /bin/ollama .
 
 FROM scratch AS publish-go
@@ -428,6 +440,8 @@ COPY --from=jetpack-6 dist/lib/ollama/ /lib/ollama/
 FROM scratch AS rocm
 COPY --from=llama-server-cpu  dist/lib/ollama /lib/ollama
 COPY --from=llama-server-rocm_v7_2 dist/lib/ollama /lib/ollama
+# The sdcpp-tagged Go binary requires the SD.cpp CPU library at runtime.
+COPY --from=sdcpp-cpu /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
 
 FROM --platform=linux/amd64 scratch AS amd64-archive
 COPY --from=amd64 /lib/ollama /lib/ollama/
