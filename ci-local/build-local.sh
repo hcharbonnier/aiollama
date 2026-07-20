@@ -214,8 +214,8 @@ fi
 # The workflow declares:
 #   - setup-environment
 #   - deps             (matrix of all backend dep stages)
-#   - default-image    (target=archive,        tagged aiollama:local)
-#   - rocm-image       (target=image-archive, FLAVOR=rocm, tagged aiollama:local-rocm)
+#   - default-image    (no target,            tagged aiollama:local)
+#   - rocm-image       (no target, FLAVOR=rocm, tagged aiollama:local-rocm)
 # `act` automatically follows the `needs:` graph when given a terminal job,
 # so for a single-variant build we just point at that terminal job. For
 # `all` we run the two terminal jobs sequentially; the underlying buildx

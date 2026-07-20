@@ -138,9 +138,16 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Default amd64 image — equivalent of release.yaml's first docker-build-push
-  # matrix entry (no FLAVOR, target=archive). Backend stages are rebuilt
-  # inline by `docker buildx build` from this single invocation; the `deps`
-  # job above is purely for validating each backend in isolation.
+  # matrix entry (no FLAVOR, no target — builds through to the final
+  # ubuntu:24.04 runtime stage which carries ENTRYPOINT/CMD). Backend stages
+  # are rebuilt inline by `docker buildx build` from this single invocation;
+  # the `deps` job above is purely for validating each backend in isolation.
+  #
+  # NOTE: do NOT set `target: archive` here. The `archive`/`image-archive`
+  # stages are FROM-scratch payload stages (bin/ollama + lib/ollama only, no
+  # shell, no ENTRYPOINT/CMD); they exist only for release tarball extraction
+  # and produce a non-runnable image. The runtime image is the final
+  # ubuntu:24.04 stage that COPYs from `image-archive`.
   # ---------------------------------------------------------------------------
   default-image:
     runs-on: ubuntu-latest
@@ -155,12 +162,11 @@ jobs:
             || docker buildx create --name ci-local-builder --driver docker-container
           docker buildx use ci-local-builder
           docker buildx inspect --bootstrap
-      - name: Build default amd64 image (archive target)
+      - name: Build default amd64 image (runtime stage)
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          target: archive
           provenance: false
           sbom: false
           load: true
@@ -175,7 +181,10 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # ROCm amd64 image — equivalent of release.yaml's second docker-build-push
-  # matrix entry (suffix=-rocm): target=image-archive with FLAVOR=rocm.
+  # matrix entry (suffix=-rocm, FLAVOR=rocm, no target — builds through to
+  # the final ubuntu:24.04 runtime stage). As above, do NOT set
+  # `target: image-archive`: that stage is a FROM-scratch payload with no
+  # ENTRYPOINT/CMD and would yield "no command specified" at `docker run`.
   # ---------------------------------------------------------------------------
   rocm-image:
     runs-on: ubuntu-latest
@@ -190,12 +199,11 @@ jobs:
             || docker buildx create --name ci-local-builder --driver docker-container
           docker buildx use ci-local-builder
           docker buildx inspect --bootstrap
-      - name: Build ROCm amd64 image (image-archive target, FLAVOR=rocm)
+      - name: Build ROCm amd64 image (runtime stage, FLAVOR=rocm)
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          target: image-archive
           provenance: false
           sbom: false
           load: true
