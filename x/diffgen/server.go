@@ -113,7 +113,13 @@ func (s *Server) Load(ctx context.Context, _ ml.SystemInfo, gpus []ml.DeviceInfo
 	if backend != "" {
 		args = append(args, "--backend", backend)
 	}
-	if maxVRAMGiB != "" {
+	// Passing --max-vram enables SD.cpp's experimental ggml_graph_cut
+	// offload/graph-splitting feature (max_graph_vram_bytes > 0). That path
+	// has been observed to fault on the ROCm backend for some models. Setting
+	// OLLAMA_DIFFGEN_NO_GRAPH_CUT skips the flag so max_graph_vram_bytes stays
+	// 0 and the whole graph runs unsplit, as a diagnostic/mitigation escape
+	// hatch when a model fits in VRAM without offload.
+	if maxVRAMGiB != "" && !envconfig.Bool("OLLAMA_DIFFGEN_NO_GRAPH_CUT")() {
 		args = append(args, "--max-vram", maxVRAMGiB)
 	}
 	if streamLayers {
