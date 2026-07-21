@@ -57,6 +57,11 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON CACHE BOOL "" FORCE)
 # linked statically into the shared lib instead of emitted as separate modules.
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
 set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
+# With a single statically-linked CPU backend, ggml's default GGML_NATIVE=ON
+# would compile it with -march=native, baking the build host's ISA into the
+# distributed payload (SIGILL on any other CPU). Force the portable x86-64
+# baseline (SSE4.2/AVX/AVX2/FMA/F16C/BMI2; AVX512 stays off) instead.
+set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
 
 # Container output support (WebM/animated-WebP) for video encoding.
 set(USE_WEBP ON CACHE BOOL "Enable WebP support" FORCE)
