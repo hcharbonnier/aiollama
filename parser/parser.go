@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/user"
@@ -333,6 +335,20 @@ func filesForModel(path string) ([]string, error) {
 		return matches, nil
 	}
 
+	// SD.cpp (diffgen) models are identified by a model_index.json. Their
+	// component files (VAE, text encoders, diffusion weights) have arbitrary
+	// names and extensions (.safetensors/.gguf/.ckpt/.pth) that the
+	// LLM-oriented globs below do not match — in particular a VAE named e.g.
+	// "flux2-vae.safetensors" matches neither "model*.safetensors" nor
+	// "consolidated*.safetensors" and would be silently dropped. Gather the
+	// referenced component files (matched by basename, searched recursively)
+	// plus model_index.json instead.
+	if sdFiles, err := sdcppModelFiles(path); err != nil {
+		return nil, err
+	} else if sdFiles != nil {
+		return sdFiles, nil
+	}
+
 	var files []string
 	// some safetensors files do not properly match "application/octet-stream", so skip checking their contentType
 	if st, _ := glob(filepath.Join(path, "model*.safetensors"), ""); len(st) > 0 {
@@ -389,6 +405,83 @@ func filesForModel(path string) ([]string, error) {
 		files = append(files, tks...)
 	}
 
+	return files, nil
+}
+
+// sdcppWeightExtensions are the checkpoint file extensions gathered for an
+// SD.cpp model when its model_index.json omits an explicit components map.
+var sdcppWeightExtensions = map[string]bool{
+	".safetensors": true,
+	".gguf":        true,
+	".ckpt":        true,
+	".pt":          true,
+	".pth":         true,
+}
+
+// sdcppModelFiles returns the files to upload for an SD.cpp (diffgen) model,
+// or nil if path is not an SD.cpp model directory (no model_index.json). It
+// resolves each entry in the model_index.json "components" map by basename,
+// searching the directory tree recursively so the WAN-style LowNoise/ HighNoise/
+// VAE/ subdirectory layouts work. When no components map is present, it falls
+// back to gathering every checkpoint-weight file in the tree (matching the
+// server-side importer, which derives component names from filename stems).
+func sdcppModelFiles(path string) ([]string, error) {
+	indexPath := filepath.Join(path, "model_index.json")
+	data, err := os.ReadFile(indexPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	var index struct {
+		Components map[string]string `json:"components"`
+	}
+	if err := json.Unmarshal(data, &index); err != nil {
+		return nil, fmt.Errorf("parsing model_index.json: %w", err)
+	}
+
+	// Index the directory tree by basename so components resolve regardless of
+	// any subdirectory nesting in the source layout.
+	byBase := make(map[string]string)
+	var weights []string
+	if err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		base := filepath.Base(p)
+		if _, ok := byBase[base]; !ok {
+			byBase[base] = p
+		}
+		if sdcppWeightExtensions[strings.ToLower(filepath.Ext(base))] {
+			weights = append(weights, p)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	files := []string{indexPath}
+	if len(index.Components) == 0 {
+		// No explicit component mapping: upload every checkpoint-weight file.
+		return append(files, weights...), nil
+	}
+
+	var missing []string
+	for _, fname := range index.Components {
+		base := filepath.Base(fname)
+		if resolved, ok := byBase[base]; ok {
+			files = append(files, resolved)
+		} else {
+			missing = append(missing, base)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("model_index.json references missing component files: %s", strings.Join(missing, ", "))
+	}
 	return files, nil
 }
 

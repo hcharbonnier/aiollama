@@ -1194,6 +1194,93 @@ func TestFilesForModel(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "sdcpp model with components map includes arbitrarily-named vae",
+			setup: func(dir string) error {
+				files := map[string]string{
+					"model_index.json":          `{"architecture":"FluxPipeline","model_format":"sdcpp","components":{"diffusion_model":"flux-2-klein-4b-Q4_0.gguf","vae":"flux2-vae.safetensors","llm":"Qwen3-4B-Q2_K.gguf"}}`,
+					"flux-2-klein-4b-Q4_0.gguf": "gguf",
+					"flux2-vae.safetensors":     "vae",
+					"Qwen3-4B-Q2_K.gguf":        "llm",
+				}
+				for name, content := range files {
+					if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			wantFiles: []string{
+				"model_index.json",
+				"flux-2-klein-4b-Q4_0.gguf",
+				"flux2-vae.safetensors",
+				"Qwen3-4B-Q2_K.gguf",
+			},
+		},
+		{
+			name: "sdcpp model resolves components in nested subdirectories",
+			setup: func(dir string) error {
+				if err := os.MkdirAll(filepath.Join(dir, "VAE"), 0o755); err != nil {
+					return err
+				}
+				entries := map[string]string{
+					"model_index.json": `{"architecture":"WanVideoPipeline","model_format":"sdcpp","capabilities":["video"],"components":{"diffusion_model":"wan.safetensors","vae":"wan_vae.safetensors"}}`,
+					"wan.safetensors":  "diff",
+					filepath.Join("VAE", "wan_vae.safetensors"): "vae",
+				}
+				for name, content := range entries {
+					if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			wantFiles: []string{
+				"model_index.json",
+				"wan.safetensors",
+				filepath.Join("VAE", "wan_vae.safetensors"),
+			},
+		},
+		{
+			name: "sdcpp model without components map gathers all weight files",
+			setup: func(dir string) error {
+				entries := map[string]string{
+					"model_index.json":      `{"architecture":"FluxPipeline","model_format":"sdcpp"}`,
+					"diffusion.safetensors": "diff",
+					"vae.safetensors":       "vae",
+					"encoder.gguf":          "enc",
+					"notes.txt":             "ignore me",
+				}
+				for name, content := range entries {
+					if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			wantFiles: []string{
+				"model_index.json",
+				"diffusion.safetensors",
+				"vae.safetensors",
+				"encoder.gguf",
+			},
+		},
+		{
+			name: "sdcpp model errors on missing referenced component",
+			setup: func(dir string) error {
+				entries := map[string]string{
+					"model_index.json": `{"model_format":"sdcpp","components":{"diffusion_model":"diff.gguf","vae":"missing-vae.safetensors"}}`,
+					"diff.gguf":         "diff",
+				}
+				for name, content := range entries {
+					if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+			wantErr: true,
+		},
 	}
 
 	tmpDir := t.TempDir()
