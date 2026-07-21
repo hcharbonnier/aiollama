@@ -71,6 +71,9 @@ func TestResolveBackend(t *testing.T) {
 		want string
 	}{
 		{"cuda preferred", []string{"cpu", "cuda"}, "cuda"},
+		{"rocm selected", []string{"cpu", "ROCm"}, "rocm"},
+		{"cuda preferred over rocm", []string{"ROCm", "cuda"}, "cuda"},
+		{"rocm preferred over vulkan", []string{"vulkan", "ROCm"}, "rocm"},
 		{"metal preferred over vulkan", []string{"vulkan", "metal"}, "metal"},
 		{"vulkan when no cuda/metal", []string{"vulkan", "cpu"}, "vulkan"},
 		{"cpu fallback when empty", []string{}, "cpu"},
@@ -152,6 +155,7 @@ func TestWANVAEDeprecatedBackend(t *testing.T) {
 		{"wan on metal", "WanVideoPipeline", "metal", true},
 		{"wan on vulkan", "WanT2VPipeline", "vulkan", true},
 		{"wan on cuda", "WanVideoPipeline", "cuda", false},
+		{"wan on rocm", "WanVideoPipeline", "rocm", false},
 		{"wan on cpu", "WanVideoPipeline", "cpu", false},
 		{"wan on empty backend", "WanVideoPipeline", "", false},
 		{"non-wan on metal", "LTXVideoPipeline", "metal", false},

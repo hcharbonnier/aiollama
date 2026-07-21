@@ -17,14 +17,22 @@ func CheckPlatformSupport() error {
 }
 
 // ResolveBackend maps discovered GPU devices to an SD.cpp backend string.
-// Preference order: CUDA > Metal > Vulkan > CPU. Scans all GPUs so a
+// Preference order: CUDA > ROCm > Metal > Vulkan > CPU. Scans all GPUs so a
 // higher-priority backend wins even if it appears later in the list.
+//
+// The returned string is matched case-insensitively against the ggml backend
+// registry name inside SD.cpp (see resolve_first_device_by_registry_name).
+// HIP/ROCm builds register their ggml backend as "ROCm" (GGML_CUDA_NAME), so
+// "rocm" selects an AMD GPU. It also matches g.Library (lowercased) for the
+// VRAM-budget accounting in EstimateVRAMBudget.
 func ResolveBackend(gpus []ml.DeviceInfo) string {
-	var hasCUDA, hasMetal, hasVulkan bool
+	var hasCUDA, hasROCm, hasMetal, hasVulkan bool
 	for _, g := range gpus {
 		switch strings.ToLower(g.Library) {
 		case "cuda":
 			hasCUDA = true
+		case "rocm":
+			hasROCm = true
 		case "metal":
 			hasMetal = true
 		case "vulkan":
@@ -34,6 +42,8 @@ func ResolveBackend(gpus []ml.DeviceInfo) string {
 	switch {
 	case hasCUDA:
 		return "cuda"
+	case hasROCm:
+		return "rocm"
 	case hasMetal:
 		return "metal"
 	case hasVulkan:
@@ -153,14 +163,15 @@ func ShouldStreamLayers(modelSize, vramBudget uint64) bool {
 }
 
 // WANVAEDeprecatedBackend reports whether a WAN video model is being loaded on
-// a backend whose VAE does not support CUDA (Metal/Vulkan), requiring a CPU
-// VAE fallback.
+// a backend whose VAE does not support the CUDA code path (Metal/Vulkan),
+// requiring a CPU VAE fallback. ROCm/HIP shares the CUDA ggml backend
+// implementation, so it is treated like CUDA here.
 func WANVAEDeprecatedBackend(architecture, backend string) bool {
 	if !IsWANVideoArchitecture(architecture) {
 		return false
 	}
 	switch backend {
-	case "cuda", "cpu", "":
+	case "cuda", "rocm", "cpu", "":
 		return false
 	default:
 		return true

@@ -9,7 +9,7 @@ include(ExternalProject)
 set(OLLAMA_LLAMA_BACKENDS "" CACHE STRING
     "Semicolon-separated llama-server GPU backends to build: cuda_v12;cuda_v13;rocm_v7_1;rocm_v7_2;vulkan;cuda_jetpack5;cuda_jetpack6")
 set(_ollama_mlx_backends_doc "Semicolon-separated MLX backends to build: cuda_v13;metal_v3;metal_v4")
-set(_ollama_sdcpp_backends_doc "Semicolon-separated stable-diffusion.cpp backends to build: cpu;cuda_v12;cuda_v13;metal;vulkan")
+set(_ollama_sdcpp_backends_doc "Semicolon-separated stable-diffusion.cpp backends to build: cpu;cuda_v12;cuda_v13;rocm_v7_1;rocm_v7_2;metal;vulkan")
 set(OLLAMA_SDCPP_BACKENDS "" CACHE STRING "${_ollama_sdcpp_backends_doc}")
 set(OLLAMA_VERSION "0.0.0" CACHE STRING "Ollama version embedded in the local Go binary")
 set(OLLAMA_PAYLOAD_INSTALL_PREFIX "${CMAKE_BINARY_DIR}" CACHE PATH
@@ -718,8 +718,14 @@ if(OLLAMA_HAVE_LLAMA_SERVER)
         # back to "cpu" as the default and rely on the build dependency
         # (ollama-sdcpp-backends) to ensure the library is present at link
         # time.
+        #
+        # GPU variants are probed before "cpu" so that a mixed build (e.g.
+        # OLLAMA_SDCPP_BACKENDS=cpu;rocm_v7_2) links the accelerated library
+        # rather than silently picking CPU. Only one libstable-diffusion is
+        # linked into the Go binary; GPU-first ordering keeps that choice
+        # deterministic and accelerated when any GPU variant was built.
         set(_sdcpp_backend_dir "cpu")
-        foreach(_candidate cpu metal vulkan cuda_v12 cuda_v13)
+        foreach(_candidate IN ITEMS metal vulkan cuda_v12 cuda_v13 rocm_v7_1 rocm_v7_2 cpu)
             if(EXISTS "${_sdcpp_lib_dir}/${_candidate}/${CMAKE_SHARED_LIBRARY_PREFIX}stable-diffusion${CMAKE_SHARED_LIBRARY_SUFFIX}")
                 set(_sdcpp_backend_dir "${_candidate}")
                 break()
@@ -986,6 +992,33 @@ foreach(_backend IN LISTS OLLAMA_SDCPP_BACKENDS)
             CMAKE_ARGS
                 -DGGML_CUDA=ON
                 ${_cuda_args})
+        list(APPEND _sdcpp_targets ollama-sdcpp-${_backend})
+    elseif(_backend STREQUAL "rocm_v7_1" OR _backend STREQUAL "rocm_v7_2")
+        # ROCm/HIP SD.cpp build. Mirrors the llama.cpp ROCm backend
+        # (GGML_HIP=ON, ggml-hip) but keeps the sdcpp static-embed model:
+        # SD.cpp's CMakeLists forces SD_BUILD_SHARED_LIBS=ON and
+        # GGML_BACKEND_DL=OFF, so the HIP ggml backend is linked statically
+        # into libstable-diffusion. HIP builds register the ggml backend as
+        # "ROCm" (GGML_CUDA_NAME), which the runtime "rocm" backend string
+        # selects (see diffgen.ResolveBackend). rocm_v7_1 is Windows-only and
+        # rocm_v7_2 is Linux-only, matching the llama.cpp naming convention.
+        if(_backend STREQUAL "rocm_v7_1" AND NOT WIN32)
+            message(FATAL_ERROR "OLLAMA_SDCPP_BACKENDS=rocm_v7_1 is only supported for Windows ROCm builds")
+        elseif(_backend STREQUAL "rocm_v7_2" AND WIN32)
+            message(FATAL_ERROR "OLLAMA_SDCPP_BACKENDS=rocm_v7_2 is only supported for Linux ROCm builds")
+        endif()
+        set(_sdcpp_rocm_args
+            -DGGML_HIP=ON
+            -DCMAKE_HIP_PLATFORM=amd
+            -DOLLAMA_GPU_BACKEND=hip)
+        ollama_append_cache_arg_if_set(_sdcpp_rocm_args AMDGPU_TARGETS)
+        ollama_append_cache_arg_if_set(_sdcpp_rocm_args CMAKE_HIP_ARCHITECTURES)
+        ollama_append_cache_arg_if_set(_sdcpp_rocm_args CMAKE_HIP_FLAGS)
+        ollama_append_cache_arg_if_set(_sdcpp_rocm_args GGML_CUDA_NO_PEER_COPY)
+        ollama_append_cache_arg_if_set(_sdcpp_rocm_args CMAKE_PREFIX_PATH)
+        ollama_add_sdcpp_build(${_backend}
+            RUNNER_DIR ${_backend}
+            CMAKE_ARGS ${_sdcpp_rocm_args})
         list(APPEND _sdcpp_targets ollama-sdcpp-${_backend})
     elseif(_backend STREQUAL "metal")
         if(NOT APPLE)
