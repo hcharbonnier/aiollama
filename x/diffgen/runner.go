@@ -507,7 +507,17 @@ func createSDContext(m *manifest.ModelManifest, backend, maxVRAMGiB string, stre
 		c.AudioVaePath = path
 	}
 
-	return sdcpp.NewContext(c)
+	ctx, err := sdcpp.NewContext(c)
+	if err != nil && c.VaePath == "" && c.TaesdPath == "" {
+		// SD.cpp always decodes latents through a VAE (or TAESD). With no
+		// vae/taesd component the weights must be embedded in the main
+		// checkpoint (legacy full checkpoints, e.g. SD1.x .ckpt); isolated
+		// diffusion weights (FLUX/WAN GGUFs) never embed them, so SD.cpp
+		// fails deep in model metadata validation with one "not in model
+		// metadata" error per VAE tensor. Point at the actual cause.
+		return nil, fmt.Errorf("%w: manifest has no vae/taesd component; SD.cpp requires VAE weights for latent decode, so add a \"vae\" entry to model_index.json components and re-create the model (unless VAE weights are embedded in the main checkpoint)", err)
+	}
+	return ctx, err
 }
 
 func bytesToSDImage(data []byte) (sdcpp.Image, error) {
