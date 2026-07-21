@@ -347,6 +347,22 @@ RUN --mount=type=cache,target=/root/.ccache \
 FROM scratch AS publish-sdcpp-cuda_v13
 COPY --from=sdcpp-cuda_v13 /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
 
+FROM rocm-7-deps AS sdcpp-rocm_v7_2
+ENV CC=clang CXX=clang++
+WORKDIR /go/src/github.com/ollama/ollama
+COPY CMakeLists.txt CMakePresets.json .
+COPY cmake cmake
+COPY x/sdcpp/include x/sdcpp/include
+COPY SD_CPP_VERSION .
+COPY --from=sources /src/sdcpp /src/sdcpp
+RUN --mount=type=cache,target=/root/.ccache \
+    OLLAMA_SD_CPP_SOURCE=/src/sdcpp \
+    cmake -S . -B build/sdcpp-rocm_v7_2 -DOLLAMA_SDCPP_BACKENDS=rocm_v7_2 -DOLLAMA_PAYLOAD_INSTALL_PREFIX=/go/src/github.com/ollama/ollama/dist \
+        && cmake --build build/sdcpp-rocm_v7_2 --target ollama-sdcpp-rocm_v7_2 -- -l $(nproc)
+
+FROM scratch AS publish-sdcpp-rocm_v7_2
+COPY --from=sdcpp-rocm_v7_2 /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
+
 FROM vulkan-deps AS sdcpp-vulkan
 WORKDIR /go/src/github.com/ollama/ollama
 COPY CMakeLists.txt CMakePresets.json .
@@ -440,12 +456,16 @@ COPY --from=jetpack-6 dist/lib/ollama/ /lib/ollama/
 FROM scratch AS rocm
 COPY --from=llama-server-cpu  dist/lib/ollama /lib/ollama
 COPY --from=llama-server-rocm_v7_2 dist/lib/ollama /lib/ollama
-# The sdcpp-tagged Go binary requires the SD.cpp CPU library at runtime.
+# The sdcpp-tagged Go binary links the SD.cpp CPU library via DT_RUNPATH and
+# needs it at runtime; the ROCm variant is loaded in preference by the diffgen
+# runner via LD_LIBRARY_PATH when an AMD GPU is present.
 COPY --from=sdcpp-cpu /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
+COPY --from=sdcpp-rocm_v7_2 /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
 
 FROM --platform=linux/amd64 scratch AS amd64-archive
 COPY --from=amd64 /lib/ollama /lib/ollama/
 COPY --from=llama-server-rocm_v7_2 dist/lib/ollama /lib/ollama/
+COPY --from=sdcpp-rocm_v7_2 /go/src/github.com/ollama/ollama/dist/lib/ollama /lib/ollama/
 
 FROM --platform=linux/arm64 scratch AS arm64-archive
 COPY --from=arm64 /lib/ollama /lib/ollama/

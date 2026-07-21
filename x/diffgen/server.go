@@ -121,7 +121,17 @@ func (s *Server) Load(ctx context.Context, _ ml.SystemInfo, gpus []ml.DeviceInfo
 	}
 	cmd := exec.Command(exe, args...)
 	cmd.Env = os.Environ()
-	configureDiffgenSubprocessEnv(cmd, ml.LibraryPaths(gpus))
+	// The released binary links libstable-diffusion from sdcpp/cpu via
+	// DT_RUNPATH. Prepend the backend-specific SD.cpp payload dir so the
+	// runner subprocess loads the accelerated library instead (DT_RUNPATH is
+	// searched after LD_LIBRARY_PATH). Without this, a GPU backend string
+	// like "rocm" is passed to a CPU-only libstable-diffusion and fails with
+	// "backend '<name>' was not found".
+	libPaths := ml.LibraryPaths(gpus)
+	if dir := sdcppPayloadDir(backend); dir != "" {
+		libPaths = append([]string{dir}, libPaths...)
+	}
+	configureDiffgenSubprocessEnv(cmd, libPaths)
 	s.cmd = cmd
 
 	stdout, _ := cmd.StdoutPipe()
@@ -206,6 +216,62 @@ func setSubprocessEnv(cmd *exec.Cmd, key, value string) {
 		}
 	}
 	cmd.Env = append(cmd.Env, key+"="+value)
+}
+
+// sdcppPayloadDir returns the lib/ollama/sdcpp/<dir> directory whose
+// libstable-diffusion matches the resolved backend, or "" when none is found
+// (in which case the loader falls back to the CPU library linked via
+// DT_RUNPATH). The versioned GPU backends (cuda_v12/cuda_v13, rocm_v7_1/
+// rocm_v7_2) are matched by prefix against the backend string ("cuda",
+// "rocm"); metal/vulkan/cpu match exactly. When multiple versioned dirs match
+// (e.g. cuda_v12 and cuda_v13 both shipped), the highest version wins.
+func sdcppPayloadDir(backend string) string {
+	if backend == "" {
+		return ""
+	}
+	root := filepath.Join(ml.LibOllamaPath, "sdcpp")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	var best string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name != backend && !strings.HasPrefix(name, backend+"_") {
+			continue
+		}
+		dir := filepath.Join(root, name)
+		if !hasStableDiffusionLib(dir) {
+			continue
+		}
+		if best == "" || name > filepath.Base(best) {
+			best = dir
+		}
+	}
+	return best
+}
+
+// hasStableDiffusionLib reports whether dir contains a libstable-diffusion
+// shared library for the current platform.
+func hasStableDiffusionLib(dir string) bool {
+	var patterns []string
+	switch runtime.GOOS {
+	case "windows":
+		patterns = []string{"stable-diffusion.dll", "stable-diffusion*.dll"}
+	case "darwin":
+		patterns = []string{"libstable-diffusion.dylib"}
+	default:
+		patterns = []string{"libstable-diffusion.so", "libstable-diffusion.so.*"}
+	}
+	for _, p := range patterns {
+		if matches, _ := filepath.Glob(filepath.Join(dir, p)); len(matches) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) getLastErr() string {
