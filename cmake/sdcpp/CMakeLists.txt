@@ -140,13 +140,50 @@ set(_sdcpp_dest "${_base_dest}/sdcpp/${OLLAMA_SDCPP_RUNNER_DIR}")
 
 # Install the stable-diffusion shared library into the backend-specific dir.
 if(TARGET stable-diffusion)
-    install(TARGETS stable-diffusion
-        RUNTIME DESTINATION "${_sdcpp_dest}" COMPONENT sdcpp OPTIONAL
-        LIBRARY DESTINATION "${_sdcpp_dest}" COMPONENT sdcpp OPTIONAL)
+    set(_sd_target stable-diffusion)
 elseif(TARGET sd)
-    install(TARGETS sd
+    set(_sd_target sd)
+endif()
+if(_sd_target)
+    install(TARGETS ${_sd_target}
         RUNTIME DESTINATION "${_sdcpp_dest}" COMPONENT sdcpp OPTIONAL
         LIBRARY DESTINATION "${_sdcpp_dest}" COMPONENT sdcpp OPTIONAL)
+endif()
+
+# Bundle GPU runtime libraries into the backend dir so the payload is
+# self-contained at runtime. The SD.cpp library links the GPU backend
+# statically (GGML_BACKEND_DL=OFF), so its runtime deps (cublas/rocblas/hip)
+# must live beside it to be found by the dynamic loader.
+if(GGML_CUDA AND CUDAToolkit_FOUND)
+    install(TARGETS ${_sd_target}
+        RUNTIME_DEPENDENCIES
+            DIRECTORIES ${CUDAToolkit_BIN_DIR} ${CUDAToolkit_BIN_DIR}/x64 ${CUDAToolkit_LIBRARY_DIR}
+            PRE_INCLUDE_REGEXES cublas cublasLt cudart
+            PRE_EXCLUDE_REGEXES ".*"
+        RUNTIME DESTINATION "${_sdcpp_dest}" COMPONENT sdcpp
+        LIBRARY DESTINATION "${_sdcpp_dest}" COMPONENT sdcpp)
+elseif(GGML_HIP)
+    find_package(hip REQUIRED)
+    install(TARGETS ${_sd_target}
+        RUNTIME_DEPENDENCY_SET sdcpp_rocm_deps
+        RUNTIME DESTINATION "${_sdcpp_dest}" COMPONENT sdcpp
+        LIBRARY DESTINATION "${_sdcpp_dest}" COMPONENT sdcpp)
+    install(RUNTIME_DEPENDENCY_SET sdcpp_rocm_deps
+        DIRECTORIES ${HIP_BIN_INSTALL_DIR} ${HIP_LIB_INSTALL_DIR}
+        PRE_INCLUDE_REGEXES hipblas rocblas amdhip64 rocsolver amd_comgr hsa-runtime64 rocsparse tinfo rocprofiler-register roctx64 rocroller drm drm_amdgpu numa elf omp
+        PRE_EXCLUDE_REGEXES ".*"
+        POST_EXCLUDE_REGEXES "system32"
+        RUNTIME DESTINATION "${_sdcpp_dest}" COMPONENT sdcpp
+        LIBRARY DESTINATION "${_sdcpp_dest}" COMPONENT sdcpp)
+    # rocblas data directory (tensile kernels) required by the HIP backend.
+    foreach(_hip_dir IN ITEMS ${HIP_BIN_INSTALL_DIR} ${HIP_LIB_INSTALL_DIR})
+        if(EXISTS ${_hip_dir}/rocblas)
+            install(DIRECTORY ${_hip_dir}/rocblas
+                DESTINATION "${_sdcpp_dest}"
+                COMPONENT sdcpp)
+            break()
+        endif()
+    endforeach()
 endif()
 
 # Install vendored header so the CGO bridge can find it at build time.
