@@ -1011,6 +1011,26 @@ foreach(_backend IN LISTS OLLAMA_SDCPP_BACKENDS)
             -DGGML_HIP=ON
             -DCMAKE_HIP_PLATFORM=amd
             -DOLLAMA_GPU_BACKEND=hip)
+        # Pin AMDGPU_TARGETS to the same curated list llama.cpp uses (see
+        # llama/server/CMakePresets.json). SD.cpp's vendored ggml-hip only
+        # forwards AMDGPU_TARGETS/GPU_TARGETS to CMAKE_HIP_ARCHITECTURES when one
+        # is explicitly set; otherwise hipcc falls back to its default offload
+        # arch, which omits common consumer/pro gfx targets (e.g. gfx1100). A
+        # library built without the running GPU's arch has no device code for
+        # its compute kernels, so the first kernel launch faults with a raw
+        # SIGSEGV and no ggml HIP-error log. Mirror the CUDA preset approach and
+        # default the target list per-OS unless the user pinned an arch.
+        ollama_cache_arg_is_set(AMDGPU_TARGETS _sdcpp_has_amdgpu_targets)
+        ollama_cache_arg_is_set(CMAKE_HIP_ARCHITECTURES _sdcpp_has_hip_arch)
+        if(NOT _sdcpp_has_amdgpu_targets AND NOT _sdcpp_has_hip_arch)
+            if(WIN32)
+                set(_sdcpp_default_amdgpu_targets "gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201")
+            else()
+                set(_sdcpp_default_amdgpu_targets "gfx908:xnack-;gfx90a:xnack+;gfx90a:xnack-;gfx942;gfx950;gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201")
+            endif()
+            ollama_escape_cmake_list("${_sdcpp_default_amdgpu_targets}" _sdcpp_amdgpu_targets_value)
+            list(APPEND _sdcpp_rocm_args "-DAMDGPU_TARGETS=${_sdcpp_amdgpu_targets_value}")
+        endif()
         ollama_append_cache_arg_if_set(_sdcpp_rocm_args AMDGPU_TARGETS)
         ollama_append_cache_arg_if_set(_sdcpp_rocm_args CMAKE_HIP_ARCHITECTURES)
         ollama_append_cache_arg_if_set(_sdcpp_rocm_args CMAKE_HIP_FLAGS)
