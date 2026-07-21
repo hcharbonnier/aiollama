@@ -1750,6 +1750,11 @@ impractically slow (~hours per frame); use the 1.3B model above for CPU E2E.
 
 ##### Importing the test models
 
+> **See also:** `docs/creating-sdcpp-models.md` — a step-by-step user guide for
+> creating SD.cpp-compatible models (WAN 2.2 T2V A14B and FLUX.2-Klein-4B),
+> including the `model_index.json` contract, component-name reference, and
+> troubleshooting.
+
 ```bash
 # Image: FLUX.2-Klein-4B
 ollama create flux2-klein-4b -f Modelfile.flux2-klein
